@@ -22,7 +22,6 @@ router = APIRouter(
 # ======================================================
 
 class SellerProfileUpdate(BaseModel):
-    display_name: Optional[str] = None
     short_tagline: Optional[str] = None
     description: Optional[str] = None
     logo_url: Optional[str] = None
@@ -71,8 +70,8 @@ async def seller_profile(
         "seller_id": str(seller["_id"]),
 
         "brand": {
+            "legal_name": profile.get("legal_name"),
             "brand_name": profile.get("brand_name"),
-            "display_name": profile.get("display_name"),
             "short_tagline": profile.get("short_tagline"),
             "description": profile.get("description"),
             "email": profile.get("email"),

@@ -71,16 +71,15 @@ async def seller_requests(admin=Depends(require_role("admin"))):
 async def verify_identity(
     user_id: str,
     data: VerifyIdentity,
-    admin=Depends(require_role("admin"))
+    admin=Depends(require_role("admin")),
+    db=Depends(get_db)
 ):
-    db = get_db()
     oid = parse_object_id(user_id)
 
     user = await db.users.find_one({"_id": oid})
     if not user:
         raise HTTPException(404, "Seller not found")
 
-    # SAFETY: already finalized
     if user.get("seller_status") == "verified":
         raise HTTPException(400, "Seller already verified")
 
@@ -88,7 +87,6 @@ async def verify_identity(
         raise HTTPException(400, "Seller already rejected")
 
     seller_request = user.get("seller_request")
-
     if not seller_request:
         raise HTTPException(400, "Seller request not found")
 
@@ -96,22 +94,32 @@ async def verify_identity(
     # APPROVE SELLER
     # =========================
     if data.action == "approve":
+
         documents = seller_request.get("documents")
         if not documents:
             raise HTTPException(400, "Seller documents missing")
 
-        base_slug = make_slug(seller_request["brand_name"])
+        legal_name = seller_request.get("legal_name")
+        brand_name = seller_request.get("brand_name")
+        category = seller_request.get("category")
+
+        if not legal_name:
+            raise HTTPException(400, "Seller legal name missing")
+        if not brand_name:
+            raise HTTPException(400, "Seller brand name missing")
+        if not category:
+            raise HTTPException(400, "Seller category missing")
+
+        base_slug = make_slug(brand_name)
         slug = await generate_unique_seller_slug(db, base_slug)
-        
-        
+
         seller_profile = {
-            "legal_name": seller_request["legal_name"],
-            "brand_name": seller_request["brand_name"],
+            "legal_name": legal_name,
+            "brand_name": brand_name,
             "slug": slug,
-            "category": seller_request["category"],
+            "category": category,
             "description": seller_request.get("description"),
             "documents": documents,
-            
             "trust": {
                 "score": 0,
                 "badges": []
@@ -119,69 +127,53 @@ async def verify_identity(
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
         }
-        tier = SellerTier.VERIFIED_FAST  # default for newly verified sellers
-        config = SELLER_TIER_CONFIG[tier.value]
 
+        tier = SellerTier.VERIFIED_FAST
+        config = SELLER_TIER_CONFIG[tier.value]
 
         await db.users.update_one(
             {"_id": oid},
             {"$set": {
-        "role": "seller",
-        "seller_status": "verified",
+                "role": "seller",
+                "seller_status": "verified",
+                "seller_profile": seller_profile,
+                "seller_tier": tier.value,
+                "settlement_hours": config["settlement_hours"],
+                "commission_percent": config["commission_percent"],
+                "seller_verified_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+                "cod_enabled": True,
+                "seller_rejected_reason": None,
+                "seller_rejected_at": None,
+            }}
+        )
 
-        # seller profile
-        "seller_profile": seller_profile,
-
-        # SELLER CONTRACT (THIS IS STEP 3)
-        "seller_tier": tier.value,
-        "settlement_hours": config["settlement_hours"],
-        "commission_percent": config["commission_percent"],
-
-        # metadata
-        "seller_verified_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
-
-        # operational flags
-        "cod_enabled": True,
-
-        # cleanup
-        "seller_rejected_reason": None,
-        "seller_rejected_at": None
-    }}
-)
-    
         await log_audit(
             db,
             actor_id=str(admin["_id"]),
             actor_role="admin",
             action="SELLER_VERIFIED",
-            metadata={
-                "user_id": user_id,
-                "slug": slug
-            }
+            metadata={"user_id": user_id, "slug": slug}
         )
 
-        return {
-            "message": "Seller verified",
-            "slug": slug
-        }
+        return {"message": "Seller verified", "slug": slug}
 
     # =========================
     # REJECT SELLER
     # =========================
-    if data.action == "reject":
+    elif data.action == "reject":
+
         if not data.reason:
             raise HTTPException(400, "Reason required for rejection")
 
         await db.users.update_one(
             {"_id": oid},
-            {
-                "$set": {
-                    "seller_status": "rejected",
-                    "seller_rejected_reason": data.reason,
-                    "seller_rejected_at": datetime.utcnow()
-                }
-            }
+            {"$set": {
+                "seller_status": "rejected",
+                "seller_rejected_reason": data.reason,
+                "seller_rejected_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow()
+            }}
         )
 
         await log_audit(
@@ -189,18 +181,16 @@ async def verify_identity(
             actor_id=str(admin["_id"]),
             actor_role="admin",
             action="SELLER_REJECTED",
-            metadata={
-                "user_id": user_id,
-                "reason": data.reason
-            }
+            metadata={"user_id": user_id, "reason": data.reason}
         )
 
-        return {
-            "message": "Seller rejected"
-        }
+        return {"message": "Seller rejected"}
 
-    # SHOULD NEVER REACH
-    raise HTTPException(400, "Invalid action")
+    # =========================
+    # INVALID ACTION
+    # =========================
+    else:
+        raise HTTPException(400, "Invalid action")
 
 # ---------------------------
 # FREEZE SELLER

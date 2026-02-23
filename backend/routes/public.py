@@ -12,18 +12,19 @@ router = APIRouter(
 # HELPERS
 # ============================================================
 
-async def get_verified_seller(db, seller_id: ObjectId):
-    return await db.users.find_one(
-        {
-            "_id": seller_id,
-            "role": "seller",
-            "seller_status": "verified",
-            "is_frozen": False
-        },
-        {
-            "seller_profile": 1
-        }
-    )
+async def get_verified_seller(db, seller_id):
+    # Handle both ObjectId and string seller_id
+    query = {
+        "role": "seller",
+        "seller_status": "verified",
+        "is_frozen": False
+    }
+    
+    # Try to convert to ObjectId, if fails use as string
+    try:
+        query["_id"] = ObjectId(seller_id)
+    except:
+        query["_id"] = seller_id
 
 
 def build_product_card(product, seller):

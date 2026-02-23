@@ -21,11 +21,11 @@ class ProductCreate(BaseModel):
     description: Optional[str] = None
     category: str
     sub_category: Optional[str] = None
-    tags: List[str] = []
+    tags: List[str] = Field(default_factory=list)
     mrp: int
-    selling_price: int
-    stock: int
-    images: List[HttpUrl] = Field(min_items=1, max_items=5)
+    selling_price: int 
+    stock: int 
+    images: List[HttpUrl] = Field(min_items=2, max_items=7)
 
 
 # =========================
@@ -254,34 +254,39 @@ async def product_detail(product_id: str):
 async def create_product(
     data: ProductCreate,
     seller=Depends(require_role("seller")),
+    db=Depends(get_db),
 ):
+    # seller safety
     if seller.get("is_frozen"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Seller account is frozen",
         )
 
+    # price validation
     if data.selling_price > data.mrp:
         raise HTTPException(
             status_code=400,
             detail="Selling price cannot exceed MRP",
         )
 
-    db = get_db()
-
     product_doc = {
-        "title": data.title,
+        "title": data.title.strip(),
         "description": data.description,
         "category": data.category.lower(),
         "sub_category": data.sub_category.lower() if data.sub_category else None,
         "tags": [t.lower() for t in data.tags],
+
         "mrp": data.mrp,
         "selling_price": data.selling_price,
         "stock": data.stock,
         "reserved_stock": 0,
-        "images": data.images,
+
+        "images": [str(img) for img in data.images],
+
         "seller_id": seller["_id"],
         "active": True,
+
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow(),
     }

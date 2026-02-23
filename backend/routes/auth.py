@@ -218,6 +218,7 @@ async def request_seller(
     # Build seller_profile
     # -------------------------
     seller_profile = {
+        "legal_name": data.legal_name,
         "brand_name": data.brand_name,
         "slug": data.brand_name.lower().replace(" ", "-"),
         "category": data.category,
@@ -254,6 +255,7 @@ async def request_seller(
     )
 
     return {"message": "Seller request submitted"}
+
 
 # ===============================
 # ROLE TESTS
