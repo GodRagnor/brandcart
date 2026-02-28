@@ -1,9 +1,11 @@
 import asyncio
+import logging
 from datetime import datetime
 from database import get_db
 from utils.order_timeline import record_order_event
 
 CHECK_INTERVAL_SECONDS = 60 * 10  # every 10 min
+logger = logging.getLogger(__name__)
 
 
 async def return_deadline_worker():
@@ -40,7 +42,7 @@ async def return_deadline_worker():
                     metadata=None,
                 )
 
-            except Exception as e:
-                print("RETURN_DEADLINE_ERROR:", str(e))
+            except Exception:
+                logger.exception("RETURN_DEADLINE_ERROR")
 
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)

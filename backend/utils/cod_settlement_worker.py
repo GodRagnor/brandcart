@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime, timedelta
 
 from database import get_db
@@ -7,6 +8,7 @@ from utils.trust import SELLER_TIER_CONFIG
 from utils.order_timeline import record_order_event
 
 CHECK_INTERVAL_SECONDS = 60 * 30  # every 30 minutes
+logger = logging.getLogger(__name__)
 
 
 async def cod_settlement_worker():
@@ -17,14 +19,17 @@ async def cod_settlement_worker():
 
         cursor = db.orders.find({
             "status": "delivered",
-            "payment.method": "COD",
-            "payment.status": "pending",
+            "$or": [
+                {"payment.method": "COD", "payment.status": "cod_pending"},
+                {"payment.method": "RAZORPAY", "payment.status": "paid"},
+            ],
+            "settlement.status": {"$ne": "settled"},
         })
 
         async for order in cursor:
             try:
                 # ---- Safety: skip if already settled (idempotency)
-                if order.get("payment", {}).get("status") == "settled":
+                if order.get("settlement", {}).get("status") == "settled":
                     continue
 
                 seller_id = order["seller_id"]
@@ -34,7 +39,7 @@ async def cod_settlement_worker():
                     continue
 
                 # ---- HARD BLOCK: frozen sellers never get settlement
-                if seller.get("is_frozen"):
+                if seller.get("is_frozen") or seller.get("seller_status") == "frozen":
                     continue
 
                 tier = seller.get("seller_tier", "standard")
@@ -44,7 +49,6 @@ async def cod_settlement_worker():
                 )
 
                 settlement_hours = tier_config["settlement_hours"]
-                commission_percent = tier_config["commission_percent"]
                 reserve_percent = tier_config.get("reserve_percent", 0)
 
                 delivered_at = order.get("delivered_at")
@@ -60,19 +64,26 @@ async def cod_settlement_worker():
                     db=db,
                     seller_id=seller_id,
                     order_id=order["_id"],
-                    order_amount=order["amount"],
-                    commission_percent=commission_percent,
-                    reserve_percent=reserve_percent,
+                    order_amount=order["pricing"]["subtotal"],
+                    commission_percent=order["pricing"]["commission_percent"],
+                    platform_fee=order["pricing"].get("platform_fee", 0),
+                )
+
+                reserve_amount = round(
+                    order["pricing"]["subtotal"] * reserve_percent / 100,
+                    2,
                 )
 
                 # ---- Mark order settled
                 update_res = await db.orders.update_one(
-                    {"_id": order["_id"], "payment.status": "pending"},
+                    {"_id": order["_id"], "settlement.status": {"$ne": "settled"}},
                     {
                         "$set": {
                             "payment.status": "settled",
-                            "status": "settled",
+                            "settlement.status": "settled",
+                            "settlement.settled_at": now,
                             "settled_at": now,
+                            "pricing.reserve_amount": reserve_amount,
                         }
                     }
                 )
@@ -91,16 +102,12 @@ async def cod_settlement_worker():
                                 "seller_tier": tier,
                             },
                         )
-                    except Exception as timeline_err:
+                    except Exception:
                         # Timeline must NEVER break settlement
-                        print(
-                            f"[TIMELINE_ERROR] order={order['_id']} err={timeline_err}"
-                        )
+                        logger.exception("TIMELINE_ERROR order=%s", order.get("_id"))
 
-            except Exception as e:
+            except Exception:
                 # Never crash the worker for one bad order
-                print(
-                    f"[COD_SETTLEMENT_ERROR] order={order.get('_id')} err={str(e)}"
-                )
+                logger.exception("COD_SETTLEMENT_ERROR order=%s", order.get("_id"))
 
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)

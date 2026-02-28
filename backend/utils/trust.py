@@ -58,19 +58,25 @@ def trust_delta_for_event(event: str) -> int:
 
 SELLER_TIER_CONFIG = {
     "standard": {
-        "settlement_hours": 72,
+        "settlement_hours": 96,
         "commission_percent": 8.0,
         "reserve_percent": 10,
+        "release_type": "T+3/T+4",
+        "release_note": "Unverified or standard sellers are paid in 3-4 days.",
     },
     "verified_fast": {
         "settlement_hours": 48,
-        "commission_percent": 6.0,
+        "commission_percent": 5.0,
         "reserve_percent": 5,
+        "release_type": "T+2",
+        "release_note": "Verified sellers are paid within 48 hours.",
     },
     "premium": {
         "settlement_hours": 24,
         "commission_percent": 5.0,
         "reserve_percent": 3,
+        "release_type": "T+1",
+        "release_note": "Premium sellers are paid within 24 hours.",
     },
 }
 
@@ -265,6 +271,7 @@ async def enforce_trust_freeze(db, seller_id):
             {
                 "$set": {
                     "seller_status": "frozen",
+                    "is_frozen": True,
                     "seller_frozen_reason": "EXCESSIVE_SELLER_FAULT_RETURNS",
                     "seller_frozen_at": now,
                     "updated_at": now,

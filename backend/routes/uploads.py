@@ -6,7 +6,7 @@ from database import get_db
 from utils.cloudinary import upload_image
 from utils.security import require_role
 
-router = APIRouter(prefix="/uploads", tags=["Uploads"])
+router = APIRouter(prefix="/api/uploads", tags=["Uploads"])
 
 
 # =========================

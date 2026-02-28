@@ -11,13 +11,13 @@ async def auto_process_returns():
 
     cursor = db.orders.find({
         "return.status": "approved",
-        "return.refund_processed": {"$ne": True},
+        "return.refund_status": {"$ne": "completed"},
     })
 
     async for order in cursor:
         seller_id = order["seller_id"]
         order_id = order["_id"]
-        refund_amount = order["pricing"]["subtotal"]
+        refund_amount = order["pricing"].get("seller_payout", order["pricing"]["subtotal"])
         reserve_amount = order["pricing"].get("reserve_amount", 0)
 
         # 1️⃣ Refund buyer impact (ledger)
@@ -43,6 +43,7 @@ async def auto_process_returns():
             {
                 "$set": {
                     "return.refund_processed": True,
+                    "return.refund_status": "completed",
                     "return.refunded_at": now,
                     "updated_at": now,
                 }

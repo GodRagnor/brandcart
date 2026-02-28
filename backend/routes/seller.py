@@ -9,6 +9,9 @@ from utils.security import require_role
 from utils.audit import log_audit
 from utils.security import get_current_seller
 from utils.wallet_service import get_wallet_balance
+from utils.trust import SELLER_TIER_CONFIG
+from config.env import EMERGENCY_PAYOUT_FEE_PERCENT, EMERGENCY_PAYOUT_FEE_FLAT
+from utils.crypto import encrypt_sensitive_value
 from routes.auth import SellerDocuments
 
 router = APIRouter(
@@ -43,6 +46,14 @@ class SellerOfferCreate(BaseModel):
     start_at: datetime
     end_at: datetime
     festival_slug: Optional[str] = None
+
+
+class EmergencyPayoutRequest(BaseModel):
+    amount: float = Field(..., gt=0)
+    account_holder_name: str = Field(..., min_length=3, max_length=120)
+    bank_account_number: str = Field(..., min_length=9, max_length=24)
+    ifsc_code: str = Field(..., min_length=11, max_length=11)
+    bank_name: Optional[str] = None
 
 # ----------------------------------------
 # SELLER PROFILE
@@ -366,6 +377,16 @@ async def get_seller_wallet(
         .to_list(50)
     )
 
+    seller_tier = seller.get("seller_tier", "standard")
+    tier_config = SELLER_TIER_CONFIG.get(seller_tier, SELLER_TIER_CONFIG["standard"])
+
+    is_verified_seller = seller.get("seller_status") == "verified"
+    release_type = "T+2" if is_verified_seller else "T+3/T+4"
+    release_window_hours = {
+        "min": 48 if is_verified_seller else 72,
+        "max": 48 if is_verified_seller else 96,
+    }
+
     return {
         "balances": {
             "available": available_balance,
@@ -374,14 +395,86 @@ async def get_seller_wallet(
         "totals": {
             "earned": summary.get("SALE_CREDIT", 0),
             "commission": summary.get("COMMISSION_DEBIT", 0),
+            "platform_fees": summary.get("PLATFORM_FEE_DEBIT", 0),
             "refunds": summary.get("REFUND_DEBIT", 0),
+            "emergency_holds": summary.get("EMERGENCY_PAYOUT_HOLD", 0),
         },
         "settlement_promise": {
-            "tier": seller.get("seller_tier"),
-            "settlement_hours": seller.get("settlement_hours"),
-            "commission_percent": seller.get("commission_percent"),
+            "tier": seller_tier,
+            "settlement_hours": seller.get("settlement_hours", tier_config["settlement_hours"]),
+            "commission_percent": seller.get("commission_percent", tier_config["commission_percent"]),
+            "release_type": release_type,
+            "release_window_hours": release_window_hours,
+            "policy_release_type": tier_config.get("release_type"),
+            "policy_release_note": tier_config.get("release_note"),
         },
         "ledger": ledger,
+    }
+
+
+@router.post("/wallet/emergency-payout")
+async def request_emergency_payout(
+    data: EmergencyPayoutRequest,
+    seller=Depends(require_role("seller")),
+    db=Depends(get_db),
+):
+    if seller.get("seller_status") != "verified":
+        raise HTTPException(403, "Only verified sellers can request emergency payout")
+
+    if not data.ifsc_code.isalnum():
+        raise HTTPException(400, "Invalid IFSC code")
+    if not data.bank_account_number.isdigit():
+        raise HTTPException(400, "Invalid bank account number")
+
+    amount = round(float(data.amount), 2)
+    fee_percent = max(float(EMERGENCY_PAYOUT_FEE_PERCENT or 0), 0)
+    fee_flat = max(float(EMERGENCY_PAYOUT_FEE_FLAT or 0), 0)
+    settlement_fee = round((amount * fee_percent / 100) + fee_flat, 2)
+    total_debit = round(amount + settlement_fee, 2)
+
+    available_balance = await get_wallet_balance(db, seller["_id"])
+    if available_balance < total_debit:
+        raise HTTPException(400, "Insufficient wallet balance after settlement fee")
+
+    payout_doc = {
+        "seller_id": seller["_id"],
+        "method": "BANK_TRANSFER",
+        "type": "emergency",
+        "status": "requested",
+        "amount": amount,
+        "settlement_fee": settlement_fee,
+        "total_debit": total_debit,
+        "bank_details": {
+            "account_holder_name": data.account_holder_name.strip(),
+            "bank_account_encrypted": encrypt_sensitive_value(data.bank_account_number.strip()),
+            "bank_account_masked": f"****{data.bank_account_number[-4:]}",
+            "ifsc_code": data.ifsc_code.strip().upper(),
+            "bank_name": data.bank_name.strip() if data.bank_name else None,
+        },
+        "requested_at": datetime.utcnow(),
+    }
+
+    res = await db.payout_requests.insert_one(payout_doc)
+
+    await db.wallet_ledger.insert_one({
+        "seller_id": seller["_id"],
+        "order_id": None,
+        "entry_type": "EMERGENCY_PAYOUT_HOLD",
+        "credit": 0,
+        "debit": total_debit,
+        "reason_code": "EMERGENCY_PAYOUT_REQUESTED",
+        "reference_id": res.inserted_id,
+        "created_at": datetime.utcnow(),
+    })
+
+    return {
+        "message": "Emergency payout requested",
+        "request_id": str(res.inserted_id),
+        "method": "BANK_TRANSFER",
+        "amount": amount,
+        "settlement_fee": settlement_fee,
+        "total_debit": total_debit,
+        "bank_account": f"****{data.bank_account_number[-4:]}",
     }
 
 # ======================================================

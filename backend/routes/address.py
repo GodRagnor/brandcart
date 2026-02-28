@@ -6,6 +6,7 @@ from bson import ObjectId
 
 from database import get_db
 from utils.security import require_role
+from utils.guards import parse_object_id
 
 router = APIRouter(
     prefix="/api/addresses",
@@ -106,7 +107,7 @@ async def update_address(
     result = await db.users.update_one(
         {
             "_id": buyer["_id"],
-            "addresses._id": ObjectId(address_id)
+            "addresses._id": parse_object_id(address_id, "address_id")
         },
         {
             "$set": {
@@ -135,7 +136,7 @@ async def delete_address(
 
     result = await db.users.update_one(
         {"_id": buyer["_id"]},
-        {"$pull": {"addresses": {"_id": ObjectId(address_id)}}}
+        {"$pull": {"addresses": {"_id": parse_object_id(address_id, "address_id")}}}
     )
 
     if result.modified_count == 0:

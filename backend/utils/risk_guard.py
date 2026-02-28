@@ -19,7 +19,7 @@ def enforce_seller_risk(
     # -------------------------------------------------
     # 1. Seller frozen (hard stop)
     # -------------------------------------------------
-    if seller.get("is_frozen"):
+    if seller.get("is_frozen") or seller.get("seller_status") == "frozen":
         raise HTTPException(
             status_code=403,
             detail="Seller account is frozen"

@@ -1,9 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
-from bson import ObjectId
 import random, hashlib, os
-from typing import List
 from typing import Optional
 from pydantic import EmailStr
 import re
@@ -13,7 +11,7 @@ from utils.jwt import create_access_token
 from utils.security import get_current_user, require_role
 from utils.validators import normalize_phone
 from utils.audit import log_audit
-from utils.rate_limiter import rate_limit
+from utils.rate_limit import rate_limit
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
@@ -32,11 +30,6 @@ class SendOtpRequest(BaseModel):
 class VerifyOtpRequest(BaseModel):
     phone: str
     otp: str
-
-class SellerRequestData(BaseModel):
-    seller_name: str
-    brand_name: str
-    documents: List[str]
 
 # ======================
 # Helpers
@@ -57,11 +50,12 @@ async def send_otp(data: SendOtpRequest):
     db = get_db()
     phone = normalize_phone(data.phone)
 
-    rate_limit(
-    key=f"otp:{phone}",
-    max_requests=3,
-    window_seconds=300,  # 3 OTPs per 5 minutes
-)
+    await rate_limit(
+        db=db,
+        key=f"otp:{phone}",
+        max_requests=3,
+        window_seconds=300,  # 3 OTPs per 5 minutes
+    )
 
     otp = generate_otp()
     otp_hash = hash_otp(otp)
@@ -77,7 +71,6 @@ async def send_otp(data: SendOtpRequest):
         upsert=True
     )
 
-    print("DEV OTP:", otp)  # replace with SMS gateway later
     return {"message": "OTP sent"}
 
 # ======================
@@ -93,7 +86,19 @@ async def verify_otp(data: VerifyOtpRequest):
     if not otp_doc:
         raise HTTPException(400, "OTP not found")
 
+    if otp_doc.get("expires_at") and datetime.utcnow() > otp_doc["expires_at"]:
+        await db.otp_codes.delete_one({"phone": phone})
+        raise HTTPException(400, "OTP expired")
+
+    if otp_doc.get("attempts", 0) >= OTP_MAX_ATTEMPTS:
+        await db.otp_codes.delete_one({"phone": phone})
+        raise HTTPException(429, "Too many OTP attempts. Please request a new OTP.")
+
     if otp_doc["otp_hash"] != hash_otp(data.otp):
+        await db.otp_codes.update_one(
+            {"phone": phone},
+            {"$inc": {"attempts": 1}},
+        )
         raise HTTPException(400, "Invalid OTP")
 
     await db.otp_codes.delete_one({"phone": phone})
@@ -192,7 +197,8 @@ async def request_seller(
 ):
     db = get_db()
 
-    rate_limit(
+    await rate_limit(
+        db=db,
         key=f"seller_request:{user['_id']}",
         max_requests=1,
         window_seconds=86400,  # once per day

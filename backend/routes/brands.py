@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from database import get_db
 
-router = APIRouter(prefix="/brands", tags=["Brands"])
+router = APIRouter(prefix="/api/brands", tags=["Brands"])
 
 @router.get("/top")
 async def top_brands(limit: int = 12):

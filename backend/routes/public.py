@@ -26,17 +26,21 @@ async def get_verified_seller(db, seller_id):
     except:
         query["_id"] = seller_id
 
+    return await db.users.find_one(query)
+
 
 def build_product_card(product, seller):
     profile = seller.get("seller_profile", {})
     trust = profile.get("trust", {})
+
+    product_images = product.get("images") or product.get("image_urls") or []
 
     return {
         "id": str(product["_id"]),
         "title": product.get("title"),
         "price": product.get("selling_price"),
         "mrp": product.get("mrp"),
-        "image": product.get("image_urls", [None])[0],
+        "image": product_images[0] if product_images else None,
         "rating": product.get("rating", 0),
         "review_count": product.get("review_count", 0),
         "seller": {
@@ -273,7 +277,12 @@ async def list_products_by_pincode(
 async def public_product(product_id: str):
     db = get_db()
 
-    product = await db.products.find_one({"_id": ObjectId(product_id)})
+    try:
+        product_oid = ObjectId(product_id)
+    except Exception:
+        raise HTTPException(400, "Invalid product ID")
+
+    product = await db.products.find_one({"_id": product_oid})
     if not product:
         raise HTTPException(404, "Product not found")
 
@@ -291,7 +300,7 @@ async def public_product(product_id: str):
             "description": product.get("description"),
             "price": product.get("selling_price"),
             "mrp": product.get("mrp"),
-            "images": product.get("image_urls", []),
+            "images": product.get("images") or product.get("image_urls", []),
             "rating": product.get("rating", 0),
             "review_count": product.get("review_count", 0)
         },

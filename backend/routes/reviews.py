@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from datetime import datetime
-from bson import ObjectId
 
 from database import get_db
 from utils.security import require_role
+from utils.guards import parse_object_id
 
 router = APIRouter(
     prefix="/api/reviews",
@@ -34,7 +34,7 @@ async def create_review(
 
     # 1️⃣ Validate order ownership + delivered status
     order = await db.orders.find_one({
-        "_id": ObjectId(order_id),
+        "_id": parse_object_id(order_id, "order_id"),
         "buyer_id": buyer["_id"],
         "status": "delivered"
     })
@@ -47,7 +47,7 @@ async def create_review(
 
     # 2️⃣ Prevent duplicate review
     existing = await db.reviews.find_one({
-        "order_id": ObjectId(order_id)
+        "order_id": parse_object_id(order_id, "order_id")
     })
 
     if existing:
@@ -123,7 +123,7 @@ async def get_product_reviews(product_id: str):
 
     cursor = db.reviews.find(
         {
-            "product_id": ObjectId(product_id),
+            "product_id": parse_object_id(product_id, "product_id"),
             "is_visible": True
         },
         {

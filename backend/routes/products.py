@@ -10,7 +10,11 @@ from utils.security import require_role
 from utils.sellers import get_verified_seller
 from utils.products import build_product_card
 
-router = APIRouter(prefix="/products", tags=["Products"])
+router = APIRouter(prefix="/api/products", tags=["Products"])
+
+
+def _product_images(product: dict) -> list:
+    return product.get("images") or product.get("image_urls") or []
 
 # =========================
 # SCHEMAS
@@ -25,7 +29,7 @@ class ProductCreate(BaseModel):
     mrp: int
     selling_price: int 
     stock: int 
-    images: List[HttpUrl] = Field(min_items=2, max_items=7)
+    images: List[HttpUrl] = Field(min_items=1, max_items=7)
 
 
 # =========================
@@ -90,7 +94,7 @@ async def search_products(
             "title": p.get("title"),
             "selling_price": p.get("selling_price"),
             "mrp": p.get("mrp"),
-            "images": p.get("images", []),
+            "images": _product_images(p),
             "category": p.get("category"),
             "sub_category": p.get("sub_category"),
         })
@@ -207,7 +211,7 @@ async def list_products(search: str = Query("")):
             "title": p["title"],
             "selling_price": p["selling_price"],
             "mrp": p.get("mrp"),
-            "images": p.get("images", []),
+            "images": _product_images(p),
             "category": p.get("category"),
             "sub_category": p.get("sub_category"),
         })
@@ -239,7 +243,7 @@ async def product_detail(product_id: str):
         "description": product.get("description"),
         "selling_price": product["selling_price"],
         "mrp": product.get("mrp"),
-        "images": product.get("images", []),
+        "images": _product_images(product),
         "category": product.get("category"),
         "sub_category": product.get("sub_category"),
         "stock": product.get("stock", 0),
@@ -257,7 +261,13 @@ async def create_product(
     db=Depends(get_db),
 ):
     # seller safety
-    if seller.get("is_frozen"):
+    if seller.get("seller_status") != "verified":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Seller not verified",
+        )
+
+    if seller.get("is_frozen") or seller.get("seller_status") == "frozen":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Seller account is frozen",

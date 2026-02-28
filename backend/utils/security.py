@@ -16,9 +16,8 @@ async def get_current_user(
     payload = decode_token(token)
 
     phone = payload.get("sub")
-    role = payload.get("role")
 
-    if not phone or not role:
+    if not phone:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token payload",
@@ -37,8 +36,6 @@ async def get_current_user(
         {"$set": {"last_active_at": datetime.utcnow()}}
     )
 
-    # Enforce role from token
-    user["role"] = role
     return user
 
 

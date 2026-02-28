@@ -1,10 +1,12 @@
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from database import get_db
 from utils.wallet_service import release_reserve
 
 CHECK_INTERVAL_SECONDS = 60 * 60  # every 1 hour
 RESERVE_HOLD_DAYS = 7
+logger = logging.getLogger(__name__)
 
 
 async def reserve_release_worker():
@@ -25,7 +27,7 @@ async def reserve_release_worker():
             try:
                 seller_id = order["seller_id"]
                 order_id = order["_id"]
-                reserve_amount = order.get("reserve_amount", 0)
+                reserve_amount = order.get("pricing", {}).get("reserve_amount", 0)
 
                 if reserve_amount <= 0:
                     continue
@@ -47,8 +49,8 @@ async def reserve_release_worker():
                     }
                 )
 
-            except Exception as e:
+            except Exception:
                 # Never crash worker for one bad order
-                print(f"[RESERVE_RELEASE_ERROR] Order {order.get('_id')}: {e}")
+                logger.exception("RESERVE_RELEASE_ERROR order=%s", order.get("_id"))
 
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)

@@ -1,10 +1,12 @@
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from database import get_db
 from utils.order_timeline import record_order_event
 
 CHECK_INTERVAL_SECONDS = 60 * 5  # every 5 minutes
-ONLINE_PAYMENT_TIMEOUT_MINUTES = 15
+RAZORPAY_PAYMENT_TIMEOUT_MINUTES = 15
+logger = logging.getLogger(__name__)
 
 
 async def order_expiry_worker():
@@ -12,10 +14,10 @@ async def order_expiry_worker():
 
     while True:
         now = datetime.utcnow()
-        cutoff = now - timedelta(minutes=ONLINE_PAYMENT_TIMEOUT_MINUTES)
+        cutoff = now - timedelta(minutes=RAZORPAY_PAYMENT_TIMEOUT_MINUTES)
 
         cursor = db.orders.find({
-            "payment.method": "ONLINE",
+            "payment.method": "RAZORPAY",
             "payment.status": "pending",
             "created_at": {"$lte": cutoff},
             "status": "created",
@@ -30,9 +32,18 @@ async def order_expiry_worker():
                         "$set": {
                             "status": "cancelled",
                             "updated_at": now,
-                            "cancel_reason": "ONLINE_PAYMENT_TIMEOUT",
+                            "cancel_reason": "RAZORPAY_PAYMENT_TIMEOUT",
                         }
                     }
+                )
+
+                # Release reserved stock if order expired before payment
+                await db.products.update_one(
+                    {
+                        "_id": order["product_id"],
+                        "reserved_stock": {"$gte": order.get("quantity", 0)},
+                    },
+                    {"$inc": {"stock": order.get("quantity", 0), "reserved_stock": -order.get("quantity", 0)}},
                 )
 
                 # Timeline event
@@ -45,7 +56,7 @@ async def order_expiry_worker():
                     metadata=None,
                 )
 
-            except Exception as e:
-                print("ORDER_EXPIRY_ERROR:", str(e))
+            except Exception:
+                logger.exception("ORDER_EXPIRY_ERROR")
 
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)

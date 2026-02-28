@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 from datetime import datetime, timedelta
+import asyncio
 from typing import Literal, Optional
 from pydantic import BaseModel
-from bson import ObjectId
 
 from database import get_db
 from utils.guards import parse_object_id, assert_valid_seller_state
@@ -10,6 +10,7 @@ from utils.audit import log_audit
 from utils.security import get_current_user, require_role
 from utils.slug import make_slug, generate_unique_seller_slug
 from utils.trust import SELLER_TIER_CONFIG
+from utils.payouts import execute_bank_payout, fetch_payout_status
 from models.user import SellerTier
 
 
@@ -21,6 +22,11 @@ router = APIRouter(prefix="/api/admin", tags=["Admin"])
 # =====================================================
 
 class VerifyIdentity(BaseModel):
+    action: Literal["approve", "reject"]
+    reason: Optional[str] = None
+
+
+class PayoutDecision(BaseModel):
     action: Literal["approve", "reject"]
     reason: Optional[str] = None
 
@@ -202,7 +208,7 @@ async def freeze_seller(
     admin=Depends(require_role("admin")),
     db=Depends(get_db),
 ):
-    seller = await db.users.find_one({"_id": ObjectId(user_id), "role": "seller"})
+    seller = await db.users.find_one({"_id": parse_object_id(user_id, "user_id"), "role": "seller"})
     if not seller:
         raise HTTPException(404, "Seller not found")
 
@@ -214,6 +220,7 @@ async def freeze_seller(
         {
             "$set": {
                 "seller_status": "frozen",
+                "is_frozen": True,
                 "seller_frozen_reason": reason,
                 "seller_frozen_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
@@ -244,7 +251,7 @@ async def unfreeze_seller(
     admin=Depends(require_role("admin")),
     db=Depends(get_db),
 ):
-    seller = await db.users.find_one({"_id": ObjectId(user_id), "role": "seller"})
+    seller = await db.users.find_one({"_id": parse_object_id(user_id, "user_id"), "role": "seller"})
     if not seller:
         raise HTTPException(404, "Seller not found")
 
@@ -259,6 +266,7 @@ async def unfreeze_seller(
         {
             "$set": {
                 "seller_status": "verified",
+                "is_frozen": False,
                 "seller_probation": {
                     "active": True,
                     "started_at": now,
@@ -391,13 +399,13 @@ async def create_festival(
 # SELLER RISK SNAPSHOT
 # =========================================================
 
-@router.get("/admin/sellers/{seller_id}/risk")
+@router.get("/sellers/{seller_id}/risk")
 async def seller_risk_snapshot(
     seller_id: str,
     admin=Depends(require_role("admin")),
     db=Depends(get_db),
 ):
-    seller = await db.users.find_one({"_id": ObjectId(seller_id), "role": "seller"})
+    seller = await db.users.find_one({"_id": parse_object_id(seller_id, "seller_id"), "role": "seller"})
     if not seller:
         raise HTTPException(404, "Seller not found")
 
@@ -489,18 +497,18 @@ async def seller_risk_dashboard(
 # FINANCE SUMMARY
 # =========================================================
 
-@router.get("/admin/finance/summary")
+@router.get("/finance/summary")
 async def finance_summary(
     admin=Depends(require_role("admin")),
     db=Depends(get_db),
 ):
     pending_cod = await db.orders.aggregate([
-        {"$match": {"payment.method": "COD", "payment.status": "pending"}},
+        {"$match": {"payment.method": "COD", "payment.status": "cod_pending"}},
         {"$group": {"_id": None, "amount": {"$sum": "$pricing.subtotal"}}}
     ]).to_list(1)
 
     unsettled = await db.orders.aggregate([
-        {"$match": {"status": "delivered", "payment.status": "pending"}},
+        {"$match": {"status": "delivered", "settlement.status": {"$ne": "settled"}}},
         {"$group": {"_id": None, "amount": {"$sum": "$pricing.seller_payout"}}}
     ]).to_list(1)
 
@@ -519,7 +527,7 @@ async def finance_summary(
 # ORDER SUMMARY
 # =========================================================
 
-@router.get("/admin/orders/summary")
+@router.get("/orders/summary")
 async def order_summary(
     admin=Depends(require_role("admin")),
     db=Depends(get_db),
@@ -534,4 +542,308 @@ async def order_summary(
         "delivered_orders": delivered,
         "rto_orders": rto,
         "refunds_completed": refunds,
+    }
+
+
+@router.get("/payout-requests")
+async def list_payout_requests(
+    status: Optional[str] = None,
+    admin=Depends(require_role("admin")),
+    db=Depends(get_db),
+):
+    query = {}
+    if status:
+        query["status"] = status
+
+    cursor = db.payout_requests.find(query).sort("requested_at", -1).limit(100)
+    rows = []
+    async for row in cursor:
+        row["_id"] = str(row["_id"])
+        row["seller_id"] = str(row["seller_id"])
+        bank_details = row.get("bank_details")
+        if bank_details:
+            row["bank_details"] = {
+                "account_holder_name": bank_details.get("account_holder_name"),
+                "bank_account_masked": bank_details.get("bank_account_masked"),
+                "ifsc_code": bank_details.get("ifsc_code"),
+                "bank_name": bank_details.get("bank_name"),
+            }
+        rows.append(row)
+
+    return {"count": len(rows), "requests": rows}
+
+
+@router.post("/payout-requests/{request_id}/decision")
+async def payout_request_decision(
+    request_id: str,
+    data: PayoutDecision,
+    admin=Depends(require_role("admin")),
+    db=Depends(get_db),
+):
+    try:
+        payout_oid = parse_object_id(request_id, "request_id")
+    except HTTPException:
+        raise
+
+    payout = await db.payout_requests.find_one({"_id": payout_oid})
+    if not payout:
+        raise HTTPException(404, "Payout request not found")
+
+    if payout.get("status") != "requested":
+        raise HTTPException(400, "Payout request already processed")
+
+    now = datetime.utcnow()
+
+    update_doc = {
+        "status": "processing" if data.action == "approve" else "rejected",
+        "reviewed_at": now,
+        "reviewed_by": str(admin["_id"]),
+        "review_reason": data.reason,
+        "transfer_processed_at": None,
+    }
+
+    await db.payout_requests.update_one({"_id": payout["_id"]}, {"$set": update_doc})
+
+    if data.action == "approve":
+        seller = await db.users.find_one({"_id": payout["seller_id"]})
+        if not seller:
+            await db.payout_requests.update_one(
+                {"_id": payout["_id"]},
+                {"$set": {"status": "failed", "failure_reason": "Seller not found", "failed_at": datetime.utcnow()}},
+            )
+            raise HTTPException(404, "Seller not found")
+
+        try:
+            provider_meta = await asyncio.to_thread(
+                execute_bank_payout,
+                payout_request=payout,
+                seller=seller,
+            )
+            await db.payout_requests.update_one(
+                {"_id": payout["_id"]},
+                {
+                    "$set": {
+                        "status": "approved",
+                        "transfer_reference": provider_meta["provider_payout_id"],
+                        "transfer_processed_at": datetime.utcnow(),
+                        "provider": provider_meta["provider"],
+                        "provider_contact_id": provider_meta["provider_contact_id"],
+                        "provider_fund_account_id": provider_meta["provider_fund_account_id"],
+                        "provider_payout_id": provider_meta["provider_payout_id"],
+                        "provider_payout_status": provider_meta["provider_payout_status"],
+                    }
+                },
+            )
+            await log_audit(
+                db=db,
+                actor_id=str(admin["_id"]),
+                actor_role="admin",
+                action="EMERGENCY_PAYOUT_APPROVED",
+                metadata={
+                    "request_id": request_id,
+                    "seller_id": str(seller["_id"]),
+                    "provider": provider_meta["provider"],
+                    "provider_payout_id": provider_meta["provider_payout_id"],
+                    "amount": payout.get("amount"),
+                },
+            )
+        except Exception as e:
+            await db.payout_requests.update_one(
+                {"_id": payout["_id"]},
+                {
+                    "$set": {
+                        "status": "failed",
+                        "failure_reason": str(e),
+                        "failed_at": datetime.utcnow(),
+                    }
+                },
+            )
+            await log_audit(
+                db=db,
+                actor_id=str(admin["_id"]),
+                actor_role="admin",
+                action="EMERGENCY_PAYOUT_FAILED",
+                metadata={
+                    "request_id": request_id,
+                    "seller_id": str(seller["_id"]),
+                    "error": str(e),
+                },
+            )
+            raise
+
+    if data.action == "reject":
+        # Re-credit held emergency payout amount on rejection
+        await db.wallet_ledger.insert_one({
+            "seller_id": payout["seller_id"],
+            "order_id": None,
+            "entry_type": "EMERGENCY_PAYOUT_RELEASE",
+            "credit": payout.get("total_debit", payout["amount"]),
+            "debit": 0,
+            "reason_code": "EMERGENCY_PAYOUT_REJECTED",
+            "reference_id": payout["_id"],
+            "created_at": now,
+        })
+        await log_audit(
+            db=db,
+            actor_id=str(admin["_id"]),
+            actor_role="admin",
+            action="EMERGENCY_PAYOUT_REJECTED",
+            metadata={
+                "request_id": request_id,
+                "seller_id": str(payout["seller_id"]),
+                "amount": payout.get("amount"),
+            },
+        )
+
+    return {
+        "message": "Payout request updated",
+        "request_id": request_id,
+        "status": "approved" if data.action == "approve" else "rejected",
+    }
+
+
+@router.post("/payout-requests/{request_id}/retry")
+async def retry_failed_payout(
+    request_id: str,
+    admin=Depends(require_role("admin")),
+    db=Depends(get_db),
+):
+    try:
+        payout_oid = parse_object_id(request_id, "request_id")
+    except HTTPException:
+        raise
+
+    payout = await db.payout_requests.find_one({"_id": payout_oid})
+    if not payout:
+        raise HTTPException(404, "Payout request not found")
+    if payout.get("status") != "failed":
+        raise HTTPException(400, "Only failed payouts can be retried")
+
+    seller = await db.users.find_one({"_id": payout["seller_id"]})
+    if not seller:
+        raise HTTPException(404, "Seller not found")
+
+    await db.payout_requests.update_one(
+        {"_id": payout["_id"]},
+        {"$set": {"status": "processing", "retried_at": datetime.utcnow(), "retried_by": str(admin["_id"])}},
+    )
+
+    try:
+        provider_meta = await asyncio.to_thread(
+            execute_bank_payout,
+            payout_request=payout,
+            seller=seller,
+        )
+        await db.payout_requests.update_one(
+            {"_id": payout["_id"]},
+            {
+                "$set": {
+                    "status": "approved",
+                    "transfer_reference": provider_meta["provider_payout_id"],
+                    "transfer_processed_at": datetime.utcnow(),
+                    "provider": provider_meta["provider"],
+                    "provider_contact_id": provider_meta["provider_contact_id"],
+                    "provider_fund_account_id": provider_meta["provider_fund_account_id"],
+                    "provider_payout_id": provider_meta["provider_payout_id"],
+                    "provider_payout_status": provider_meta["provider_payout_status"],
+                    "failure_reason": None,
+                }
+            },
+        )
+        await log_audit(
+            db=db,
+            actor_id=str(admin["_id"]),
+            actor_role="admin",
+            action="EMERGENCY_PAYOUT_RETRIED_APPROVED",
+            metadata={
+                "request_id": request_id,
+                "seller_id": str(seller["_id"]),
+                "provider": provider_meta["provider"],
+                "provider_payout_id": provider_meta["provider_payout_id"],
+            },
+        )
+    except Exception as e:
+        await db.payout_requests.update_one(
+            {"_id": payout["_id"]},
+            {"$set": {"status": "failed", "failure_reason": str(e), "failed_at": datetime.utcnow()}},
+        )
+        await log_audit(
+            db=db,
+            actor_id=str(admin["_id"]),
+            actor_role="admin",
+            action="EMERGENCY_PAYOUT_RETRY_FAILED",
+            metadata={
+                "request_id": request_id,
+                "seller_id": str(seller["_id"]),
+                "error": str(e),
+            },
+        )
+        raise
+
+    return {"message": "Payout retried successfully", "request_id": request_id, "status": "approved"}
+
+
+@router.post("/payout-requests/{request_id}/reconcile")
+async def reconcile_payout_status(
+    request_id: str,
+    admin=Depends(require_role("admin")),
+    db=Depends(get_db),
+):
+    try:
+        payout_oid = parse_object_id(request_id, "request_id")
+    except HTTPException:
+        raise
+
+    payout = await db.payout_requests.find_one({"_id": payout_oid})
+    if not payout:
+        raise HTTPException(404, "Payout request not found")
+
+    provider_payout_id = payout.get("provider_payout_id")
+    if not provider_payout_id:
+        raise HTTPException(400, "Provider payout id not available for reconciliation")
+
+    provider_meta = await asyncio.to_thread(
+        fetch_payout_status,
+        provider_payout_id=provider_payout_id,
+    )
+    provider_status = (provider_meta.get("provider_payout_status") or "").lower()
+
+    update_fields = {
+        "provider": provider_meta["provider"],
+        "provider_payout_id": provider_meta["provider_payout_id"],
+        "provider_payout_status": provider_meta["provider_payout_status"],
+        "reconciled_at": datetime.utcnow(),
+        "reconciled_by": str(admin["_id"]),
+    }
+
+    if provider_status == "processed":
+        update_fields["status"] = "approved"
+        update_fields["transfer_processed_at"] = datetime.utcnow()
+    elif provider_status in {"failed", "reversed", "rejected", "cancelled"}:
+        update_fields["status"] = "failed"
+        update_fields["failed_at"] = datetime.utcnow()
+
+    await db.payout_requests.update_one(
+        {"_id": payout["_id"]},
+        {"$set": update_fields},
+    )
+
+    await log_audit(
+        db=db,
+        actor_id=str(admin["_id"]),
+        actor_role="admin",
+        action="EMERGENCY_PAYOUT_RECONCILED",
+        metadata={
+            "request_id": request_id,
+            "provider": provider_meta["provider"],
+            "provider_payout_id": provider_meta["provider_payout_id"],
+            "provider_status": provider_meta["provider_payout_status"],
+        },
+    )
+
+    return {
+        "message": "Payout reconciled",
+        "request_id": request_id,
+        "status": update_fields.get("status", payout.get("status")),
+        "provider_status": provider_meta["provider_payout_status"],
     }

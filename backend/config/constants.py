@@ -3,9 +3,9 @@
 # -----------------------------
 # COD / PAYMENT LIMITS
 # -----------------------------
-from config.env import MAX_COD_ORDER_VALUE
+from config.env import MAX_COD_ORDER_VALUE, MAX_DAILY_COD_ORDERS
 
-MAX_DAILY_COD_ORDERS = 100           # per seller per day
+PLATFORM_FEE_PER_ORDER = 10          # fixed INR fee per order
 
 # -----------------------------
 # WALLET / RISK LIMITS

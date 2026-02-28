@@ -6,9 +6,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from database import get_db
+from utils.indexes import ensure_indexes
 
 # ENV
-from config.env import ENV, CORS_ALLOWED_ORIGINS
+from config.env import ENV, CORS_ALLOWED_ORIGINS, validate_production_env
 
 # ROUTES
 from routes.auth import router as auth_router
@@ -22,16 +23,14 @@ from routes.webhooks import router as webhook_router
 from routes.address import router as address_router
 from routes.brands import router as brands_router
 from routes.uploads import router as uploads_router
+from routes.cart import router as cart_router
 
 # WORKERS
 from utils.cod_settlement_worker import cod_settlement_worker
 from utils.reserve_release_worker import reserve_release_worker
-from utils.return_worker import return_worker
 from workers.order_expiry_worker import order_expiry_worker
 from workers.return_deadline_worker import return_deadline_worker
 from workers.audit_cleanup_worker import audit_cleanup_worker
-
-print("ENV:", ENV)
 
 app = FastAPI(
     title="Brandcart API",
@@ -65,17 +64,18 @@ app.add_middleware(
 # ROUTES
 # -----------------------------
 
-app.include_router(auth_router, prefix="/api")
-app.include_router(products_router, prefix="/api")
-app.include_router(orders_router, prefix="/api")
-app.include_router(admin_router, prefix="/api")
-app.include_router(seller_router, prefix="/api")
+app.include_router(auth_router)
+app.include_router(products_router)
+app.include_router(orders_router)
+app.include_router(admin_router)
+app.include_router(seller_router)
 app.include_router(public_router, tags=["Public"])
-app.include_router(reviews_router, prefix="/api")
-app.include_router(webhook_router, prefix="/api")
-app.include_router(address_router, prefix="/api")
-app.include_router(uploads_router, prefix="/api")
-app.include_router(brands_router, prefix="/api")
+app.include_router(reviews_router)
+app.include_router(webhook_router)
+app.include_router(address_router)
+app.include_router(uploads_router)
+app.include_router(brands_router)
+app.include_router(cart_router)
 
 # -----------------------------
 # HEALTH CHECKS
@@ -98,9 +98,12 @@ async def health_db():
 
 @app.on_event("startup")
 async def start_background_workers():
+    validate_production_env()
+    db = get_db()
+    await ensure_indexes(db)
+
     asyncio.create_task(cod_settlement_worker())
     asyncio.create_task(reserve_release_worker())
-    asyncio.create_task(return_worker())
     asyncio.create_task(order_expiry_worker())
     asyncio.create_task(return_deadline_worker())
     asyncio.create_task(audit_cleanup_worker())

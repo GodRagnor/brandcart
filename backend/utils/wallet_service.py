@@ -9,6 +9,7 @@ from config.constants import SELLER_RESERVE_CONFIG
 
 ENTRY_SALE_CREDIT = "SALE_CREDIT"
 ENTRY_COMMISSION_DEBIT = "COMMISSION_DEBIT"
+ENTRY_PLATFORM_FEE_DEBIT = "PLATFORM_FEE_DEBIT"
 ENTRY_RESERVE_HOLD = "RESERVE_HOLD"
 ENTRY_RESERVE_RELEASE = "RESERVE_RELEASE"
 ENTRY_REFUND_DEBIT = "REFUND_DEBIT"
@@ -84,6 +85,16 @@ async def get_reserve_balance(db, seller_id: ObjectId) -> int:
     return max(reserve, 0)
 
 
+async def get_wallet_summary(db, seller_id: ObjectId) -> dict:
+    pipeline = [
+        {"$match": {"seller_id": seller_id}},
+        {"$group": {"_id": "$entry_type", "amount": {"$sum": {"$subtract": ["$credit", "$debit"]}}}},
+    ]
+
+    rows = await db.wallet_ledger.aggregate(pipeline).to_list(None)
+    return {row["_id"]: row["amount"] for row in rows}
+
+
 # ==============================
 # Settlement (COD / prepaid)
 # ==============================
@@ -92,23 +103,24 @@ async def process_order_settlement(
     db,
     seller_id: ObjectId,
     order_id: ObjectId,
-    order_amount: int,
+    order_amount: float,
     commission_percent: float,
+    platform_fee: float = 0,
 ):
     seller = await db.users.find_one({"_id": seller_id})
     if not seller:
         raise Exception("Seller not found")
     
-    seller = await db.users.find_one({"_id": seller_id})
     if seller.get("is_frozen"):
         raise Exception("Settlement blocked: seller is frozen")
 
     tier = seller.get("seller_tier", "standard")
     reserve_percent = SELLER_RESERVE_CONFIG.get(tier, 10)
 
-    commission = int(order_amount * commission_percent / 100)
-    reserve = int(order_amount * reserve_percent / 100)
-    seller_credit = order_amount - commission - reserve
+    commission = round(order_amount * commission_percent / 100, 2)
+    reserve = round(order_amount * reserve_percent / 100, 2)
+    platform_fee = round(float(platform_fee or 0), 2)
+    seller_credit = round(order_amount - commission - reserve - platform_fee, 2)
 
     # Commission debit
     await add_ledger_entry(
@@ -119,6 +131,17 @@ async def process_order_settlement(
         order_id=order_id,
         reason_code="COMMISSION_DEDUCTED",
     )
+
+    # Fixed platform fee debit
+    if platform_fee > 0:
+        await add_ledger_entry(
+            db,
+            seller_id,
+            ENTRY_PLATFORM_FEE_DEBIT,
+            debit=platform_fee,
+            order_id=order_id,
+            reason_code="PLATFORM_FEE_DEDUCTED",
+        )
 
     # Seller sale credit
     await add_ledger_entry(
@@ -150,7 +173,7 @@ async def process_return_refund(db, seller_id, order_id, refund_amount):
     await add_ledger_entry(
         db=db,
         seller_id=seller_id,
-        entry_type="RETURN_REFUND",
+        entry_type=ENTRY_REFUND_DEBIT,
         debit=refund_amount,
         order_id=order_id,
         reason_code="RETURN_APPROVED_REFUND",

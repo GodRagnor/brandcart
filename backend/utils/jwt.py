@@ -1,10 +1,12 @@
 from datetime import datetime, timedelta
 from jose import jwt
-import os
+from config.env import JWT_SECRET, JWT_ALGORITHM, ACCESS_TOKEN_DAYS
 
-JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")
-JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_DAYS = 30  # login valid for 30 days
+def _require_jwt_secret() -> str:
+    secret = (JWT_SECRET or "").strip()
+    if not secret:
+        raise RuntimeError("JWT_SECRET is not configured")
+    return secret
 
 def create_access_token(payload: dict) -> str:
     payload = payload.copy()
@@ -12,7 +14,7 @@ def create_access_token(payload: dict) -> str:
         "exp": datetime.utcnow() + timedelta(days=ACCESS_TOKEN_DAYS),
         "iat": datetime.utcnow()
     })
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return jwt.encode(payload, _require_jwt_secret(), algorithm=JWT_ALGORITHM)
 
 def decode_token(token: str) -> dict:
-    return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    return jwt.decode(token, _require_jwt_secret(), algorithms=[JWT_ALGORITHM])
