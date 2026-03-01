@@ -13,9 +13,16 @@ RAZORPAY_CURRENCY = "INR"
 
 
 def _require_razorpay_config() -> tuple[str, str]:
-    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+    key_id = (RAZORPAY_KEY_ID or "").strip()
+    key_secret = (RAZORPAY_KEY_SECRET or "").strip()
+    if (
+        not key_id
+        or not key_secret
+        or key_id.startswith("CHANGE_THIS")
+        or key_secret.startswith("CHANGE_THIS")
+    ):
         raise HTTPException(status_code=500, detail="Razorpay keys are not configured")
-    return RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET
+    return key_id, key_secret
 
 
 def _basic_auth_header(key_id: str, key_secret: str) -> str:

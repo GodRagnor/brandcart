@@ -312,6 +312,80 @@ async def public_product(product_id: str):
         }
     }
 
+
+@router.get("/product/{product_id}/delivery")
+async def check_product_delivery(product_id: str, pincode: str = Query(..., min_length=6, max_length=6)):
+    db = get_db()
+
+    try:
+        product_oid = ObjectId(product_id)
+    except Exception:
+        raise HTTPException(400, "Invalid product ID")
+
+    product = await db.products.find_one({"_id": product_oid})
+    if not product:
+        raise HTTPException(404, "Product not found")
+
+    seller = await db.users.find_one(
+        {"_id": product["seller_id"]},
+        {
+            "role": 1,
+            "seller_status": 1,
+            "is_frozen": 1,
+            "serviceable_areas": 1,
+            "cod_settings": 1,
+        },
+    )
+    if not seller:
+        raise HTTPException(404, "Seller not found")
+
+    if seller.get("is_frozen") or seller.get("seller_status") != "verified" or seller.get("role") != "seller":
+        return {
+            "product_id": product_id,
+            "pincode": pincode,
+            "deliverable": False,
+            "cod_available": False,
+            "reason": "Seller unavailable",
+        }
+
+    available_stock = max(0, int(product.get("stock", 0)) - int(product.get("reserved_stock", 0)))
+    if available_stock <= 0:
+        return {
+            "product_id": product_id,
+            "pincode": pincode,
+            "deliverable": False,
+            "cod_available": False,
+            "reason": "Out of stock",
+        }
+
+    area = next(
+        (
+            a for a in seller.get("serviceable_areas", [])
+            if str(a.get("pincode")) == pincode and a.get("delivery_enabled")
+        ),
+        None
+    )
+
+    if not area:
+        return {
+            "product_id": product_id,
+            "pincode": pincode,
+            "deliverable": False,
+            "cod_available": False,
+            "reason": "Delivery not available",
+        }
+
+    cod_available = bool(area.get("cod_enabled")) and bool(seller.get("cod_settings", {}).get("enabled", False))
+
+    return {
+        "product_id": product_id,
+        "pincode": pincode,
+        "deliverable": True,
+        "cod_available": cod_available,
+        "estimated_days": area.get("estimated_days"),
+        "reason": "Delivery available",
+    }
+
 # ============================================================
 # PUBLIC SELLER PROFILE
 # ============================================================

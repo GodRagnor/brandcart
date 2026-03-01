@@ -24,6 +24,7 @@ from routes.address import router as address_router
 from routes.brands import router as brands_router
 from routes.uploads import router as uploads_router
 from routes.cart import router as cart_router
+from routes.questions import router as questions_router
 
 # WORKERS
 from utils.cod_settlement_worker import cod_settlement_worker
@@ -76,6 +77,7 @@ app.include_router(address_router)
 app.include_router(uploads_router)
 app.include_router(brands_router)
 app.include_router(cart_router)
+app.include_router(questions_router)
 
 # -----------------------------
 # HEALTH CHECKS

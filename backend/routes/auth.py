@@ -16,6 +16,8 @@ from utils.rate_limit import rate_limit
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
 ADMIN_PHONE = os.getenv("ADMIN_PHONE")
+ENV = (os.getenv("ENV", "development") or "development").lower()
+OTP_DEV_MODE = (os.getenv("OTP_DEV_MODE", "true" if ENV != "production" else "false")).lower() in {"1", "true", "yes", "on"}
 
 OTP_EXPIRY_MINUTES = 5
 OTP_MAX_ATTEMPTS = 5
@@ -71,7 +73,10 @@ async def send_otp(data: SendOtpRequest):
         upsert=True
     )
 
-    return {"message": "OTP sent"}
+    response = {"message": "OTP sent"}
+    if OTP_DEV_MODE:
+        response["otp"] = otp
+    return response
 
 # ======================
 # Verify OTP (LOGIN)
@@ -144,6 +149,48 @@ async def me(user=Depends(get_current_user)):
         "phone": user["phone"],
         "role": user["role"],
         "is_frozen": user.get("is_frozen", False)
+    }
+
+
+@router.get("/seller-request-status")
+async def seller_request_status(user=Depends(get_current_user)):
+    seller_request = user.get("seller_request") or {}
+    seller_profile = user.get("seller_profile") or {}
+
+    request_payload = None
+    if seller_request:
+        docs = seller_request.get("documents") or {}
+        request_payload = {
+            "legal_name": seller_request.get("legal_name"),
+            "brand_name": seller_request.get("brand_name"),
+            "category": seller_request.get("category"),
+            "description": seller_request.get("description"),
+            "email": seller_request.get("email"),
+            "logo_url": seller_request.get("logo_url"),
+            "documents": {
+                "pan_card": docs.get("pan_card"),
+                "gst_certificate": docs.get("gst_certificate"),
+                "address_proof": docs.get("address_proof"),
+            },
+        }
+
+    profile_payload = None
+    if seller_profile:
+        profile_payload = {
+            "brand_name": seller_profile.get("brand_name"),
+            "slug": seller_profile.get("slug"),
+            "category": seller_profile.get("category"),
+        }
+
+    return {
+        "role": user.get("role"),
+        "seller_status": user.get("seller_status", "none"),
+        "requested_at": user.get("seller_requested_at"),
+        "rejected_at": user.get("seller_rejected_at"),
+        "rejected_reason": user.get("seller_rejected_reason"),
+        "verified_at": user.get("seller_verified_at"),
+        "request": request_payload,
+        "seller_profile": profile_payload,
     }
 
 # -----------------------

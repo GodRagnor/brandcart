@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
-import { apiGet } from './lib/api'
+import { apiGet, apiPost } from './lib/api'
 
 const categoryIcons = [
   { label: 'Mobiles', icon: 'mobiles', query: 'mobile' },
@@ -48,6 +48,36 @@ const readWishlistIds = () => {
     return parsed.filter((id) => typeof id === 'string')
   } catch {
     return []
+  }
+}
+
+const AUTH_TOKEN_KEY = 'brandcartAuthToken'
+const AUTH_PHONE_KEY = 'brandcartAuthPhone'
+const AUTH_ROLE_KEY = 'brandcartAuthRole'
+const ACCOUNT_PROFILE_KEY = 'brandcartAccountProfile'
+const ACCOUNT_CARDS_KEY = 'brandcartSavedCards'
+const ACCOUNT_DEVICES_KEY = 'brandcartDeviceSessions'
+const ACCOUNT_NOTIFICATIONS_KEY = 'brandcartNotificationPrefs'
+const ACCOUNT_PRIVACY_KEY = 'brandcartPrivacyPrefs'
+const ACCOUNT_QA_KEY = 'brandcartQaItems'
+const ACCOUNT_REVIEWS_KEY = 'brandcartReviewDrafts'
+const paymentOptions = [
+  { id: 'RAZORPAY', title: 'UPI / Card / Wallet / NetBanking', subtitle: 'Secure online payment via Razorpay' },
+  { id: 'COD', title: 'Cash on Delivery', subtitle: 'Pay when product is delivered' },
+]
+
+const readAuthToken = () => localStorage.getItem(AUTH_TOKEN_KEY) || ''
+const readAuthPhone = () => localStorage.getItem(AUTH_PHONE_KEY) || ''
+const readAuthRole = () => localStorage.getItem(AUTH_ROLE_KEY) || 'buyer'
+const readStoredJson = (key, fallback) => {
+  const raw = localStorage.getItem(key)
+  if (!raw) {
+    return fallback
+  }
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return fallback
   }
 }
 
@@ -317,6 +347,14 @@ function AccountMenuIcon({ type }) {
       </svg>
     )
   }
+  if (type === 'admin') {
+    return (
+      <svg {...iconProps}>
+        <path d="M12 3 4.8 6.1v5.2c0 4.8 3 7.8 7.2 9.7 4.2-1.9 7.2-4.9 7.2-9.7V6.1z" />
+        <path d="m9.6 12 1.7 1.8 3.3-3.6" />
+      </svg>
+    )
+  }
   if (type === 'docs') {
     return (
       <svg {...iconProps}>
@@ -350,6 +388,10 @@ function App() {
 
   const [productReviews, setProductReviews] = useState({ count: 0, average: null, reviews: [] })
   const [isLoadingReviews, setIsLoadingReviews] = useState(false)
+  const [productQuestions, setProductQuestions] = useState([])
+  const [isLoadingQuestions, setIsLoadingQuestions] = useState(false)
+  const [questionInput, setQuestionInput] = useState('')
+  const [isSubmittingQuestion, setIsSubmittingQuestion] = useState(false)
 
   const [sellerProfile, setSellerProfile] = useState(null)
   const [similarProducts, setSimilarProducts] = useState([])
@@ -365,6 +407,122 @@ function App() {
   const [activeCategoryQuery, setActiveCategoryQuery] = useState('mobile')
   const [notificationsEnabled, setNotificationsEnabled] = useState(true)
   const [accountLanguage, setAccountLanguage] = useState('English')
+  const [authToken, setAuthToken] = useState(readAuthToken)
+  const [userPhone, setUserPhone] = useState(readAuthPhone)
+  const [userRole, setUserRole] = useState(readAuthRole)
+  const [authPhoneInput, setAuthPhoneInput] = useState('')
+  const [authOtpInput, setAuthOtpInput] = useState('')
+  const [isSendingOtp, setIsSendingOtp] = useState(false)
+  const [isVerifyingOtp, setIsVerifyingOtp] = useState(false)
+  const [isOtpSent, setIsOtpSent] = useState(false)
+  const [debugOtp, setDebugOtp] = useState('')
+  const [checkoutPending, setCheckoutPending] = useState(false)
+  const [addresses, setAddresses] = useState([])
+  const [isLoadingAddresses, setIsLoadingAddresses] = useState(false)
+  const [isSavingAddress, setIsSavingAddress] = useState(false)
+  const [selectedCheckoutAddress, setSelectedCheckoutAddress] = useState(null)
+  const [selectedPaymentMethod, setSelectedPaymentMethod] = useState('RAZORPAY')
+  const [isPlacingOrder, setIsPlacingOrder] = useState(false)
+  const [paymentError, setPaymentError] = useState('')
+  const [deliveryPincode, setDeliveryPincode] = useState('')
+  const [isCheckingDelivery, setIsCheckingDelivery] = useState(false)
+  const [deliveryCheck, setDeliveryCheck] = useState({
+    checked: false,
+    deliverable: null,
+    codAvailable: null,
+    reason: '',
+    estimatedDays: null,
+  })
+  const [accountView, setAccountView] = useState('menu')
+  const [profileForm, setProfileForm] = useState(() => readStoredJson(ACCOUNT_PROFILE_KEY, {
+    fullName: '',
+    email: '',
+    gender: 'Prefer not to say',
+  }))
+  const [savedCards, setSavedCards] = useState(() => readStoredJson(ACCOUNT_CARDS_KEY, []))
+  const [cardForm, setCardForm] = useState({
+    holder: '',
+    number: '',
+    expiry: '',
+  })
+  const [deviceSessions, setDeviceSessions] = useState(() => readStoredJson(ACCOUNT_DEVICES_KEY, []))
+  const [notificationPrefs, setNotificationPrefs] = useState(() => readStoredJson(ACCOUNT_NOTIFICATIONS_KEY, {
+    orderUpdates: true,
+    promotions: true,
+    priceAlerts: true,
+  }))
+  const [privacyPrefs, setPrivacyPrefs] = useState(() => readStoredJson(ACCOUNT_PRIVACY_KEY, {
+    personalizedAds: true,
+    usageAnalytics: true,
+    savedSearches: true,
+  }))
+  const [qaItems, setQaItems] = useState(() => readStoredJson(ACCOUNT_QA_KEY, []))
+  const [qaInput, setQaInput] = useState('')
+  const [reviewDrafts, setReviewDrafts] = useState(() => readStoredJson(ACCOUNT_REVIEWS_KEY, []))
+  const [reviewInput, setReviewInput] = useState('')
+  const [sellerRequestForm, setSellerRequestForm] = useState({
+    legal_name: '',
+    brand_name: '',
+    category: '',
+    description: '',
+    email: '',
+    pan_card: '',
+    gst_certificate: '',
+    address_proof: '',
+    logo_url: '',
+  })
+  const [isSubmittingSellerRequest, setIsSubmittingSellerRequest] = useState(false)
+  const [sellerOnboarding, setSellerOnboarding] = useState({
+    status: 'none',
+    requestedAt: '',
+    rejectedAt: '',
+    rejectedReason: '',
+    request: null,
+  })
+  const [isLoadingSellerOnboarding, setIsLoadingSellerOnboarding] = useState(false)
+  const [adminSellerRequests, setAdminSellerRequests] = useState([])
+  const [isLoadingAdminSellerRequests, setIsLoadingAdminSellerRequests] = useState(false)
+  const [adminUpdatingSellerId, setAdminUpdatingSellerId] = useState('')
+  const [adminRejectReasons, setAdminRejectReasons] = useState({})
+  const [adminActiveSellers, setAdminActiveSellers] = useState([])
+  const [isLoadingAdminActiveSellers, setIsLoadingAdminActiveSellers] = useState(false)
+  const [adminSellerRanking, setAdminSellerRanking] = useState([])
+  const [isLoadingAdminSellerRanking, setIsLoadingAdminSellerRanking] = useState(false)
+  const [adminRiskDashboard, setAdminRiskDashboard] = useState(null)
+  const [isLoadingAdminRiskDashboard, setIsLoadingAdminRiskDashboard] = useState(false)
+  const [adminFinanceSummary, setAdminFinanceSummary] = useState(null)
+  const [isLoadingAdminFinanceSummary, setIsLoadingAdminFinanceSummary] = useState(false)
+  const [adminOrderSummary, setAdminOrderSummary] = useState(null)
+  const [isLoadingAdminOrderSummary, setIsLoadingAdminOrderSummary] = useState(false)
+  const [adminPayoutRequests, setAdminPayoutRequests] = useState([])
+  const [adminPayoutStatusFilter, setAdminPayoutStatusFilter] = useState('')
+  const [isLoadingAdminPayoutRequests, setIsLoadingAdminPayoutRequests] = useState(false)
+  const [adminPayoutDecisionReasons, setAdminPayoutDecisionReasons] = useState({})
+  const [adminUpdatingPayoutId, setAdminUpdatingPayoutId] = useState('')
+  const [adminFreezeReasons, setAdminFreezeReasons] = useState({})
+  const [adminUpdatingSellerActionId, setAdminUpdatingSellerActionId] = useState('')
+  const [adminRiskSnapshots, setAdminRiskSnapshots] = useState({})
+  const [adminLoadingRiskSellerId, setAdminLoadingRiskSellerId] = useState('')
+  const [commissionInput, setCommissionInput] = useState('')
+  const [isUpdatingCommission, setIsUpdatingCommission] = useState(false)
+  const [festivalForm, setFestivalForm] = useState({
+    slug: '',
+    name: '',
+    start_at: '',
+    end_at: '',
+    eligible_tiers: 'verified_fast',
+  })
+  const [isCreatingFestival, setIsCreatingFestival] = useState(false)
+  const [addressForm, setAddressForm] = useState({
+    name: '',
+    phone: '',
+    line1: '',
+    city: '',
+    state: '',
+    pincode: '',
+    is_default: false,
+  })
+  const isLoggedIn = Boolean(authToken)
 
   const buildLocalSuggestions = (query) => {
     const needle = query.trim().toLowerCase()
@@ -465,6 +623,144 @@ function App() {
   }, [wishlistIds])
 
   useEffect(() => {
+    if (authToken) {
+      localStorage.setItem(AUTH_TOKEN_KEY, authToken)
+    } else {
+      localStorage.removeItem(AUTH_TOKEN_KEY)
+    }
+  }, [authToken])
+
+  useEffect(() => {
+    if (userPhone) {
+      localStorage.setItem(AUTH_PHONE_KEY, userPhone)
+    } else {
+      localStorage.removeItem(AUTH_PHONE_KEY)
+    }
+  }, [userPhone])
+
+  useEffect(() => {
+    if (userRole) {
+      localStorage.setItem(AUTH_ROLE_KEY, userRole)
+    } else {
+      localStorage.removeItem(AUTH_ROLE_KEY)
+    }
+  }, [userRole])
+
+  useEffect(() => {
+    if (!authToken) {
+      setUserPhone('')
+      setUserRole('buyer')
+      setAddresses([])
+      setAdminSellerRequests([])
+      setAdminActiveSellers([])
+      setAdminSellerRanking([])
+      setAdminRiskDashboard(null)
+      setAdminFinanceSummary(null)
+      setAdminOrderSummary(null)
+      setAdminPayoutRequests([])
+      setAdminRiskSnapshots({})
+      setSellerOnboarding({
+        status: 'none',
+        requestedAt: '',
+        rejectedAt: '',
+        rejectedReason: '',
+        request: null,
+      })
+      return
+    }
+
+    let cancelled = false
+    const loadMe = async () => {
+      try {
+        const me = await apiGet('/api/auth/me', { token: authToken })
+        if (!cancelled) {
+          setUserPhone(me?.phone || '')
+          setUserRole(me?.role || 'buyer')
+        }
+      } catch {
+        if (!cancelled) {
+          setAuthToken('')
+          setUserPhone('')
+          setUserRole('buyer')
+          setAddresses([])
+          setAdminSellerRequests([])
+          setAdminActiveSellers([])
+          setAdminSellerRanking([])
+          setAdminRiskDashboard(null)
+          setAdminFinanceSummary(null)
+          setAdminOrderSummary(null)
+          setAdminPayoutRequests([])
+          setAdminRiskSnapshots({})
+        }
+      }
+    }
+
+    loadMe()
+    return () => {
+      cancelled = true
+    }
+  }, [authToken])
+
+  useEffect(() => {
+    if (!authToken || accountView !== 'sell') {
+      return
+    }
+
+    let cancelled = false
+    const loadSellerOnboarding = async () => {
+      setIsLoadingSellerOnboarding(true)
+      try {
+        const response = await apiGet('/api/auth/seller-request-status', { token: authToken })
+        if (cancelled) {
+          return
+        }
+        const status = response?.seller_status || 'none'
+        const request = response?.request && typeof response.request === 'object' ? response.request : null
+        setUserRole(response?.role || 'buyer')
+        setSellerOnboarding({
+          status,
+          requestedAt: response?.requested_at || '',
+          rejectedAt: response?.rejected_at || '',
+          rejectedReason: response?.rejected_reason || '',
+          request,
+        })
+        if (request) {
+          setSellerRequestForm((prev) => ({
+            legal_name: prev.legal_name || request.legal_name || '',
+            brand_name: prev.brand_name || request.brand_name || '',
+            category: prev.category || request.category || '',
+            description: prev.description || request.description || '',
+            email: prev.email || request.email || '',
+            pan_card: prev.pan_card || request?.documents?.pan_card || '',
+            gst_certificate: prev.gst_certificate || request?.documents?.gst_certificate || '',
+            address_proof: prev.address_proof || request?.documents?.address_proof || '',
+            logo_url: prev.logo_url || request.logo_url || '',
+          }))
+        }
+      } catch {
+        if (!cancelled) {
+          setSellerOnboarding({
+            status: 'none',
+            requestedAt: '',
+            rejectedAt: '',
+            rejectedReason: '',
+            request: null,
+          })
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingSellerOnboarding(false)
+        }
+      }
+    }
+
+    loadSellerOnboarding()
+    return () => {
+      cancelled = true
+    }
+  }, [authToken, accountView])
+
+  useEffect(() => {
     if (!Array.isArray(wishlistIds) || wishlistIds.length === 0) {
       setWishlistItems([])
       setIsLoadingWishlistItems(false)
@@ -504,6 +800,45 @@ function App() {
       cancelled = true
     }
   }, [wishlistIds, products, similarProducts, productDetail, activeProductSummary])
+
+  useEffect(() => {
+    localStorage.setItem(ACCOUNT_PROFILE_KEY, JSON.stringify(profileForm))
+  }, [profileForm])
+
+  useEffect(() => {
+    localStorage.setItem(ACCOUNT_CARDS_KEY, JSON.stringify(savedCards))
+  }, [savedCards])
+
+  useEffect(() => {
+    localStorage.setItem(ACCOUNT_DEVICES_KEY, JSON.stringify(deviceSessions))
+  }, [deviceSessions])
+
+  useEffect(() => {
+    localStorage.setItem(ACCOUNT_NOTIFICATIONS_KEY, JSON.stringify(notificationPrefs))
+  }, [notificationPrefs])
+
+  useEffect(() => {
+    setNotificationsEnabled(Boolean(notificationPrefs.orderUpdates || notificationPrefs.promotions || notificationPrefs.priceAlerts))
+  }, [notificationPrefs])
+
+  useEffect(() => {
+    localStorage.setItem(ACCOUNT_PRIVACY_KEY, JSON.stringify(privacyPrefs))
+  }, [privacyPrefs])
+
+  useEffect(() => {
+    localStorage.setItem(ACCOUNT_QA_KEY, JSON.stringify(qaItems))
+  }, [qaItems])
+
+  useEffect(() => {
+    localStorage.setItem(ACCOUNT_REVIEWS_KEY, JSON.stringify(reviewDrafts))
+  }, [reviewDrafts])
+
+  useEffect(() => {
+    if (!userPhone) {
+      return
+    }
+    setProfileForm((prev) => ({ ...prev, phone: userPhone }))
+  }, [userPhone])
 
   useEffect(() => {
     const trimmed = searchText.trim()
@@ -552,6 +887,13 @@ function App() {
       setProductDetail(null)
       setDetailError('')
       setSelectedImage('')
+      setDeliveryCheck({
+        checked: false,
+        deliverable: null,
+        codAvailable: null,
+        reason: '',
+        estimatedDays: null,
+      })
       return
     }
 
@@ -584,19 +926,64 @@ function App() {
       return
     }
 
+    let cancelled = false
     const loadReviews = async () => {
       setIsLoadingReviews(true)
       try {
         const response = await apiGet(`/api/reviews/product/${activeProductId}`)
-        setProductReviews(summarizeReviews(response))
+        if (!cancelled) {
+          setProductReviews(summarizeReviews(response))
+        }
       } catch {
-        setProductReviews({ count: 0, average: null, reviews: [] })
+        if (!cancelled) {
+          setProductReviews({ count: 0, average: null, reviews: [] })
+        }
       } finally {
-        setIsLoadingReviews(false)
+        if (!cancelled) {
+          setIsLoadingReviews(false)
+        }
       }
     }
 
     loadReviews()
+    const timer = setInterval(loadReviews, 15000)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [activeProductId])
+
+  useEffect(() => {
+    if (!activeProductId) {
+      setProductQuestions([])
+      return
+    }
+
+    let cancelled = false
+    const loadQuestions = async () => {
+      setIsLoadingQuestions(true)
+      try {
+        const response = await apiGet(`/api/questions/product/${activeProductId}`)
+        if (!cancelled) {
+          setProductQuestions(Array.isArray(response?.items) ? response.items : [])
+        }
+      } catch {
+        if (!cancelled) {
+          setProductQuestions([])
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingQuestions(false)
+        }
+      }
+    }
+
+    loadQuestions()
+    const timer = setInterval(loadQuestions, 15000)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
   }, [activeProductId])
 
   useEffect(() => {
@@ -725,6 +1112,340 @@ function App() {
     setTimeout(() => setCartNotice(''), 1400)
   }
 
+  const normalizePhoneInput = (value) => value.replace(/\D/g, '').slice(0, 10)
+
+  const loadAddresses = async (tokenOverride = '') => {
+    const token = tokenOverride || authToken
+    if (!token) {
+      return
+    }
+    setIsLoadingAddresses(true)
+    try {
+      const data = await apiGet('/api/addresses', { token })
+      setAddresses(Array.isArray(data) ? data : [])
+    } catch {
+      setAddresses([])
+      flashNotice('Could not load addresses')
+    } finally {
+      setIsLoadingAddresses(false)
+    }
+  }
+
+  const openAddressPanel = () => {
+    if (!isLoggedIn) {
+      setCheckoutPending(false)
+      setActiveQuickPanel('auth')
+      flashNotice('Login required')
+      return
+    }
+    setSelectedCheckoutAddress(null)
+    setActiveQuickPanel('address')
+    loadAddresses()
+  }
+
+  const sendOtp = async (event) => {
+    event.preventDefault()
+    const phone = normalizePhoneInput(authPhoneInput)
+    if (phone.length !== 10) {
+      flashNotice('Enter a valid 10-digit phone number')
+      return
+    }
+
+    setIsSendingOtp(true)
+    try {
+      const response = await apiPost('/api/auth/send-otp', { phone })
+      setAuthPhoneInput(phone)
+      setIsOtpSent(true)
+      const nextOtp = typeof response?.otp === 'string' ? response.otp : ''
+      setDebugOtp(nextOtp)
+      flashNotice(nextOtp ? `OTP: ${nextOtp}` : 'OTP sent')
+    } catch {
+      flashNotice('Failed to send OTP')
+    } finally {
+      setIsSendingOtp(false)
+    }
+  }
+
+  const verifyOtp = async (event) => {
+    event.preventDefault()
+    const phone = normalizePhoneInput(authPhoneInput)
+    const otp = authOtpInput.trim()
+    if (phone.length !== 10 || otp.length < 4) {
+      flashNotice('Enter phone and OTP')
+      return
+    }
+
+    setIsVerifyingOtp(true)
+    try {
+      const response = await apiPost('/api/auth/verify-otp', { phone, otp })
+      const nextToken = response?.access_token || ''
+      if (!nextToken) {
+        throw new Error('Missing token')
+      }
+      setUserRole(response?.role || 'buyer')
+      setAuthToken(nextToken)
+      setUserPhone(phone)
+      recordDeviceSession(phone)
+      setIsOtpSent(false)
+      setDebugOtp('')
+      setAuthOtpInput('')
+      flashNotice('Login successful')
+      if (checkoutPending) {
+        setCheckoutPending(false)
+        setActiveQuickPanel('address')
+        loadAddresses(nextToken)
+      } else {
+        setActiveQuickPanel('account')
+      }
+    } catch {
+      flashNotice('Invalid OTP')
+    } finally {
+      setIsVerifyingOtp(false)
+    }
+  }
+
+  const logout = () => {
+    setAuthToken('')
+    setUserPhone('')
+    setUserRole('buyer')
+    setIsOtpSent(false)
+    setDebugOtp('')
+    setAuthOtpInput('')
+    setCheckoutPending(false)
+    setAddresses([])
+    setAdminSellerRequests([])
+    setAdminActiveSellers([])
+    setAdminSellerRanking([])
+    setAdminRiskDashboard(null)
+    setAdminFinanceSummary(null)
+    setAdminOrderSummary(null)
+    setAdminPayoutRequests([])
+    setAdminRiskSnapshots({})
+    setAdminRejectReasons({})
+    flashNotice('Logged out')
+  }
+
+  const updateAddressField = (field, value) => {
+    setAddressForm((prev) => ({ ...prev, [field]: value }))
+  }
+
+  const addAddress = async (event) => {
+    event.preventDefault()
+    if (!authToken) {
+      flashNotice('Login required')
+      return
+    }
+
+    const payload = {
+      name: addressForm.name.trim(),
+      phone: normalizePhoneInput(addressForm.phone),
+      line1: addressForm.line1.trim(),
+      city: addressForm.city.trim(),
+      state: addressForm.state.trim(),
+      pincode: addressForm.pincode.replace(/\D/g, '').slice(0, 6),
+      is_default: Boolean(addressForm.is_default),
+    }
+
+    if (!payload.name || !payload.phone || !payload.line1 || !payload.city || !payload.state || payload.pincode.length !== 6) {
+      flashNotice('Complete all address fields')
+      return
+    }
+
+    setIsSavingAddress(true)
+    try {
+      await apiPost('/api/addresses', payload, { token: authToken })
+      setAddressForm((prev) => ({
+        ...prev,
+        line1: '',
+        city: '',
+        state: '',
+        pincode: '',
+        is_default: false,
+      }))
+      flashNotice('Address added')
+      loadAddresses()
+    } catch {
+      flashNotice('Could not add address')
+    } finally {
+      setIsSavingAddress(false)
+    }
+  }
+
+  const proceedToPayment = (selectedAddress) => {
+    setSelectedCheckoutAddress(selectedAddress || null)
+    setSelectedPaymentMethod('RAZORPAY')
+    setPaymentError('')
+    setActiveQuickPanel('payment')
+  }
+
+  const createIdempotencyKey = (prefix) => {
+    if (window.crypto?.randomUUID) {
+      return `${prefix}-${window.crypto.randomUUID()}`
+    }
+    return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  }
+
+  const loadRazorpayCheckout = () => new Promise((resolve, reject) => {
+    if (window.Razorpay) {
+      resolve(true)
+      return
+    }
+    const script = document.createElement('script')
+    script.src = 'https://checkout.razorpay.com/v1/checkout.js'
+    script.async = true
+    script.onload = () => resolve(true)
+    script.onerror = () => reject(new Error('Failed to load Razorpay SDK'))
+    document.body.appendChild(script)
+  })
+
+  const buildCreateOrderPath = ({ productId, quantity, paymentMethod, addressId, idempotencyKey }) => {
+    const params = new URLSearchParams({
+      product_id: String(productId),
+      quantity: String(quantity),
+      payment_method: paymentMethod,
+      idempotency_key: idempotencyKey,
+    })
+    if (addressId) {
+      params.set('address_id', String(addressId))
+    }
+    return `/api/orders/create?${params.toString()}`
+  }
+
+  const placeCodOrders = async () => {
+    const addressId = selectedCheckoutAddress?._id
+    if (!addressId) {
+      throw new Error('Address is missing')
+    }
+
+    const results = []
+    for (const item of cartItems) {
+      const response = await apiPost(
+        buildCreateOrderPath({
+          productId: item.id,
+          quantity: Number(item.qty || 1),
+          paymentMethod: 'COD',
+          addressId,
+          idempotencyKey: createIdempotencyKey('cod'),
+        }),
+        undefined,
+        { token: authToken },
+      )
+      results.push(response)
+    }
+    return results
+  }
+
+  const placeRazorpayOrder = async () => {
+    if (cartItems.length !== 1) {
+      throw new Error('Online payment is supported for one item at a time. Use Buy Now for Razorpay or use COD for full cart.')
+    }
+
+    const item = cartItems[0]
+    const addressId = selectedCheckoutAddress?._id
+    if (!addressId) {
+      throw new Error('Address is missing')
+    }
+
+    const created = await apiPost(
+      buildCreateOrderPath({
+        productId: item.id,
+        quantity: Number(item.qty || 1),
+        paymentMethod: 'RAZORPAY',
+        addressId,
+        idempotencyKey: createIdempotencyKey('rzp-create'),
+      }),
+      undefined,
+      { token: authToken },
+    )
+
+    const payment = created?.payment
+    if (!payment?.key_id || !payment?.razorpay_order_id) {
+      throw new Error('Invalid payment session from backend')
+    }
+
+    await loadRazorpayCheckout()
+
+    await new Promise((resolve, reject) => {
+      const options = {
+        key: payment.key_id,
+        amount: payment.amount_paise,
+        currency: payment.currency || 'INR',
+        name: 'Brandcart',
+        description: item.title || 'Order payment',
+        order_id: payment.razorpay_order_id,
+        prefill: {
+          contact: userPhone || authPhoneInput || '',
+        },
+        theme: {
+          color: '#f0b83f',
+        },
+        handler: async (rzpResponse) => {
+          try {
+            await apiPost('/api/orders/payment/razorpay/verify', {
+              order_id: created.order_id,
+              razorpay_order_id: rzpResponse.razorpay_order_id,
+              razorpay_payment_id: rzpResponse.razorpay_payment_id,
+              razorpay_signature: rzpResponse.razorpay_signature,
+              idempotency_key: createIdempotencyKey('rzp-verify'),
+            }, { token: authToken })
+            resolve(created)
+          } catch (error) {
+            reject(error)
+          }
+        },
+        modal: {
+          ondismiss: () => reject(new Error('Payment cancelled')),
+        },
+      }
+      const razorpay = new window.Razorpay(options)
+      razorpay.on('payment.failed', (event) => {
+        const reason = event?.error?.description || 'Payment failed'
+        reject(new Error(reason))
+      })
+      razorpay.open()
+    })
+  }
+
+  const completeCheckout = async () => {
+    if (!selectedCheckoutAddress) {
+      flashNotice('Select delivery address')
+      return
+    }
+    if (!cartItems.length) {
+      flashNotice('Cart is empty')
+      return
+    }
+
+    setIsPlacingOrder(true)
+    setPaymentError('')
+    try {
+      if (selectedPaymentMethod === 'COD') {
+        await placeCodOrders()
+      } else if (selectedPaymentMethod === 'RAZORPAY') {
+        await placeRazorpayOrder()
+      } else {
+        throw new Error('Unsupported payment method')
+      }
+
+      const itemCount = cartItems.reduce((sum, item) => sum + Number(item.qty || 1), 0)
+      const selected = paymentOptions.find((item) => item.id === selectedPaymentMethod)
+      const methodLabel = selected?.title || selectedPaymentMethod
+      const city = selectedCheckoutAddress?.city
+
+      setCartItems([])
+      setCheckoutPending(false)
+      setSelectedCheckoutAddress(null)
+      closeQuickPanel()
+      flashNotice(`Order placed via ${methodLabel} for ${itemCount} item${itemCount > 1 ? 's' : ''}${city ? ` to ${city}` : ''}`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not place order'
+      setPaymentError(message)
+      flashNotice(message)
+    } finally {
+      setIsPlacingOrder(false)
+    }
+  }
+
   const addProductToCart = (product, preferredImage = '') => {
     if (!product?.id) {
       return
@@ -829,6 +1550,10 @@ function App() {
     if (!productDetail?.id) {
       return
     }
+    if (deliveryCheck.checked && deliveryCheck.deliverable === false) {
+      flashNotice('Not deliverable to this pincode')
+      return
+    }
     addProductToCart(productDetail, selectedImage || detailImages[0] || null)
   }
 
@@ -846,82 +1571,530 @@ function App() {
   }
 
   const openAccountPanel = () => {
+    if (!isLoggedIn) {
+      setCheckoutPending(false)
+      setActiveQuickPanel((prev) => (prev === 'auth' ? '' : 'auth'))
+      return
+    }
+    setAccountView('menu')
     setActiveQuickPanel((prev) => (prev === 'account' ? '' : 'account'))
   }
 
   const closeQuickPanel = () => {
+    setAccountView('menu')
     setActiveQuickPanel('')
   }
 
+  const recordDeviceSession = (phone) => {
+    const nextDevice = {
+      id: window.crypto?.randomUUID ? window.crypto.randomUUID() : `dev-${Date.now()}`,
+      label: `${navigator.platform || 'Device'} / ${navigator.userAgent?.includes('Mobile') ? 'Mobile' : 'Desktop'}`,
+      phone,
+      last_active_at: new Date().toISOString(),
+      current: true,
+    }
+    setDeviceSessions((prev) => {
+      const normalized = (Array.isArray(prev) ? prev : []).map((item) => ({ ...item, current: false }))
+      return [nextDevice, ...normalized].slice(0, 6)
+    })
+  }
+
+  const saveProfile = (event) => {
+    event.preventDefault()
+    if (!profileForm.fullName.trim()) {
+      flashNotice('Name is required')
+      return
+    }
+    flashNotice('Profile updated')
+    setAccountView('menu')
+  }
+
+  const addSavedCard = (event) => {
+    event.preventDefault()
+    const digits = cardForm.number.replace(/\D/g, '')
+    if (digits.length < 12 || !cardForm.holder.trim() || !cardForm.expiry.trim()) {
+      flashNotice('Enter valid card details')
+      return
+    }
+    setSavedCards((prev) => ([
+      {
+        id: window.crypto?.randomUUID ? window.crypto.randomUUID() : `card-${Date.now()}`,
+        holder: cardForm.holder.trim(),
+        last4: digits.slice(-4),
+        expiry: cardForm.expiry.trim(),
+      },
+      ...prev,
+    ]))
+    setCardForm({ holder: '', number: '', expiry: '' })
+    flashNotice('Card saved')
+  }
+
+  const removeSavedCard = (id) => {
+    setSavedCards((prev) => prev.filter((item) => item.id !== id))
+    flashNotice('Card removed')
+  }
+
+  const saveLanguage = (language) => {
+    setAccountLanguage(language)
+    flashNotice(`Language: ${language}`)
+    setAccountView('menu')
+  }
+
+  const toggleNotificationPref = (key) => {
+    setNotificationPrefs((prev) => ({ ...prev, [key]: !prev[key] }))
+  }
+
+  const togglePrivacyPref = (key) => {
+    setPrivacyPrefs((prev) => ({ ...prev, [key]: !prev[key] }))
+  }
+
+  const addQuestion = (event) => {
+    event.preventDefault()
+    const value = qaInput.trim()
+    if (!value) {
+      return
+    }
+    setQaItems((prev) => ([{
+      id: window.crypto?.randomUUID ? window.crypto.randomUUID() : `qa-${Date.now()}`,
+      question: value,
+      answer: 'Thanks, our team will respond soon.',
+      created_at: new Date().toISOString(),
+    }, ...prev]))
+    setQaInput('')
+    flashNotice('Question submitted')
+  }
+
+  const addReviewDraft = (event) => {
+    event.preventDefault()
+    const value = reviewInput.trim()
+    if (!value) {
+      return
+    }
+    setReviewDrafts((prev) => ([{
+      id: window.crypto?.randomUUID ? window.crypto.randomUUID() : `review-${Date.now()}`,
+      text: value,
+      created_at: new Date().toISOString(),
+    }, ...prev]))
+    setReviewInput('')
+    flashNotice('Review draft saved')
+  }
+
+  const submitSellerRequest = async (event) => {
+    event.preventDefault()
+    if (!authToken) {
+      flashNotice('Login required')
+      return
+    }
+    if (sellerOnboarding.status === 'requested') {
+      flashNotice('Your seller request is already under review')
+      return
+    }
+    if (userRole === 'seller' || sellerOnboarding.status === 'verified') {
+      flashNotice('Your account is already verified as seller')
+      return
+    }
+    const payload = {
+      legal_name: sellerRequestForm.legal_name.trim(),
+      brand_name: sellerRequestForm.brand_name.trim(),
+      category: sellerRequestForm.category.trim(),
+      description: sellerRequestForm.description.trim(),
+      email: sellerRequestForm.email.trim() || undefined,
+      logo_url: sellerRequestForm.logo_url.trim() || undefined,
+      documents: {
+        pan_card: sellerRequestForm.pan_card.trim().toUpperCase(),
+        gst_certificate: sellerRequestForm.gst_certificate.trim().toUpperCase(),
+        address_proof: sellerRequestForm.address_proof.trim(),
+      },
+    }
+    if (!payload.legal_name || !payload.brand_name || !payload.category || !payload.documents.pan_card || !payload.documents.gst_certificate || !payload.documents.address_proof) {
+      flashNotice('Complete seller request form')
+      return
+    }
+    setIsSubmittingSellerRequest(true)
+    try {
+      await apiPost('/api/auth/request-seller', payload, { token: authToken })
+      setSellerOnboarding({
+        status: 'requested',
+        requestedAt: new Date().toISOString(),
+        rejectedAt: '',
+        rejectedReason: '',
+        request: {
+          legal_name: payload.legal_name,
+          brand_name: payload.brand_name,
+          category: payload.category,
+          description: payload.description,
+          email: payload.email || '',
+          logo_url: payload.logo_url || '',
+          documents: {
+            pan_card: payload.documents.pan_card,
+            gst_certificate: payload.documents.gst_certificate,
+            address_proof: payload.documents.address_proof,
+          },
+        },
+      })
+      flashNotice('Seller request submitted and pending review')
+      setAccountView('menu')
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not submit seller request')
+    } finally {
+      setIsSubmittingSellerRequest(false)
+    }
+  }
+
+  const loadAdminSellerRequests = async () => {
+    if (!authToken || userRole !== 'admin') {
+      return
+    }
+    setIsLoadingAdminSellerRequests(true)
+    try {
+      const response = await apiGet('/api/admin/seller-requests', { token: authToken })
+      setAdminSellerRequests(Array.isArray(response?.requests) ? response.requests : [])
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Failed to load seller requests')
+    } finally {
+      setIsLoadingAdminSellerRequests(false)
+    }
+  }
+
+  const loadAdminActiveSellers = async () => {
+    if (!authToken || userRole !== 'admin') {
+      return
+    }
+    setIsLoadingAdminActiveSellers(true)
+    try {
+      const response = await apiGet('/api/admin/sellers/active', { token: authToken })
+      setAdminActiveSellers(Array.isArray(response) ? response : [])
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Failed to load active sellers')
+    } finally {
+      setIsLoadingAdminActiveSellers(false)
+    }
+  }
+
+  const loadAdminSellerRanking = async () => {
+    if (!authToken || userRole !== 'admin') {
+      return
+    }
+    setIsLoadingAdminSellerRanking(true)
+    try {
+      const response = await apiGet('/api/admin/sellers/ranking', { token: authToken })
+      setAdminSellerRanking(Array.isArray(response) ? response : [])
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Failed to load seller ranking')
+    } finally {
+      setIsLoadingAdminSellerRanking(false)
+    }
+  }
+
+  const loadAdminRiskDashboard = async () => {
+    if (!authToken || userRole !== 'admin') {
+      return
+    }
+    setIsLoadingAdminRiskDashboard(true)
+    try {
+      const response = await apiGet('/api/admin/dashboard/sellers', { token: authToken })
+      setAdminRiskDashboard(response && typeof response === 'object' ? response : null)
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Failed to load risk dashboard')
+    } finally {
+      setIsLoadingAdminRiskDashboard(false)
+    }
+  }
+
+  const loadAdminFinanceSummary = async () => {
+    if (!authToken || userRole !== 'admin') {
+      return
+    }
+    setIsLoadingAdminFinanceSummary(true)
+    try {
+      const response = await apiGet('/api/admin/finance/summary', { token: authToken })
+      setAdminFinanceSummary(response && typeof response === 'object' ? response : null)
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Failed to load finance summary')
+    } finally {
+      setIsLoadingAdminFinanceSummary(false)
+    }
+  }
+
+  const loadAdminOrderSummary = async () => {
+    if (!authToken || userRole !== 'admin') {
+      return
+    }
+    setIsLoadingAdminOrderSummary(true)
+    try {
+      const response = await apiGet('/api/admin/orders/summary', { token: authToken })
+      setAdminOrderSummary(response && typeof response === 'object' ? response : null)
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Failed to load order summary')
+    } finally {
+      setIsLoadingAdminOrderSummary(false)
+    }
+  }
+
+  const loadAdminPayoutRequests = async (statusOverride = adminPayoutStatusFilter) => {
+    if (!authToken || userRole !== 'admin') {
+      return
+    }
+    setIsLoadingAdminPayoutRequests(true)
+    try {
+      const query = statusOverride ? `?status=${encodeURIComponent(statusOverride)}` : ''
+      const response = await apiGet(`/api/admin/payout-requests${query}`, { token: authToken })
+      setAdminPayoutRequests(Array.isArray(response?.requests) ? response.requests : [])
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Failed to load payout requests')
+    } finally {
+      setIsLoadingAdminPayoutRequests(false)
+    }
+  }
+
+  const loadAdminSnapshot = async () => {
+    await Promise.all([
+      loadAdminSellerRequests(),
+      loadAdminActiveSellers(),
+      loadAdminSellerRanking(),
+      loadAdminRiskDashboard(),
+      loadAdminFinanceSummary(),
+      loadAdminOrderSummary(),
+      loadAdminPayoutRequests(),
+    ])
+  }
+
+  const decideSellerRequest = async (userId, action) => {
+    if (!authToken || userRole !== 'admin' || !userId) {
+      return
+    }
+    const reason = (adminRejectReasons[userId] || '').trim()
+    if (action === 'reject' && !reason) {
+      flashNotice('Rejection reason is required')
+      return
+    }
+    setAdminUpdatingSellerId(userId)
+    try {
+      await apiPost(
+        `/api/admin/seller/${userId}/verify-identity`,
+        { action, ...(action === 'reject' ? { reason } : {}) },
+        { token: authToken },
+      )
+      setAdminSellerRequests((prev) => prev.filter((item) => item.user_id !== userId))
+      setAdminRejectReasons((prev) => ({ ...prev, [userId]: '' }))
+      flashNotice(action === 'approve' ? 'Seller approved' : 'Seller rejected')
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not update seller request')
+    } finally {
+      setAdminUpdatingSellerId('')
+    }
+  }
+
+  const updateSellerStatus = async (sellerId, action) => {
+    if (!authToken || userRole !== 'admin' || !sellerId) {
+      return
+    }
+    const reason = (adminFreezeReasons[sellerId] || '').trim()
+    if (action === 'freeze' && !reason) {
+      flashNotice('Freeze reason is required')
+      return
+    }
+    setAdminUpdatingSellerActionId(sellerId)
+    try {
+      const url = action === 'freeze'
+        ? `/api/admin/seller/${sellerId}/freeze?reason=${encodeURIComponent(reason)}`
+        : `/api/admin/seller/${sellerId}/unfreeze`
+      await apiPost(url, {}, { token: authToken })
+      if (action === 'freeze') {
+        setAdminFreezeReasons((prev) => ({ ...prev, [sellerId]: '' }))
+      }
+      flashNotice(action === 'freeze' ? 'Seller frozen' : 'Seller unfrozen')
+      await Promise.all([loadAdminActiveSellers(), loadAdminRiskDashboard(), loadAdminSellerRanking()])
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not update seller status')
+    } finally {
+      setAdminUpdatingSellerActionId('')
+    }
+  }
+
+  const loadSellerRiskSnapshot = async (sellerId) => {
+    if (!authToken || userRole !== 'admin' || !sellerId) {
+      return
+    }
+    setAdminLoadingRiskSellerId(sellerId)
+    try {
+      const response = await apiGet(`/api/admin/sellers/${sellerId}/risk`, { token: authToken })
+      setAdminRiskSnapshots((prev) => ({ ...prev, [sellerId]: response }))
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not fetch risk snapshot')
+    } finally {
+      setAdminLoadingRiskSellerId('')
+    }
+  }
+
+  const decidePayoutRequest = async (requestId, action) => {
+    if (!authToken || userRole !== 'admin' || !requestId) {
+      return
+    }
+    const reason = (adminPayoutDecisionReasons[requestId] || '').trim()
+    if (action === 'reject' && !reason) {
+      flashNotice('Rejection reason is required')
+      return
+    }
+    setAdminUpdatingPayoutId(requestId)
+    try {
+      await apiPost(`/api/admin/payout-requests/${requestId}/decision`, { action, reason: reason || undefined }, { token: authToken })
+      setAdminPayoutDecisionReasons((prev) => ({ ...prev, [requestId]: '' }))
+      flashNotice(action === 'approve' ? 'Payout approved' : 'Payout rejected')
+      await Promise.all([loadAdminPayoutRequests(), loadAdminFinanceSummary()])
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not process payout decision')
+    } finally {
+      setAdminUpdatingPayoutId('')
+    }
+  }
+
+  const retryPayoutRequest = async (requestId) => {
+    if (!authToken || userRole !== 'admin' || !requestId) {
+      return
+    }
+    setAdminUpdatingPayoutId(requestId)
+    try {
+      await apiPost(`/api/admin/payout-requests/${requestId}/retry`, {}, { token: authToken })
+      flashNotice('Payout retried')
+      await Promise.all([loadAdminPayoutRequests(), loadAdminFinanceSummary()])
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not retry payout')
+    } finally {
+      setAdminUpdatingPayoutId('')
+    }
+  }
+
+  const reconcilePayoutRequest = async (requestId) => {
+    if (!authToken || userRole !== 'admin' || !requestId) {
+      return
+    }
+    setAdminUpdatingPayoutId(requestId)
+    try {
+      await apiPost(`/api/admin/payout-requests/${requestId}/reconcile`, {}, { token: authToken })
+      flashNotice('Payout reconciled')
+      await Promise.all([loadAdminPayoutRequests(), loadAdminFinanceSummary()])
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not reconcile payout')
+    } finally {
+      setAdminUpdatingPayoutId('')
+    }
+  }
+
+  const saveCommissionRate = async () => {
+    if (!authToken || userRole !== 'admin') {
+      return
+    }
+    const parsed = Number(commissionInput)
+    if (!Number.isFinite(parsed)) {
+      flashNotice('Enter a valid commission rate')
+      return
+    }
+    setIsUpdatingCommission(true)
+    try {
+      await apiPost(`/api/admin/set-commission?rate=${encodeURIComponent(parsed)}`, {}, { token: authToken })
+      flashNotice('Commission updated')
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not update commission')
+    } finally {
+      setIsUpdatingCommission(false)
+    }
+  }
+
+  const createFestivalOffer = async (event) => {
+    event.preventDefault()
+    if (!authToken || userRole !== 'admin') {
+      return
+    }
+    const slug = festivalForm.slug.trim()
+    const name = festivalForm.name.trim()
+    const startAt = festivalForm.start_at
+    const endAt = festivalForm.end_at
+    const tiers = festivalForm.eligible_tiers
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)
+    if (!slug || !name || !startAt || !endAt || tiers.length === 0) {
+      flashNotice('Complete festival fields')
+      return
+    }
+    setIsCreatingFestival(true)
+    try {
+      await apiPost('/api/admin/festivals', {
+        slug,
+        name,
+        start_at: startAt,
+        end_at: endAt,
+        eligible_tiers: tiers,
+      }, { token: authToken })
+      flashNotice('Festival created')
+      setFestivalForm((prev) => ({ ...prev, slug: '', name: '' }))
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not create festival')
+    } finally {
+      setIsCreatingFestival(false)
+    }
+  }
+
+  useEffect(() => {
+    if (authToken && userRole === 'admin') {
+      loadAdminSnapshot()
+    }
+  }, [authToken, userRole])
+
+  useEffect(() => {
+    if (authToken && userRole === 'admin') {
+      loadAdminPayoutRequests(adminPayoutStatusFilter)
+    }
+  }, [adminPayoutStatusFilter])
+
   const handleAccountAction = (action) => {
     if (action === 'manage_devices') {
-      flashNotice('1 active device connected')
+      setAccountView('devices')
       return
     }
     if (action === 'edit_profile') {
-      flashNotice('Profile editor opened')
+      setAccountView('profile')
       return
     }
     if (action === 'saved_cards') {
-      flashNotice('2 saved cards available')
+      setAccountView('cards')
       return
     }
     if (action === 'saved_addresses') {
-      flashNotice('Saved addresses loaded')
+      openAddressPanel()
       return
     }
     if (action === 'language') {
-      const languages = ['English', 'Hindi', 'Tamil']
-      const currentIndex = languages.indexOf(accountLanguage)
-      const next = languages[(currentIndex + 1) % languages.length]
-      setAccountLanguage(next)
-      flashNotice(`Language: ${next}`)
+      setAccountView('language')
       return
     }
     if (action === 'notifications') {
-      setNotificationsEnabled((prev) => {
-        const next = !prev
-        flashNotice(`Notifications ${next ? 'enabled' : 'disabled'}`)
-        return next
-      })
+      setAccountView('notifications')
       return
     }
     if (action === 'privacy') {
-      flashNotice('Privacy controls opened')
+      setAccountView('privacy')
       return
     }
     if (action === 'reviews') {
-      flashNotice('No new reviews yet')
+      setAccountView('reviews')
       return
     }
     if (action === 'qa') {
-      flashNotice('No pending questions')
+      setAccountView('qa')
       return
     }
     if (action === 'sell') {
-      setActiveQuickPanel('')
-      setIsCategoryView(false)
-      if (activeProductId) {
-        closeProduct()
-      }
-      setSearchText('deals')
-      loadProducts('deals')
-      flashNotice('Showing sell and deal options')
+      setAccountView('sell')
       return
     }
     if (action === 'terms') {
-      flashNotice('Terms, policies and licenses opened')
+      setAccountView('terms')
       return
     }
     if (action === 'faqs') {
-      setActiveQuickPanel('')
-      setIsCategoryView(false)
-      if (activeProductId) {
-        closeProduct()
-      }
-      setSearchText('help')
-      loadProducts('help')
-      flashNotice('Showing help and FAQs')
+      setAccountView('faqs')
     }
   }
 
@@ -944,10 +2117,116 @@ function App() {
       flashNotice('Cart is empty')
       return
     }
-    const itemCount = cartItems.reduce((sum, item) => sum + Number(item.qty || 1), 0)
-    setCartItems([])
-    closeQuickPanel()
-    flashNotice(`Checkout complete for ${itemCount} item${itemCount > 1 ? 's' : ''}`)
+    if (!isLoggedIn) {
+      setCheckoutPending(true)
+      setActiveQuickPanel('auth')
+      flashNotice('Login to continue checkout')
+      return
+    }
+    setCheckoutPending(false)
+    setSelectedCheckoutAddress(null)
+    setActiveQuickPanel('address')
+    loadAddresses()
+  }
+
+  const buyNow = () => {
+    if (!productDetail?.id) {
+      return
+    }
+    if (deliveryCheck.checked && deliveryCheck.deliverable === false) {
+      flashNotice('Not deliverable to this pincode')
+      return
+    }
+
+    const image = selectedImage || detailImages[0] || (Array.isArray(productDetail.images) ? productDetail.images[0] : null)
+    setCartItems([{
+      id: productDetail.id,
+      title: productDetail.title,
+      image: image || null,
+      price: productDetail.selling_price,
+      qty: 1,
+    }])
+
+    if (!isLoggedIn) {
+      setCheckoutPending(true)
+      setActiveQuickPanel('auth')
+      flashNotice('Login to continue checkout')
+      return
+    }
+
+    setCheckoutPending(false)
+    setSelectedCheckoutAddress(null)
+    setActiveQuickPanel('address')
+    loadAddresses()
+  }
+
+  const checkDeliveryAvailability = async (event) => {
+    event.preventDefault()
+    if (!activeProductId) {
+      return
+    }
+    const pincode = deliveryPincode.replace(/\D/g, '').slice(0, 6)
+    if (pincode.length !== 6) {
+      flashNotice('Enter a valid 6-digit pincode')
+      return
+    }
+
+    setIsCheckingDelivery(true)
+    try {
+      const response = await apiGet(`/api/public/product/${activeProductId}/delivery?pincode=${encodeURIComponent(pincode)}`)
+      setDeliveryCheck({
+        checked: true,
+        deliverable: Boolean(response?.deliverable),
+        codAvailable: Boolean(response?.cod_available),
+        reason: response?.reason || '',
+        estimatedDays: Number.isFinite(Number(response?.estimated_days)) ? Number(response.estimated_days) : null,
+      })
+      if (!response?.deliverable) {
+        flashNotice('Delivery unavailable for this pincode')
+      }
+    } catch (error) {
+      setDeliveryCheck({
+        checked: true,
+        deliverable: false,
+        codAvailable: false,
+        reason: error instanceof Error ? error.message : 'Could not check delivery',
+        estimatedDays: null,
+      })
+      flashNotice('Could not check delivery')
+    } finally {
+      setIsCheckingDelivery(false)
+    }
+  }
+
+  const submitProductQuestion = async (event) => {
+    event.preventDefault()
+    if (!activeProductId) {
+      return
+    }
+    const question = questionInput.trim()
+    if (!question) {
+      flashNotice('Enter your question')
+      return
+    }
+    if (!isLoggedIn) {
+      setCheckoutPending(false)
+      setActiveQuickPanel('auth')
+      flashNotice('Login to ask a question')
+      return
+    }
+
+    setIsSubmittingQuestion(true)
+    try {
+      await apiPost(`/api/questions/product/${activeProductId}`, { question }, { token: authToken })
+      setQuestionInput('')
+      const response = await apiGet(`/api/questions/product/${activeProductId}`)
+      setProductQuestions(Array.isArray(response?.items) ? response.items : [])
+      flashNotice('Question submitted')
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not submit question')
+    } finally {
+      setIsSubmittingQuestion(false)
+    }
   }
 
   const detailImages = Array.isArray(productDetail?.images) ? productDetail.images : []
@@ -976,6 +2255,20 @@ function App() {
   const spotlightProducts = categoryProducts.slice(0, 8)
   const launchProducts = categoryProducts.slice(8, 16)
   const heroProduct = categoryProducts[0] || null
+  const accountViewTitle = ({
+    menu: 'Account Settings',
+    devices: 'Manage Devices',
+    profile: 'Edit Profile',
+    cards: 'Saved Cards',
+    language: 'Select Language',
+    notifications: 'Notification Settings',
+    privacy: 'Privacy Center',
+    reviews: 'Reviews',
+    qa: 'Questions & Answers',
+    sell: 'Sell on Brandcart',
+    terms: 'Terms & Policies',
+    faqs: 'FAQs',
+  })[accountView] || 'Account Settings'
 
   useEffect(() => {
     const previous = prevIsPdpRef.current
@@ -988,6 +2281,393 @@ function App() {
     prevIsPdpRef.current = isPdp
     return undefined
   }, [isPdp])
+
+  if (isLoggedIn && userRole === 'admin') {
+    return (
+      <main className="admin-shell">
+        <header className="admin-header">
+          <div>
+            <p className="admin-kicker">Brandcart Operations</p>
+            <h1>Admin Dashboard</h1>
+            <p className="admin-meta">Logged in as {userPhone || 'admin'}</p>
+          </div>
+          <div className="admin-header-actions">
+            <button
+              type="button"
+              className="account-inline-btn"
+              onClick={loadAdminSnapshot}
+              disabled={
+                isLoadingAdminSellerRequests
+                || isLoadingAdminActiveSellers
+                || isLoadingAdminSellerRanking
+                || isLoadingAdminRiskDashboard
+                || isLoadingAdminFinanceSummary
+                || isLoadingAdminOrderSummary
+                || isLoadingAdminPayoutRequests
+              }
+            >
+              Refresh All
+            </button>
+            <button type="button" className="account-primary-btn" onClick={logout}>Logout</button>
+          </div>
+        </header>
+
+        <section className="admin-panel">
+          <div className="admin-panel-head">
+            <h2>Platform Snapshot</h2>
+            <span>Live backend data</span>
+          </div>
+          <div className="admin-metrics-grid">
+            <article className="admin-metric-card">
+              <strong>Total Sellers</strong>
+              <p>{isLoadingAdminRiskDashboard ? '...' : Number(adminRiskDashboard?.summary?.total_sellers || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Frozen Sellers</strong>
+              <p>{isLoadingAdminRiskDashboard ? '...' : Number(adminRiskDashboard?.summary?.frozen_sellers || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Probation Sellers</strong>
+              <p>{isLoadingAdminRiskDashboard ? '...' : Number(adminRiskDashboard?.summary?.probation_sellers || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Low Trust Sellers</strong>
+              <p>{isLoadingAdminRiskDashboard ? '...' : Number(adminRiskDashboard?.summary?.low_trust_sellers || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Pending COD</strong>
+              <p>{isLoadingAdminFinanceSummary ? '...' : (formatInr(adminFinanceSummary?.pending_cod_amount) || '₹0')}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Unsettled Payouts</strong>
+              <p>{isLoadingAdminFinanceSummary ? '...' : (formatInr(adminFinanceSummary?.unsettled_payouts) || '₹0')}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Reserve Locked</strong>
+              <p>{isLoadingAdminFinanceSummary ? '...' : (formatInr(adminFinanceSummary?.reserve_locked) || '₹0')}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Total Orders</strong>
+              <p>{isLoadingAdminOrderSummary ? '...' : Number(adminOrderSummary?.total_orders || 0)}</p>
+            </article>
+          </div>
+        </section>
+
+        <section className="admin-panel">
+          <div className="admin-panel-head">
+            <h2>Seller Verification Queue</h2>
+            <span>{adminSellerRequests.length} pending</span>
+          </div>
+          {isLoadingAdminSellerRequests && <p className="quick-panel-meta">Loading seller requests...</p>}
+          {!isLoadingAdminSellerRequests && adminSellerRequests.length === 0 && <p className="quick-panel-meta">No pending seller requests.</p>}
+
+          <div className="admin-request-list">
+            {adminSellerRequests.map((item) => (
+              <article className="account-tile" key={item.user_id}>
+                <strong>{item.brand_name || 'Unknown brand'} ({item.category || '-'})</strong>
+                <p>Legal name: {item.legal_name || '-'}</p>
+                <p>Phone: {item.phone || '-'}</p>
+                <p>Email: {item.email || '-'}</p>
+                <p>PAN: {item.documents?.pan_card || '-'}</p>
+                <p>GST: {item.documents?.gst_certificate || '-'}</p>
+                <p>Address proof: {item.documents?.address_proof || '-'}</p>
+                <p>Requested: {item.requested_at ? new Date(item.requested_at).toLocaleString() : '-'}</p>
+                <textarea
+                  rows={2}
+                  placeholder="Reason required if rejecting"
+                  value={adminRejectReasons[item.user_id] || ''}
+                  onChange={(event) => setAdminRejectReasons((prev) => ({ ...prev, [item.user_id]: event.target.value }))}
+                />
+                <div className="admin-request-actions">
+                  <button
+                    type="button"
+                    className="account-inline-btn"
+                    disabled={adminUpdatingSellerId === item.user_id}
+                    onClick={() => decideSellerRequest(item.user_id, 'approve')}
+                  >
+                    {adminUpdatingSellerId === item.user_id ? 'Updating...' : 'Approve'}
+                  </button>
+                  <button
+                    type="button"
+                    className="account-inline-btn"
+                    disabled={adminUpdatingSellerId === item.user_id}
+                    onClick={() => decideSellerRequest(item.user_id, 'reject')}
+                  >
+                    {adminUpdatingSellerId === item.user_id ? 'Updating...' : 'Reject'}
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+
+        <section className="admin-panel">
+          <div className="admin-panel-head">
+            <h2>Active Sellers</h2>
+            <span>{adminActiveSellers.length} listed</span>
+          </div>
+          {isLoadingAdminActiveSellers && <p className="quick-panel-meta">Loading active sellers...</p>}
+          {!isLoadingAdminActiveSellers && adminActiveSellers.length === 0 && <p className="quick-panel-meta">No active sellers found.</p>}
+          <div className="admin-request-list">
+            {adminActiveSellers.map((seller) => {
+              const sellerId = seller?._id || ''
+              const snapshot = adminRiskSnapshots[sellerId]
+              const isFrozen = seller?.seller_status === 'frozen'
+              return (
+                <article className="account-tile" key={sellerId || `seller-${seller?.phone || Math.random()}`}>
+                  <strong>{seller?.seller_profile?.brand_name || seller?.seller_request?.brand_name || 'Unknown seller'}</strong>
+                  <p>Seller ID: {sellerId || '-'}</p>
+                  <p>Phone: {seller?.phone || '-'}</p>
+                  <p>Status: {seller?.seller_status || '-'}</p>
+                  <p>Trust Score: {Number(seller?.seller_profile?.trust?.score || 0)}</p>
+                  {isFrozen && <p>Frozen reason: {seller?.seller_frozen_reason || '-'}</p>}
+                  {!isFrozen && (
+                    <textarea
+                      rows={2}
+                      placeholder="Freeze reason"
+                      value={adminFreezeReasons[sellerId] || ''}
+                      onChange={(event) => setAdminFreezeReasons((prev) => ({ ...prev, [sellerId]: event.target.value }))}
+                    />
+                  )}
+                  <div className="admin-request-actions">
+                    {!isFrozen && (
+                      <button
+                        type="button"
+                        className="account-inline-btn"
+                        disabled={adminUpdatingSellerActionId === sellerId}
+                        onClick={() => updateSellerStatus(sellerId, 'freeze')}
+                      >
+                        {adminUpdatingSellerActionId === sellerId ? 'Updating...' : 'Freeze'}
+                      </button>
+                    )}
+                    {isFrozen && (
+                      <button
+                        type="button"
+                        className="account-inline-btn"
+                        disabled={adminUpdatingSellerActionId === sellerId}
+                        onClick={() => updateSellerStatus(sellerId, 'unfreeze')}
+                      >
+                        {adminUpdatingSellerActionId === sellerId ? 'Updating...' : 'Unfreeze'}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="account-inline-btn"
+                      disabled={adminLoadingRiskSellerId === sellerId}
+                      onClick={() => loadSellerRiskSnapshot(sellerId)}
+                    >
+                      {adminLoadingRiskSellerId === sellerId ? 'Loading Risk...' : 'Risk Snapshot'}
+                    </button>
+                  </div>
+                  {snapshot && (
+                    <div className="admin-risk-inline">
+                      <p>Tier: {snapshot?.tier || '-'}</p>
+                      <p>Settlement Hours: {snapshot?.settlement_hours ?? '-'}</p>
+                      <p>Commission %: {snapshot?.commission_percent ?? '-'}</p>
+                      <p>Probation: {snapshot?.probation?.active ? 'Yes' : 'No'}</p>
+                    </div>
+                  )}
+                </article>
+              )
+            })}
+          </div>
+        </section>
+
+        <section className="admin-panel">
+          <div className="admin-panel-head">
+            <h2>Seller Ranking</h2>
+            <span>{adminSellerRanking.length} ranked</span>
+          </div>
+          {isLoadingAdminSellerRanking && <p className="quick-panel-meta">Loading ranking...</p>}
+          {!isLoadingAdminSellerRanking && adminSellerRanking.length === 0 && <p className="quick-panel-meta">No ranking data.</p>}
+          {!isLoadingAdminSellerRanking && adminSellerRanking.length > 0 && (
+            <div className="admin-table-wrap">
+              <table className="admin-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Brand</th>
+                    <th>Score</th>
+                    <th>Badges</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {adminSellerRanking.map((seller, index) => (
+                    <tr key={seller.seller_id}>
+                      <td>{index + 1}</td>
+                      <td>{seller.brand_name || '-'}</td>
+                      <td>{Number(seller.score || 0)}</td>
+                      <td>{Array.isArray(seller.badges) && seller.badges.length ? seller.badges.join(', ') : '-'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+
+        <section className="admin-panel">
+          <div className="admin-panel-head">
+            <h2>Payout Requests</h2>
+            <span>{adminPayoutRequests.length} records</span>
+          </div>
+          <div className="admin-filter-row">
+            {['', 'requested', 'processing', 'approved', 'failed', 'rejected'].map((status) => (
+              <button
+                key={status || 'all'}
+                type="button"
+                className={`account-inline-btn ${adminPayoutStatusFilter === status ? 'is-selected' : ''}`}
+                onClick={() => setAdminPayoutStatusFilter(status)}
+              >
+                {status || 'all'}
+              </button>
+            ))}
+          </div>
+          {isLoadingAdminPayoutRequests && <p className="quick-panel-meta">Loading payout requests...</p>}
+          {!isLoadingAdminPayoutRequests && adminPayoutRequests.length === 0 && <p className="quick-panel-meta">No payout requests found.</p>}
+          <div className="admin-request-list">
+            {adminPayoutRequests.map((request) => {
+              const requestId = request?._id || ''
+              const status = request?.status || '-'
+              const canDecide = status === 'requested'
+              const canRetry = status === 'failed'
+              const canReconcile = Boolean(request?.provider_payout_id)
+              return (
+                <article className="account-tile" key={requestId || `payout-${Math.random()}`}>
+                  <strong>Request {requestId || '-'}</strong>
+                  <p>Status: {status}</p>
+                  <p>Seller: {request?.seller_id || '-'}</p>
+                  <p>Amount: {formatInr(request?.amount) || `₹${Number(request?.amount || 0)}`}</p>
+                  <p>Requested: {request?.requested_at ? new Date(request.requested_at).toLocaleString() : '-'}</p>
+                  <p>Bank: {request?.bank_details?.bank_name || '-'} ({request?.bank_details?.bank_account_masked || '-'})</p>
+                  {status === 'failed' && <p>Failure: {request?.failure_reason || '-'}</p>}
+                  {canDecide && (
+                    <textarea
+                      rows={2}
+                      placeholder="Reason (required for reject)"
+                      value={adminPayoutDecisionReasons[requestId] || ''}
+                      onChange={(event) => setAdminPayoutDecisionReasons((prev) => ({ ...prev, [requestId]: event.target.value }))}
+                    />
+                  )}
+                  <div className="admin-request-actions">
+                    {canDecide && (
+                      <>
+                        <button
+                          type="button"
+                          className="account-inline-btn"
+                          disabled={adminUpdatingPayoutId === requestId}
+                          onClick={() => decidePayoutRequest(requestId, 'approve')}
+                        >
+                          {adminUpdatingPayoutId === requestId ? 'Updating...' : 'Approve'}
+                        </button>
+                        <button
+                          type="button"
+                          className="account-inline-btn"
+                          disabled={adminUpdatingPayoutId === requestId}
+                          onClick={() => decidePayoutRequest(requestId, 'reject')}
+                        >
+                          {adminUpdatingPayoutId === requestId ? 'Updating...' : 'Reject'}
+                        </button>
+                      </>
+                    )}
+                    {canRetry && (
+                      <button
+                        type="button"
+                        className="account-inline-btn"
+                        disabled={adminUpdatingPayoutId === requestId}
+                        onClick={() => retryPayoutRequest(requestId)}
+                      >
+                        {adminUpdatingPayoutId === requestId ? 'Updating...' : 'Retry'}
+                      </button>
+                    )}
+                    {canReconcile && (
+                      <button
+                        type="button"
+                        className="account-inline-btn"
+                        disabled={adminUpdatingPayoutId === requestId}
+                        onClick={() => reconcilePayoutRequest(requestId)}
+                      >
+                        {adminUpdatingPayoutId === requestId ? 'Updating...' : 'Reconcile'}
+                      </button>
+                    )}
+                  </div>
+                </article>
+              )
+            })}
+          </div>
+        </section>
+
+        <section className="admin-panel">
+          <div className="admin-panel-head">
+            <h2>Platform Controls</h2>
+            <span>Commission and festivals</span>
+          </div>
+          <div className="admin-controls-grid">
+            <form
+              className="account-form"
+              onSubmit={(event) => {
+                event.preventDefault()
+                saveCommissionRate()
+              }}
+            >
+              <label>Commission Rate (0 to 0.10)</label>
+              <input
+                type="number"
+                step="0.001"
+                min="0"
+                max="0.1"
+                value={commissionInput}
+                onChange={(event) => setCommissionInput(event.target.value)}
+                placeholder="0.050"
+              />
+              <button type="submit" className="account-primary-btn" disabled={isUpdatingCommission}>
+                {isUpdatingCommission ? 'Saving...' : 'Update Commission'}
+              </button>
+            </form>
+
+            <form className="account-form" onSubmit={createFestivalOffer}>
+              <label>Festival Slug</label>
+              <input
+                type="text"
+                value={festivalForm.slug}
+                onChange={(event) => setFestivalForm((prev) => ({ ...prev, slug: event.target.value }))}
+                placeholder="diwali-2026"
+              />
+              <label>Festival Name</label>
+              <input
+                type="text"
+                value={festivalForm.name}
+                onChange={(event) => setFestivalForm((prev) => ({ ...prev, name: event.target.value }))}
+                placeholder="Diwali Mega Sale"
+              />
+              <label>Start At (ISO/DateTime)</label>
+              <input
+                type="datetime-local"
+                value={festivalForm.start_at}
+                onChange={(event) => setFestivalForm((prev) => ({ ...prev, start_at: event.target.value }))}
+              />
+              <label>End At (ISO/DateTime)</label>
+              <input
+                type="datetime-local"
+                value={festivalForm.end_at}
+                onChange={(event) => setFestivalForm((prev) => ({ ...prev, end_at: event.target.value }))}
+              />
+              <label>Eligible Tiers (comma-separated)</label>
+              <input
+                type="text"
+                value={festivalForm.eligible_tiers}
+                onChange={(event) => setFestivalForm((prev) => ({ ...prev, eligible_tiers: event.target.value }))}
+                placeholder="verified_fast, verified_plus"
+              />
+              <button type="submit" className="account-primary-btn" disabled={isCreatingFestival}>
+                {isCreatingFestival ? 'Creating...' : 'Create Festival'}
+              </button>
+            </form>
+          </div>
+        </section>
+      </main>
+    )
+  }
 
   return (
     <main className="page-shell">
@@ -1192,7 +2872,7 @@ function App() {
 
                   <div className="pdp-cta-row">
                     <button type="button" className="pdp-cart-btn" onClick={addToCart}>ADD TO CART</button>
-                    <button type="button" className="pdp-buy-btn">BUY NOW</button>
+                    <button type="button" className="pdp-buy-btn" onClick={buyNow}>BUY NOW</button>
                   </div>
                 </aside>
 
@@ -1248,6 +2928,30 @@ function App() {
                     {detailHasStrike && <span>{detailMrp}</span>}
                   </div>
 
+                  <form className="pdp-delivery-check" onSubmit={checkDeliveryAvailability}>
+                    <label htmlFor="pdp-pincode">Check delivery to your area</label>
+                    <div className="pdp-delivery-row">
+                      <input
+                        id="pdp-pincode"
+                        type="text"
+                        inputMode="numeric"
+                        placeholder="Enter pincode"
+                        value={deliveryPincode}
+                        onChange={(event) => setDeliveryPincode(event.target.value.replace(/\D/g, '').slice(0, 6))}
+                      />
+                      <button type="submit" disabled={isCheckingDelivery}>
+                        {isCheckingDelivery ? 'Checking...' : 'Check'}
+                      </button>
+                    </div>
+                    {deliveryCheck.checked && (
+                      <p className={`pdp-delivery-note ${deliveryCheck.deliverable ? 'ok' : 'no'}`}>
+                        {deliveryCheck.deliverable
+                          ? `Delivery available${deliveryCheck.estimatedDays ? ` in ${deliveryCheck.estimatedDays} day(s)` : ''}. ${deliveryCheck.codAvailable ? 'COD available.' : 'COD not available.'}`
+                          : `${deliveryCheck.reason || 'Delivery unavailable'} for this pincode.`}
+                      </p>
+                    )}
+                  </form>
+
                   <div className="pdp-seller">
                     <h2>Seller</h2>
                     <div className="pdp-seller-row">
@@ -1266,19 +2970,57 @@ function App() {
                   </div>
 
                   <div className="pdp-section">
-                    <h2>Product details</h2>
-                    <div className="pdp-specs">
-                      <p><span>Category</span> {productDetail.category || 'NA'}</p>
-                      <p><span>Sub Category</span> {productDetail.sub_category || 'NA'}</p>
-                    </div>
+                    <p className="pdp-description">{productDetail.description || 'No description available.'}</p>
                   </div>
 
-                  {productDetail.description && (
-                    <div className="pdp-section">
-                      <h2>Description</h2>
-                      <p className="pdp-description">{productDetail.description}</p>
-                    </div>
-                  )}
+                  <div className="pdp-section">
+                    <h2>Ratings & Reviews</h2>
+                    {isLoadingReviews && <p className="quick-panel-meta">Refreshing reviews...</p>}
+                    {!isLoadingReviews && productReviews.reviews.length === 0 && (
+                      <p className="quick-panel-meta">No reviews yet.</p>
+                    )}
+                    {!isLoadingReviews && productReviews.reviews.length > 0 && (
+                      <div className="pdp-review-list">
+                        {productReviews.reviews.slice(0, 8).map((review, index) => (
+                          <article className="pdp-review-card" key={`${review.created_at || 'review'}-${index}`}>
+                            <p className="pdp-review-rating">{'★'.repeat(Number(review.rating || 0))}</p>
+                            <p>{review.comment || 'No comment'}</p>
+                            <small>{review.created_at ? new Date(review.created_at).toLocaleString() : ''}</small>
+                          </article>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="pdp-section">
+                    <h2>Questions & Answers</h2>
+                    <form className="pdp-qa-form" onSubmit={submitProductQuestion}>
+                      <textarea
+                        rows={2}
+                        placeholder="Ask a question about this product"
+                        value={questionInput}
+                        onChange={(event) => setQuestionInput(event.target.value)}
+                      />
+                      <button type="submit" disabled={isSubmittingQuestion}>
+                        {isSubmittingQuestion ? 'Submitting...' : 'Ask Question'}
+                      </button>
+                    </form>
+                    {isLoadingQuestions && <p className="quick-panel-meta">Refreshing Q&A...</p>}
+                    {!isLoadingQuestions && productQuestions.length === 0 && (
+                      <p className="quick-panel-meta">No questions yet. Be the first to ask.</p>
+                    )}
+                    {!isLoadingQuestions && productQuestions.length > 0 && (
+                      <div className="pdp-qa-list">
+                        {productQuestions.slice(0, 8).map((item) => (
+                          <article className="pdp-qa-card" key={item.id}>
+                            <strong>Q: {item.question}</strong>
+                            <p>A: {item.answer || 'Seller will answer soon.'}</p>
+                            <small>{item.created_at ? new Date(item.created_at).toLocaleString() : ''}</small>
+                          </article>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </article>
               </div>
 
@@ -1432,7 +3174,7 @@ function App() {
           {cartItemTotal > 0 && <span className="bottom-nav-badge">{cartItemTotal}</span>}
         </button>
 
-        <button type="button" className={`bottom-nav-item ${activeQuickPanel === 'account' ? 'is-active' : ''}`} onClick={openAccountPanel}>
+        <button type="button" className={`bottom-nav-item ${activeQuickPanel === 'account' || activeQuickPanel === 'auth' ? 'is-active' : ''}`} onClick={openAccountPanel}>
           <FooterNavIcon icon="account" />
           <span>Account</span>
         </button>
@@ -1501,74 +3243,517 @@ function App() {
           </>
         )}
 
+        {activeQuickPanel === 'auth' && (
+          <>
+            <div className="quick-panel-head">
+              <h3>{checkoutPending ? 'Login for Checkout' : 'Signup / Login'}</h3>
+              <button type="button" onClick={closeQuickPanel}>Back</button>
+            </div>
+            <div className="quick-panel-body">
+              <p className="quick-panel-meta">Enter your phone number. New users are auto-registered after OTP verification.</p>
+              <form className="auth-form" onSubmit={sendOtp}>
+                <label htmlFor="auth-phone">Phone Number</label>
+                <input
+                  id="auth-phone"
+                  type="tel"
+                  inputMode="numeric"
+                  placeholder="10-digit phone"
+                  value={authPhoneInput}
+                  onChange={(event) => setAuthPhoneInput(normalizePhoneInput(event.target.value))}
+                />
+                <button type="submit" disabled={isSendingOtp}>
+                  {isSendingOtp ? 'Sending OTP...' : isOtpSent ? 'Resend OTP' : 'Send OTP'}
+                </button>
+              </form>
+
+              {isOtpSent && (
+                <form className="auth-form" onSubmit={verifyOtp}>
+                  <label htmlFor="auth-otp">OTP</label>
+                  <input
+                    id="auth-otp"
+                    type="text"
+                    inputMode="numeric"
+                    placeholder="Enter OTP"
+                    value={authOtpInput}
+                    onChange={(event) => setAuthOtpInput(event.target.value.replace(/\D/g, '').slice(0, 6))}
+                  />
+                  <button type="submit" disabled={isVerifyingOtp}>
+                    {isVerifyingOtp ? 'Verifying...' : 'Verify & Continue'}
+                  </button>
+                </form>
+              )}
+              {debugOtp && (
+                <p className="quick-panel-meta">Dev OTP: <strong>{debugOtp}</strong></p>
+              )}
+            </div>
+          </>
+        )}
+
+        {activeQuickPanel === 'address' && (
+          <>
+            <div className="quick-panel-head">
+              <h3>Add Address</h3>
+              <button type="button" onClick={closeQuickPanel}>Back</button>
+            </div>
+            <div className="quick-panel-body">
+              <p className="quick-panel-meta">Select a delivery address or add a new one.</p>
+
+              {isLoadingAddresses && <p className="quick-panel-meta">Loading addresses...</p>}
+              {!isLoadingAddresses && addresses.length === 0 && <p className="quick-panel-meta">No saved addresses yet.</p>}
+              {!isLoadingAddresses && addresses.map((address) => (
+                <article className="address-card" key={address._id}>
+                  <div>
+                    <strong>{address.name}</strong>
+                    <p>{address.line1}, {address.city}, {address.state} - {address.pincode}</p>
+                    <p>{address.phone}</p>
+                  </div>
+                  <button type="button" onClick={() => proceedToPayment(address)}>Deliver Here</button>
+                </article>
+              ))}
+
+              <form className="address-form" onSubmit={addAddress}>
+                <h4>Add New Address</h4>
+                <input
+                  type="text"
+                  placeholder="Full name"
+                  value={addressForm.name}
+                  onChange={(event) => updateAddressField('name', event.target.value)}
+                />
+                <input
+                  type="tel"
+                  inputMode="numeric"
+                  placeholder="Phone number"
+                  value={addressForm.phone}
+                  onChange={(event) => updateAddressField('phone', normalizePhoneInput(event.target.value))}
+                />
+                <textarea
+                  placeholder="House no, street, area"
+                  value={addressForm.line1}
+                  onChange={(event) => updateAddressField('line1', event.target.value)}
+                  rows={2}
+                />
+                <div className="address-grid">
+                  <input
+                    type="text"
+                    placeholder="City"
+                    value={addressForm.city}
+                    onChange={(event) => updateAddressField('city', event.target.value)}
+                  />
+                  <input
+                    type="text"
+                    placeholder="State"
+                    value={addressForm.state}
+                    onChange={(event) => updateAddressField('state', event.target.value)}
+                  />
+                </div>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  placeholder="Pincode"
+                  value={addressForm.pincode}
+                  onChange={(event) => updateAddressField('pincode', event.target.value.replace(/\D/g, '').slice(0, 6))}
+                />
+                <label className="address-default">
+                  <input
+                    type="checkbox"
+                    checked={addressForm.is_default}
+                    onChange={(event) => updateAddressField('is_default', event.target.checked)}
+                  />
+                  <span>Set as default address</span>
+                </label>
+                <button type="submit" disabled={isSavingAddress}>
+                  {isSavingAddress ? 'Saving...' : 'Add Address'}
+                </button>
+              </form>
+            </div>
+          </>
+        )}
+
+        {activeQuickPanel === 'payment' && (
+          <>
+            <div className="quick-panel-head">
+              <h3>Payment Options</h3>
+              <button type="button" onClick={() => setActiveQuickPanel('address')}>Back</button>
+            </div>
+            <div className="quick-panel-body">
+              <p className="quick-panel-meta">
+                Deliver to: <strong>{selectedCheckoutAddress ? `${selectedCheckoutAddress.name}, ${selectedCheckoutAddress.city}` : 'Select an address'}</strong>
+              </p>
+              <div className="payment-list">
+                {paymentOptions.map((option) => (
+                  <button
+                    key={option.id}
+                    type="button"
+                    className={`payment-option ${selectedPaymentMethod === option.id ? 'is-selected' : ''}`}
+                    onClick={() => {
+                      setSelectedPaymentMethod(option.id)
+                      setPaymentError('')
+                    }}
+                  >
+                    <span className="payment-option-main">{option.title}</span>
+                    <span className="payment-option-sub">{option.subtitle}</span>
+                  </button>
+                ))}
+              </div>
+              {paymentError && <p className="payment-error">{paymentError}</p>}
+            </div>
+            <div className="quick-panel-foot">
+              <p>Method: <strong>{paymentOptions.find((item) => item.id === selectedPaymentMethod)?.title || '-'}</strong></p>
+              <button type="button" onClick={completeCheckout} disabled={isPlacingOrder}>
+                {isPlacingOrder ? 'Processing...' : 'Place Order'}
+              </button>
+            </div>
+          </>
+        )}
+
         {activeQuickPanel === 'account' && (
           <>
             <div className="quick-panel-head">
-              <h3>Account Settings</h3>
+              <h3>{accountViewTitle}</h3>
+              <button type="button" onClick={() => (accountView === 'menu' ? closeQuickPanel() : setAccountView('menu'))}>Back</button>
             </div>
             <div className="quick-panel-body account-body">
-              <section className="account-section">
-                <div className="account-list">
-                  {[
-                    ['device', 'Manage Devices', 'manage_devices'],
-                    ['profile', 'Edit Profile', 'edit_profile'],
-                    ['cards', 'Saved Credit / Debit & Gift Cards', 'saved_cards'],
-                    ['address', 'Saved Addresses', 'saved_addresses'],
-                    ['language', `Select Language (${accountLanguage})`, 'language'],
-                    ['notification', `Notification Settings (${notificationsEnabled ? 'On' : 'Off'})`, 'notifications'],
-                    ['privacy', 'Privacy Center', 'privacy'],
-                  ].map(([type, label, action]) => (
-                    <button type="button" className="account-row" key={label} onClick={() => handleAccountAction(action)}>
-                      <span className="account-row-icon"><AccountMenuIcon type={type} /></span>
-                      <span>{label}</span>
-                      <em>&#8250;</em>
-                    </button>
-                  ))}
-                </div>
-              </section>
+              {accountView === 'menu' && (
+                <>
+                  <section className="account-section">
+                    <div className="account-list">
+                      <button type="button" className="account-row" onClick={openAddressPanel}>
+                        <span className="account-row-icon"><AccountMenuIcon type="address" /></span>
+                        <span>Manage Checkout Addresses</span>
+                        <em>&#8250;</em>
+                      </button>
+                      <button type="button" className="account-row" onClick={logout}>
+                        <span className="account-row-icon"><AccountMenuIcon type="profile" /></span>
+                        <span>Logout ({userPhone || 'buyer'})</span>
+                        <em>&#8250;</em>
+                      </button>
+                    </div>
+                  </section>
 
-              <section className="account-section">
-                <h4>My Activity</h4>
-                <div className="account-list">
-                  {[
-                    ['reviews', 'Reviews', 'reviews'],
-                    ['qa', 'Questions & Answers', 'qa'],
-                  ].map(([type, label, action]) => (
-                    <button type="button" className="account-row" key={label} onClick={() => handleAccountAction(action)}>
-                      <span className="account-row-icon"><AccountMenuIcon type={type} /></span>
-                      <span>{label}</span>
-                      <em>&#8250;</em>
-                    </button>
-                  ))}
-                </div>
-              </section>
+                  <section className="account-section">
+                    <div className="account-list">
+                      {[
+                        ['device', 'Manage Devices', 'manage_devices'],
+                        ['profile', 'Edit Profile', 'edit_profile'],
+                        ['cards', 'Saved Credit / Debit & Gift Cards', 'saved_cards'],
+                        ['address', 'Saved Addresses', 'saved_addresses'],
+                        ['language', `Select Language (${accountLanguage})`, 'language'],
+                        ['notification', `Notification Settings (${notificationsEnabled ? 'On' : 'Off'})`, 'notifications'],
+                        ['privacy', 'Privacy Center', 'privacy'],
+                      ].map(([type, label, action]) => (
+                        <button type="button" className="account-row" key={label} onClick={() => handleAccountAction(action)}>
+                          <span className="account-row-icon"><AccountMenuIcon type={type} /></span>
+                          <span>{label}</span>
+                          <em>&#8250;</em>
+                        </button>
+                      ))}
+                    </div>
+                  </section>
 
-              <section className="account-section">
-                <h4>Earn with Brandcart</h4>
-                <div className="account-list">
-                  <button type="button" className="account-row" onClick={() => handleAccountAction('sell')}>
-                    <span className="account-row-icon"><AccountMenuIcon type="seller" /></span>
-                    <span>Sell on Brandcart</span>
-                    <em>&#8250;</em>
-                  </button>
-                </div>
-              </section>
+                  <section className="account-section">
+                    <h4>My Activity</h4>
+                    <div className="account-list">
+                      {[
+                        ['reviews', 'Reviews', 'reviews'],
+                        ['qa', 'Questions & Answers', 'qa'],
+                      ].map(([type, label, action]) => (
+                        <button type="button" className="account-row" key={label} onClick={() => handleAccountAction(action)}>
+                          <span className="account-row-icon"><AccountMenuIcon type={type} /></span>
+                          <span>{label}</span>
+                          <em>&#8250;</em>
+                        </button>
+                      ))}
+                    </div>
+                  </section>
 
-              <section className="account-section">
-                <h4>Feedback & Information</h4>
-                <div className="account-list">
-                  {[
-                    ['docs', 'Terms, Policies and Licenses', 'terms'],
-                    ['info', 'Browse FAQs', 'faqs'],
-                  ].map(([type, label, action]) => (
-                    <button type="button" className="account-row" key={label} onClick={() => handleAccountAction(action)}>
-                      <span className="account-row-icon"><AccountMenuIcon type={type} /></span>
-                      <span>{label}</span>
-                      <em>&#8250;</em>
+                  <section className="account-section">
+                    <h4>Earn with Brandcart</h4>
+                    <div className="account-list">
+                      <button type="button" className="account-row" onClick={() => handleAccountAction('sell')}>
+                        <span className="account-row-icon"><AccountMenuIcon type="seller" /></span>
+                        <span>Sell on Brandcart</span>
+                        <em>&#8250;</em>
+                      </button>
+                    </div>
+                  </section>
+
+                  <section className="account-section">
+                    <h4>Feedback & Information</h4>
+                    <div className="account-list">
+                      {[
+                        ['docs', 'Terms, Policies and Licenses', 'terms'],
+                        ['info', 'Browse FAQs', 'faqs'],
+                      ].map(([type, label, action]) => (
+                        <button type="button" className="account-row" key={label} onClick={() => handleAccountAction(action)}>
+                          <span className="account-row-icon"><AccountMenuIcon type={type} /></span>
+                          <span>{label}</span>
+                          <em>&#8250;</em>
+                        </button>
+                      ))}
+                    </div>
+                  </section>
+                </>
+              )}
+
+              {accountView === 'devices' && (
+                <section className="account-section">
+                  <div className="account-content">
+                    <p className="quick-panel-meta">Signed in devices linked to your account.</p>
+                    {(deviceSessions.length ? deviceSessions : [{
+                      id: 'current',
+                      label: `${navigator.platform || 'Device'} / ${navigator.userAgent?.includes('Mobile') ? 'Mobile' : 'Desktop'}`,
+                      phone: userPhone || '-',
+                      last_active_at: new Date().toISOString(),
+                      current: true,
+                    }]).map((item) => (
+                      <article className="account-tile" key={item.id}>
+                        <strong>{item.label}</strong>
+                        <p>{item.phone || '-'}</p>
+                        <p>Last active: {new Date(item.last_active_at).toLocaleString()}</p>
+                        {item.current && <span className="account-chip">Current device</span>}
+                      </article>
+                    ))}
+                    <button
+                      type="button"
+                      className="account-primary-btn"
+                      onClick={() => {
+                        setDeviceSessions((prev) => prev.filter((item) => item.current))
+                        flashNotice('Signed out from other devices')
+                      }}
+                    >
+                      Sign Out From Other Devices
                     </button>
-                  ))}
-                </div>
-              </section>
+                  </div>
+                </section>
+              )}
+
+              {accountView === 'profile' && (
+                <section className="account-section">
+                  <form className="account-form" onSubmit={saveProfile}>
+                    <label>Full Name</label>
+                    <input
+                      type="text"
+                      value={profileForm.fullName}
+                      onChange={(event) => setProfileForm((prev) => ({ ...prev, fullName: event.target.value }))}
+                    />
+                    <label>Email</label>
+                    <input
+                      type="email"
+                      value={profileForm.email}
+                      onChange={(event) => setProfileForm((prev) => ({ ...prev, email: event.target.value }))}
+                    />
+                    <label>Phone</label>
+                    <input type="text" value={userPhone || '-'} disabled />
+                    <label>Gender</label>
+                    <select value={profileForm.gender} onChange={(event) => setProfileForm((prev) => ({ ...prev, gender: event.target.value }))}>
+                      {['Prefer not to say', 'Male', 'Female', 'Other'].map((option) => <option key={option}>{option}</option>)}
+                    </select>
+                    <button type="submit" className="account-primary-btn">Save Profile</button>
+                  </form>
+                </section>
+              )}
+
+              {accountView === 'cards' && (
+                <section className="account-section">
+                  <div className="account-content">
+                    <form className="account-form" onSubmit={addSavedCard}>
+                      <label>Card Holder Name</label>
+                      <input type="text" value={cardForm.holder} onChange={(event) => setCardForm((prev) => ({ ...prev, holder: event.target.value }))} />
+                      <label>Card Number</label>
+                      <input type="text" inputMode="numeric" value={cardForm.number} onChange={(event) => setCardForm((prev) => ({ ...prev, number: event.target.value.replace(/\D/g, '').slice(0, 16) }))} />
+                      <label>Expiry (MM/YY)</label>
+                      <input type="text" value={cardForm.expiry} onChange={(event) => setCardForm((prev) => ({ ...prev, expiry: event.target.value.slice(0, 5) }))} />
+                      <button type="submit" className="account-primary-btn">Save Card</button>
+                    </form>
+                    {savedCards.length === 0 && <p className="quick-panel-meta">No saved cards.</p>}
+                    {savedCards.map((item) => (
+                      <article className="account-tile" key={item.id}>
+                        <strong>XXXX XXXX XXXX {item.last4}</strong>
+                        <p>{item.holder} | Exp: {item.expiry}</p>
+                        <button type="button" className="account-inline-btn" onClick={() => removeSavedCard(item.id)}>Remove</button>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {accountView === 'language' && (
+                <section className="account-section">
+                  <div className="account-content">
+                    {['English', 'Hindi', 'Tamil', 'Telugu'].map((language) => (
+                      <button type="button" key={language} className={`account-choice ${accountLanguage === language ? 'is-selected' : ''}`} onClick={() => saveLanguage(language)}>
+                        {language}
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {accountView === 'notifications' && (
+                <section className="account-section">
+                  <div className="account-content">
+                    {[
+                      ['orderUpdates', 'Order Updates'],
+                      ['promotions', 'Promotions & Offers'],
+                      ['priceAlerts', 'Price Drop Alerts'],
+                    ].map(([key, label]) => (
+                      <label className="account-switch-row" key={key}>
+                        <span>{label}</span>
+                        <input
+                          type="checkbox"
+                          checked={Boolean(notificationPrefs[key])}
+                          onChange={() => toggleNotificationPref(key)}
+                        />
+                      </label>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {accountView === 'privacy' && (
+                <section className="account-section">
+                  <div className="account-content">
+                    {[
+                      ['personalizedAds', 'Personalized Ads'],
+                      ['usageAnalytics', 'Usage Analytics'],
+                      ['savedSearches', 'Save Search History'],
+                    ].map(([key, label]) => (
+                      <label className="account-switch-row" key={key}>
+                        <span>{label}</span>
+                        <input
+                          type="checkbox"
+                          checked={Boolean(privacyPrefs[key])}
+                          onChange={() => togglePrivacyPref(key)}
+                        />
+                      </label>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {accountView === 'reviews' && (
+                <section className="account-section">
+                  <div className="account-content">
+                    <form className="account-form" onSubmit={addReviewDraft}>
+                      <label>Write Review Draft</label>
+                      <textarea rows={3} value={reviewInput} onChange={(event) => setReviewInput(event.target.value)} placeholder="Share your product experience" />
+                      <button type="submit" className="account-primary-btn">Save Draft</button>
+                    </form>
+                    {reviewDrafts.length === 0 && <p className="quick-panel-meta">No review drafts yet.</p>}
+                    {reviewDrafts.map((item) => (
+                      <article className="account-tile" key={item.id}>
+                        <p>{item.text}</p>
+                        <p>{new Date(item.created_at).toLocaleString()}</p>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {accountView === 'qa' && (
+                <section className="account-section">
+                  <div className="account-content">
+                    <form className="account-form" onSubmit={addQuestion}>
+                      <label>Ask a Question</label>
+                      <textarea rows={3} value={qaInput} onChange={(event) => setQaInput(event.target.value)} placeholder="Ask about orders, products or policy" />
+                      <button type="submit" className="account-primary-btn">Submit Question</button>
+                    </form>
+                    {qaItems.length === 0 && <p className="quick-panel-meta">No questions asked yet.</p>}
+                    {qaItems.map((item) => (
+                      <article className="account-tile" key={item.id}>
+                        <strong>Q: {item.question}</strong>
+                        <p>A: {item.answer}</p>
+                        <p>{new Date(item.created_at).toLocaleString()}</p>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {accountView === 'sell' && (
+                <section className="account-section">
+                  <div className="account-content">
+                    {isLoadingSellerOnboarding && <p className="quick-panel-meta">Checking seller onboarding status...</p>}
+                    {!isLoadingSellerOnboarding && sellerOnboarding.status === 'requested' && (
+                      <article className="account-tile">
+                        <strong>Seller request is under review</strong>
+                        <p>Your documents are submitted and pending admin verification.</p>
+                        <p>Requested at: {sellerOnboarding.requestedAt ? new Date(sellerOnboarding.requestedAt).toLocaleString() : '-'}</p>
+                      </article>
+                    )}
+                    {!isLoadingSellerOnboarding && (userRole === 'seller' || sellerOnboarding.status === 'verified') && (
+                      <article className="account-tile">
+                        <strong>Your seller account is verified</strong>
+                        <p>You can now access seller features.</p>
+                      </article>
+                    )}
+                    {!isLoadingSellerOnboarding && sellerOnboarding.status === 'rejected' && (
+                      <article className="account-tile">
+                        <strong>Seller request was rejected</strong>
+                        <p>Reason: {sellerOnboarding.rejectedReason || 'Not specified'}</p>
+                        <p>Rejected at: {sellerOnboarding.rejectedAt ? new Date(sellerOnboarding.rejectedAt).toLocaleString() : '-'}</p>
+                        <p>You can update details and submit again.</p>
+                      </article>
+                    )}
+                    {!isLoadingSellerOnboarding && sellerOnboarding.status !== 'requested' && userRole !== 'seller' && sellerOnboarding.status !== 'verified' && (
+                      <form className="account-form" onSubmit={submitSellerRequest}>
+                        <label>Legal Name</label>
+                        <input type="text" value={sellerRequestForm.legal_name} onChange={(event) => setSellerRequestForm((prev) => ({ ...prev, legal_name: event.target.value }))} />
+                        <label>Brand Name</label>
+                        <input type="text" value={sellerRequestForm.brand_name} onChange={(event) => setSellerRequestForm((prev) => ({ ...prev, brand_name: event.target.value }))} />
+                        <label>Category</label>
+                        <input type="text" value={sellerRequestForm.category} onChange={(event) => setSellerRequestForm((prev) => ({ ...prev, category: event.target.value }))} />
+                        <label>Description</label>
+                        <textarea rows={2} value={sellerRequestForm.description} onChange={(event) => setSellerRequestForm((prev) => ({ ...prev, description: event.target.value }))} />
+                        <label>Email</label>
+                        <input type="email" value={sellerRequestForm.email} onChange={(event) => setSellerRequestForm((prev) => ({ ...prev, email: event.target.value }))} />
+                        <label>PAN Card</label>
+                        <input type="text" value={sellerRequestForm.pan_card} onChange={(event) => setSellerRequestForm((prev) => ({ ...prev, pan_card: event.target.value.toUpperCase() }))} />
+                        <label>GST Certificate</label>
+                        <input type="text" value={sellerRequestForm.gst_certificate} onChange={(event) => setSellerRequestForm((prev) => ({ ...prev, gst_certificate: event.target.value.toUpperCase() }))} />
+                        <label>Address Proof (URL/File Id)</label>
+                        <input type="text" value={sellerRequestForm.address_proof} onChange={(event) => setSellerRequestForm((prev) => ({ ...prev, address_proof: event.target.value }))} />
+                        <label>Logo URL (optional)</label>
+                        <input type="text" value={sellerRequestForm.logo_url} onChange={(event) => setSellerRequestForm((prev) => ({ ...prev, logo_url: event.target.value }))} />
+                        <button type="submit" className="account-primary-btn" disabled={isSubmittingSellerRequest}>
+                          {isSubmittingSellerRequest ? 'Submitting...' : (sellerOnboarding.status === 'rejected' ? 'Resubmit Seller Request' : 'Submit Seller Request')}
+                        </button>
+                      </form>
+                    )}
+                  </div>
+                </section>
+              )}
+
+              {accountView === 'terms' && (
+                <section className="account-section">
+                  <div className="account-content">
+                    {[
+                      'Payments are processed securely. Do not share OTPs.',
+                      'Returns are subject to product and seller policy.',
+                      'COD may be unavailable for some products and pincodes.',
+                      'Accounts violating policy may be restricted.',
+                    ].map((item) => <p key={item} className="quick-panel-meta">{item}</p>)}
+                  </div>
+                </section>
+              )}
+
+              {accountView === 'faqs' && (
+                <section className="account-section">
+                  <div className="account-content">
+                    {[
+                      ['How do I track order?', 'Open Orders section after placing your order.'],
+                      ['Why COD unavailable?', 'COD depends on seller settings, pincode and order value.'],
+                      ['How to become seller?', 'Use Sell on Brandcart and submit valid KYC details.'],
+                      ['How to change address?', 'Open Saved Addresses from account menu.'],
+                    ].map(([q, a]) => (
+                      <article className="account-tile" key={q}>
+                        <strong>{q}</strong>
+                        <p>{a}</p>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
             </div>
           </>
         )}
