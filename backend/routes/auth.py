@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
-import random, hashlib, os
+import random, hashlib, os, logging
 from typing import Optional
 from pydantic import EmailStr
 import re
@@ -12,6 +12,9 @@ from utils.security import get_current_user, require_role
 from utils.validators import normalize_phone
 from utils.audit import log_audit
 from utils.rate_limit import rate_limit
+from utils.otp_notify import notify_otp
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
@@ -73,9 +76,20 @@ async def send_otp(data: SendOtpRequest):
         upsert=True
     )
 
-    response = {"message": "OTP sent"}
+    # Send OTP via SMS/Email
+    notification = await notify_otp(phone=phone, otp=otp)
+    
+    response = {
+        "message": notification.get("message", "OTP sent"),
+        "sms_sent": notification.get("sms_sent", False),
+        "email_sent": notification.get("email_sent", False),
+    }
+    
+    # In dev mode, return OTP for testing
     if OTP_DEV_MODE:
         response["otp"] = otp
+        logger.warning(f"⚠️  OTP_DEV_MODE: OTP for {phone} is {otp}")
+    
     return response
 
 # ======================

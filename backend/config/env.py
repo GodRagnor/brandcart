@@ -81,6 +81,25 @@ CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 # --------------------------------------------------
 BANK_DATA_ENCRYPTION_KEY = os.getenv("BANK_DATA_ENCRYPTION_KEY")
 
+# =====================================================
+# OTP & NOTIFICATIONS
+# =====================================================
+OTP_DEV_MODE = (os.getenv("OTP_DEV_MODE", "true")).lower() in {"1", "true", "yes", "on"}
+
+# SMS Configuration (Twilio)
+SMS_PROVIDER = (os.getenv("SMS_PROVIDER") or "twilio").lower()
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_FROM_PHONE = os.getenv("TWILIO_FROM_PHONE")
+
+# Email Configuration (SMTP)
+EMAIL_PROVIDER = (os.getenv("EMAIL_PROVIDER") or "none").lower()
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL")
+
 
 def validate_production_env() -> None:
     if (ENV or "").lower() != "production":
@@ -102,6 +121,9 @@ def validate_production_env() -> None:
         "CLOUDINARY_API_KEY": CLOUDINARY_API_KEY,
         "CLOUDINARY_API_SECRET": CLOUDINARY_API_SECRET,
         "MONGODB_URI": MONGO_URI,
+        "TWILIO_ACCOUNT_SID": TWILIO_ACCOUNT_SID,
+        "TWILIO_AUTH_TOKEN": TWILIO_AUTH_TOKEN,
+        "TWILIO_FROM_PHONE": TWILIO_FROM_PHONE,
     }
 
     invalid = []
