@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { apiGet, apiPost } from './lib/api'
+import { createRateLimiter, createTokenValidator, validateEmail, validatePhone } from './lib/security'
+import { validateQuantity, validatePrice, sanitizeText } from './lib/validators'
 
 const categoryIcons = [
   { label: 'Mobiles', icon: 'mobiles', query: 'mobile' },
@@ -370,6 +372,9 @@ function AccountMenuIcon({ type }) {
   )
 }
 
+// Rate limiter for OTP requests (max 5 per minute)
+const otpRateLimiter = createRateLimiter(5, 60000)
+
 function App() {
   const [searchText, setSearchText] = useState('')
   const [searchSuggestions, setSearchSuggestions] = useState([])
@@ -415,7 +420,6 @@ function App() {
   const [isSendingOtp, setIsSendingOtp] = useState(false)
   const [isVerifyingOtp, setIsVerifyingOtp] = useState(false)
   const [isOtpSent, setIsOtpSent] = useState(false)
-  const [debugOtp, setDebugOtp] = useState('')
   const [checkoutPending, setCheckoutPending] = useState(false)
   const [addresses, setAddresses] = useState([])
   const [isLoadingAddresses, setIsLoadingAddresses] = useState(false)
@@ -439,7 +443,7 @@ function App() {
     email: '',
     gender: 'Prefer not to say',
   }))
-  const [savedCards, setSavedCards] = useState(() => readStoredJson(ACCOUNT_CARDS_KEY, []))
+  const [savedCards, setSavedCards] = useState([]) // Security: Cards should never be stored client-side
   const [cardForm, setCardForm] = useState({
     holder: '',
     number: '',
@@ -806,10 +810,6 @@ function App() {
   }, [profileForm])
 
   useEffect(() => {
-    localStorage.setItem(ACCOUNT_CARDS_KEY, JSON.stringify(savedCards))
-  }, [savedCards])
-
-  useEffect(() => {
     localStorage.setItem(ACCOUNT_DEVICES_KEY, JSON.stringify(deviceSessions))
   }, [deviceSessions])
 
@@ -1145,22 +1145,40 @@ function App() {
 
   const sendOtp = async (event) => {
     event.preventDefault()
+    
+    // Check rate limit
+    if (!otpRateLimiter.isAllowed()) {
+      flashNotice('Too many OTP requests. Please try again later.')
+      return
+    }
+    
     const phone = normalizePhoneInput(authPhoneInput)
-    if (phone.length !== 10) {
+    
+    // Validate phone
+    const phoneValidation = validatePhone(phone)
+    if (!phoneValidation) {
       flashNotice('Enter a valid 10-digit phone number')
       return
     }
 
     setIsSendingOtp(true)
     try {
-      const response = await apiPost('/api/auth/send-otp', { phone })
-      setAuthPhoneInput(phone)
+      const response = await apiPost('/api/auth/send-otp', { phone: phoneValidation })
+      setAuthPhoneInput(phoneValidation)
       setIsOtpSent(true)
-      const nextOtp = typeof response?.otp === 'string' ? response.otp : ''
-      setDebugOtp(nextOtp)
-      flashNotice(nextOtp ? `OTP: ${nextOtp}` : 'OTP sent')
-    } catch {
-      flashNotice('Failed to send OTP')
+      
+      // Show detailed feedback based on what was sent
+      if (response?.sms_sent && response?.email_sent) {
+        flashNotice('OTP sent via SMS and Email')
+      } else if (response?.sms_sent) {
+        flashNotice('OTP sent via SMS')
+      } else if (response?.email_sent) {
+        flashNotice('OTP sent via Email')
+      } else {
+        flashNotice(response?.message || 'OTP sent')
+      }
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Failed to send OTP')
     } finally {
       setIsSendingOtp(false)
     }
@@ -1170,24 +1188,26 @@ function App() {
     event.preventDefault()
     const phone = normalizePhoneInput(authPhoneInput)
     const otp = authOtpInput.trim()
-    if (phone.length !== 10 || otp.length < 4) {
-      flashNotice('Enter phone and OTP')
+    
+    // Validate inputs
+    const phoneValidation = validatePhone(phone)
+    if (!phoneValidation || otp.length < 4 || otp.length > 6) {
+      flashNotice('Enter valid phone and OTP')
       return
     }
 
     setIsVerifyingOtp(true)
     try {
-      const response = await apiPost('/api/auth/verify-otp', { phone, otp })
+      const response = await apiPost('/api/auth/verify-otp', { phone: phoneValidation, otp })
       const nextToken = response?.access_token || ''
       if (!nextToken) {
         throw new Error('Missing token')
       }
       setUserRole(response?.role || 'buyer')
       setAuthToken(nextToken)
-      setUserPhone(phone)
-      recordDeviceSession(phone)
+      setUserPhone(phoneValidation)
+      recordDeviceSession(phoneValidation)
       setIsOtpSent(false)
-      setDebugOtp('')
       setAuthOtpInput('')
       flashNotice('Login successful')
       if (checkoutPending) {
@@ -1197,8 +1217,8 @@ function App() {
       } else {
         setActiveQuickPanel('account')
       }
-    } catch {
-      flashNotice('Invalid OTP')
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Invalid OTP')
     } finally {
       setIsVerifyingOtp(false)
     }
@@ -1209,7 +1229,6 @@ function App() {
     setUserPhone('')
     setUserRole('buyer')
     setIsOtpSent(false)
-    setDebugOtp('')
     setAuthOtpInput('')
     setCheckoutPending(false)
     setAddresses([])
@@ -3281,9 +3300,6 @@ function App() {
                     {isVerifyingOtp ? 'Verifying...' : 'Verify & Continue'}
                   </button>
                 </form>
-              )}
-              {debugOtp && (
-                <p className="quick-panel-meta">Dev OTP: <strong>{debugOtp}</strong></p>
               )}
             </div>
           </>

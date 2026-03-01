@@ -1,5 +1,25 @@
 const envBase = import.meta.env.VITE_API_BASE_URL?.trim() || ''
-const API_BASE_URL = envBase.endsWith('/') ? envBase.slice(0, -1) : envBase
+const API_BASE_URL = validateApiUrl(envBase)
+
+function validateApiUrl(url) {
+  if (!url) return ''
+  const trimmed = url.endsWith('/') ? url.slice(0, -1) : url
+  try {
+    const parsed = new URL(trimmed)
+    if (typeof window !== 'undefined' && window.location.protocol === 'https:' && parsed.protocol !== 'https:') {
+      console.warn('Warning: API URL should use HTTPS')
+    }
+    return trimmed
+  } catch {
+    console.error('Invalid API base URL:', url)
+    return ''
+  }
+}
+
+function getCsrfToken() {
+  const meta = document.querySelector('meta[name="csrf-token"]')
+  return meta ? meta.getAttribute('content') : ''
+}
 
 async function apiRequest(path, options = {}) {
   const { method = 'GET', body, token } = options
@@ -11,16 +31,24 @@ async function apiRequest(path, options = {}) {
   if (token) {
     headers.Authorization = `Bearer ${token}`
   }
+  
+  if (method !== 'GET') {
+    const csrfToken = getCsrfToken()
+    if (csrfToken) {
+      headers['X-CSRF-Token'] = csrfToken
+    }
+  }
 
   const res = await fetch(`${API_BASE_URL}${path}`, {
     method,
-    credentials: 'include',
+    credentials: 'same-origin',
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
   })
 
   if (!res.ok) {
     let message = `HTTP ${res.status}`
+    let errorCode = ''
     try {
       const payload = await res.json()
       if (payload?.detail) {
@@ -28,10 +56,22 @@ async function apiRequest(path, options = {}) {
       } else if (payload?.message) {
         message = payload.message
       }
+      if (payload?.code) {
+        errorCode = payload.code
+      }
     } catch {
       message = `HTTP ${res.status}`
     }
-    throw new Error(message)
+    
+    if (res.status === 401 && errorCode === 'TOKEN_EXPIRED') {
+      localStorage.removeItem('brandcartAuthToken')
+      window.location.reload()
+    }
+    
+    const error = new Error(message)
+    error.status = res.status
+    error.code = errorCode
+    throw error
   }
 
   if (res.status === 204) {
