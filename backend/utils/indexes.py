@@ -99,6 +99,57 @@ async def ensure_indexes(db):
         [("status", ASCENDING), ("settlement.status", ASCENDING), ("delivered_at", ASCENDING)],
         name="orders_settlement_idx",
     )
+    await _create_index_safe(
+        db.orders,
+        [("delivery_partner.user_id", ASCENDING), ("status", ASCENDING), ("created_at", DESCENDING)],
+        name="orders_delivery_partner_user_status_created_idx",
+        sparse=True,
+    )
+    await _create_index_safe(
+        db.orders,
+        [("delivery_partner.phone", ASCENDING), ("status", ASCENDING), ("created_at", DESCENDING)],
+        name="orders_delivery_partner_phone_status_created_idx",
+        sparse=True,
+    )
+
+    # Seller delivery partners
+    await _create_index_safe(
+        db.seller_delivery_partners,
+        [("seller_id", ASCENDING), ("is_active", ASCENDING), ("created_at", DESCENDING)],
+        name="seller_delivery_partners_seller_active_created_idx",
+    )
+    await _create_index_safe(
+        db.seller_delivery_partners,
+        [("seller_id", ASCENDING), ("phone", ASCENDING)],
+        name="seller_delivery_partners_seller_phone_unique_idx",
+        unique=True,
+    )
+    await _create_index_safe(
+        db.seller_delivery_partners,
+        [("seller_id", ASCENDING), ("app_partner_id", ASCENDING)],
+        name="seller_delivery_partners_seller_app_partner_unique_idx",
+        unique=True,
+        sparse=True,
+    )
+
+    # Delivery app partner catalog
+    await _create_index_safe(
+        db.delivery_app_partners,
+        [("is_active", ASCENDING), ("name", ASCENDING)],
+        name="delivery_app_partners_active_name_idx",
+    )
+    await _create_index_safe(
+        db.delivery_app_partners,
+        [("code", ASCENDING)],
+        name="delivery_app_partners_code_unique_idx",
+        unique=True,
+    )
+    await _create_index_safe(
+        db.delivery_app_partners,
+        [("phone", ASCENDING)],
+        name="delivery_app_partners_phone_unique_idx",
+        unique=True,
+    )
 
     # Idempotency
     await _create_index_safe(

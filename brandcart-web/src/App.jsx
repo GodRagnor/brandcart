@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
-import { apiGet, apiPost } from './lib/api'
+import { apiDelete, apiGet, apiPatch, apiPost } from './lib/api'
 import { createRateLimiter, createTokenValidator, validateEmail, validatePhone } from './lib/security'
 import { validateQuantity, validatePrice, sanitizeText } from './lib/validators'
+// buyer/seller dashboards have been merged into App.jsx; dashboard folder is no longer used
 
 const categoryIcons = [
   { label: 'Mobiles', icon: 'mobiles', query: 'mobile' },
@@ -17,6 +18,15 @@ const categoryIcons = [
   { label: 'Books', icon: 'books', query: 'books' },
   { label: 'Toys', icon: 'toys', query: 'toys' },
   { label: 'Deals', icon: 'deals', query: 'deals' },
+]
+
+const indiaStates = [
+  'Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chhattisgarh', 'Goa', 'Gujarat',
+  'Haryana', 'Himachal Pradesh', 'Jharkhand', 'Karnataka', 'Kerala', 'Madhya Pradesh',
+  'Maharashtra', 'Manipur', 'Meghalaya', 'Mizoram', 'Nagaland', 'Odisha', 'Punjab',
+  'Rajasthan', 'Sikkim', 'Tamil Nadu', 'Telangana', 'Tripura', 'Uttar Pradesh', 'Uttarakhand',
+  'West Bengal', 'Andaman and Nicobar Islands', 'Chandigarh', 'Dadra and Nagar Haveli and Daman and Diu',
+  'Delhi', 'Jammu and Kashmir', 'Ladakh', 'Lakshadweep', 'Puducherry',
 ]
 
 const readCartItems = () => {
@@ -71,6 +81,10 @@ const paymentOptions = [
 const readAuthToken = () => localStorage.getItem(AUTH_TOKEN_KEY) || ''
 const readAuthPhone = () => localStorage.getItem(AUTH_PHONE_KEY) || ''
 const readAuthRole = () => localStorage.getItem(AUTH_ROLE_KEY) || 'buyer'
+const readPortalMode = () => {
+  const mode = new URLSearchParams(window.location.search).get('portal')
+  return mode === 'seller' || mode === 'admin' || mode === 'delivery' ? mode : ''
+}
 const readStoredJson = (key, fallback) => {
   const raw = localStorage.getItem(key)
   if (!raw) {
@@ -99,6 +113,75 @@ const getInitials = (name) => {
   }
   const parts = name.trim().split(/\s+/).slice(0, 2)
   return parts.map((part) => part[0]?.toUpperCase() || '').join('') || 'BR'
+}
+
+// currency helper reused by seller dashboard
+const formatCurrency = (value) => {
+  return new Intl.NumberFormat('en-IN', {
+    style: 'currency',
+    currency: 'INR',
+  }).format(value || 0)
+}
+
+const formatDateTime = (value) => {
+  if (!value) {
+    return '-'
+  }
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return '-'
+  }
+  return date.toLocaleString()
+}
+
+const normalizeOrderStatus = (value) => String(value || '').trim().toLowerCase()
+
+const buildOrderTrackingTimeline = (order) => {
+  const status = normalizeOrderStatus(order?.status)
+  const trackingRows = Array.isArray(order?.tracking) ? order.tracking : []
+  const findTrackingAt = (codes) => {
+    const hit = trackingRows.find((row) => codes.includes(String(row?.status || '').trim().toUpperCase()))
+    return hit?.at || null
+  }
+
+  const shippedAt = findTrackingAt(['SHIPPED', 'ORDER_SHIPPED'])
+  const outForDeliveryAt = findTrackingAt(['OUT_FOR_DELIVERY', 'DELIVERY_OTP_GENERATED']) || order?.delivery_otp_generated_at || null
+  const deliveredAt = findTrackingAt(['DELIVERED', 'ORDER_DELIVERED']) || order?.delivered_at || null
+
+  const shippedDone = ['shipped', 'delivery_otp_pending', 'out_for_delivery', 'delivered', 'rto'].includes(status) || Boolean(shippedAt)
+  const outForDeliveryDone = ['delivery_otp_pending', 'out_for_delivery', 'delivered'].includes(status) || Boolean(outForDeliveryAt)
+  const deliveredDone = status === 'delivered' || Boolean(deliveredAt)
+
+  const steps = [
+    { event: 'ORDERED', label: 'Ordered', created_at: order?.created_at || null, done: true },
+    { event: 'SHIPPED', label: 'Shipped', created_at: shippedAt || null, done: shippedDone },
+    { event: 'OUT_FOR_DELIVERY', label: 'Out for Delivery', created_at: outForDeliveryAt || null, done: outForDeliveryDone },
+    { event: 'DELIVERED', label: 'Delivered', created_at: deliveredAt || null, done: deliveredDone },
+  ].filter((step) => step.done || step.created_at)
+
+  if (status === 'rto') {
+    steps.push({
+      event: 'RTO',
+      label: 'Returned To Origin',
+      created_at: order?.updated_at || null,
+      done: true,
+    })
+  }
+
+  const returnStatus = normalizeOrderStatus(order?.return?.status)
+  if (returnStatus === 'requested') {
+    steps.push({ event: 'RETURN_REQUESTED', label: 'Return Requested', created_at: order?.updated_at || null, done: true })
+  } else if (returnStatus === 'approved') {
+    steps.push({ event: 'RETURN_APPROVED', label: 'Return Approved', created_at: order?.updated_at || null, done: true })
+  } else if (returnStatus === 'rejected') {
+    steps.push({ event: 'RETURN_REJECTED', label: 'Return Rejected', created_at: order?.updated_at || null, done: true })
+  }
+
+  if (normalizeOrderStatus(order?.return?.refund_status) === 'completed') {
+    steps.push({ event: 'REFUND_COMPLETED', label: 'Refund Completed', created_at: order?.updated_at || null, done: true })
+  }
+
+  return steps
 }
 
 const summarizeReviews = (payload) => {
@@ -238,6 +321,14 @@ function FooterNavIcon({ icon }) {
       </svg>
     )
   }
+  if (icon === 'orders') {
+    return (
+      <svg {...iconProps}>
+        <rect x="4.5" y="4" width="15" height="16" rx="2" />
+        <path d="M8 8h8M8 12h8M8 16h5" />
+      </svg>
+    )
+  }
   if (icon === 'categories') {
     return (
       <svg {...iconProps}>
@@ -342,6 +433,13 @@ function AccountMenuIcon({ type }) {
       </svg>
     )
   }
+  if (type === 'wishlist') {
+    return (
+      <svg {...iconProps}>
+        <path d="M12 20s-6.8-4.4-8.8-8.2C1.8 9.3 3 6.3 5.8 5.4c2-.6 3.8.1 5.1 1.6 1.3-1.5 3.1-2.2 5.1-1.6 2.8.9 4 3.9 2.6 6.4C18.8 15.6 12 20 12 20z" />
+      </svg>
+    )
+  }
   if (type === 'seller') {
     return (
       <svg {...iconProps}>
@@ -415,6 +513,7 @@ function App() {
   const [authToken, setAuthToken] = useState(readAuthToken)
   const [userPhone, setUserPhone] = useState(readAuthPhone)
   const [userRole, setUserRole] = useState(readAuthRole)
+  const [portalMode, setPortalMode] = useState(readPortalMode)
   const [authPhoneInput, setAuthPhoneInput] = useState('')
   const [authOtpInput, setAuthOtpInput] = useState('')
   const [isSendingOtp, setIsSendingOtp] = useState(false)
@@ -428,6 +527,12 @@ function App() {
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState('RAZORPAY')
   const [isPlacingOrder, setIsPlacingOrder] = useState(false)
   const [paymentError, setPaymentError] = useState('')
+  const [buyerOrders, setBuyerOrders] = useState([])
+  const [isLoadingBuyerOrders, setIsLoadingBuyerOrders] = useState(false)
+  const [buyerOrderStatusFilter, setBuyerOrderStatusFilter] = useState('all')
+  const [buyerOrderTimeline, setBuyerOrderTimeline] = useState([])
+  const [isLoadingBuyerTimeline, setIsLoadingBuyerTimeline] = useState(false)
+  const [activeBuyerTimelineOrderId, setActiveBuyerTimelineOrderId] = useState('')
   const [deliveryPincode, setDeliveryPincode] = useState('')
   const [isCheckingDelivery, setIsCheckingDelivery] = useState(false)
   const [deliveryCheck, setDeliveryCheck] = useState({
@@ -438,6 +543,7 @@ function App() {
     estimatedDays: null,
   })
   const [accountView, setAccountView] = useState('menu')
+  const [accountMenuQuery, setAccountMenuQuery] = useState('')
   const [profileForm, setProfileForm] = useState(() => readStoredJson(ACCOUNT_PROFILE_KEY, {
     fullName: '',
     email: '',
@@ -484,6 +590,99 @@ function App() {
     request: null,
   })
   const [isLoadingSellerOnboarding, setIsLoadingSellerOnboarding] = useState(false)
+
+  // ----- seller dashboard state (moved from separate component) -----
+  const [sellerActiveSection, setSellerActiveSection] = useState('overview')
+  const [sellerPerformance, setSellerPerformance] = useState(null)
+  const [sellerProducts, setSellerProducts] = useState([])
+  const [sellerWallet, setSellerWallet] = useState(null)
+  const [sellerDashboardProfile, setSellerDashboardProfile] = useState(null)
+  const [sellerServiceableRegions, setSellerServiceableRegions] = useState([])
+  const [sellerAllIndia, setSellerAllIndia] = useState(false)
+  const [sellerOffers, setSellerOffers] = useState([])
+  const [isLoadingSellerData, setIsLoadingSellerData] = useState(false)
+  const [sellerDataError, setSellerDataError] = useState('')
+  const [isLoadingSellerOffers, setIsLoadingSellerOffers] = useState(false)
+  const [sellerProfileForm, setSellerProfileForm] = useState({
+    support_email: '',
+    short_tagline: '',
+    logo_url: '',
+    description: '',
+  })
+  const [isSavingSellerProfile, setIsSavingSellerProfile] = useState(false)
+  const [sellerLogoFile, setSellerLogoFile] = useState(null)
+  const [isUploadingSellerLogo, setIsUploadingSellerLogo] = useState(false)
+  const [sellerDocumentsForm, setSellerDocumentsForm] = useState({
+    pan_card: '',
+    gst_certificate: '',
+    address_proof: '',
+  })
+  const [isSubmittingSellerDocuments, setIsSubmittingSellerDocuments] = useState(false)
+  const [isSavingSellerAllIndia, setIsSavingSellerAllIndia] = useState(false)
+  const [sellerRegionForm, setSellerRegionForm] = useState({ state: '', city: '', cod_enabled: false })
+  const [isSavingSellerRegions, setIsSavingSellerRegions] = useState(false)
+  const [isEnablingSellerCod, setIsEnablingSellerCod] = useState(false)
+  const [sellerCreateProductForm, setSellerCreateProductForm] = useState({
+    title: '',
+    description: '',
+    category: '',
+    sub_category: '',
+    tags: '',
+    mrp: '',
+    selling_price: '',
+    stock: '',
+    images: '',
+  })
+  const [isCreatingSellerProduct, setIsCreatingSellerProduct] = useState(false)
+  const [sellerProductUploadFiles, setSellerProductUploadFiles] = useState([])
+  const [isUploadingSellerProductImages, setIsUploadingSellerProductImages] = useState(false)
+  const [sellerOfferForm, setSellerOfferForm] = useState({
+    product_id: '',
+    offer_price: '',
+    start_at: '',
+    end_at: '',
+    festival_slug: '',
+  })
+  const [isCreatingSellerOffer, setIsCreatingSellerOffer] = useState(false)
+  const [sellerUpdatingOfferId, setSellerUpdatingOfferId] = useState('')
+  const [sellerPayoutForm, setSellerPayoutForm] = useState({
+    amount: '',
+    account_holder_name: '',
+    bank_account_number: '',
+    ifsc_code: '',
+    bank_name: '',
+  })
+  const [isRequestingEmergencyPayout, setIsRequestingEmergencyPayout] = useState(false)
+  const [sellerSavedBankAccount, setSellerSavedBankAccount] = useState(null)
+  const [sellerBankAccountForm, setSellerBankAccountForm] = useState({
+    account_holder_name: '',
+    bank_account_number: '',
+    ifsc_code: '',
+    bank_name: '',
+  })
+  const [isSavingSellerBankAccount, setIsSavingSellerBankAccount] = useState(false)
+  const [useSavedBankForPayout, setUseSavedBankForPayout] = useState(true)
+  const [sellerOrderOps, setSellerOrderOps] = useState({
+    order_id: '',
+    return_action: 'accept',
+  })
+  const [sellerOrders, setSellerOrders] = useState([])
+  const [sellerOrderStatusFilter, setSellerOrderStatusFilter] = useState('all')
+  const [isLoadingSellerOrders, setIsLoadingSellerOrders] = useState(false)
+  const [sellerOrderTimeline, setSellerOrderTimeline] = useState([])
+  const [sellerDeliveryPartners, setSellerDeliveryPartners] = useState([])
+  const [sellerDeliveryAppPartners, setSellerDeliveryAppPartners] = useState([])
+  const [sellerSelectedDeliveryAppPartnerId, setSellerSelectedDeliveryAppPartnerId] = useState('')
+  const [isSavingSellerDeliveryPartner, setIsSavingSellerDeliveryPartner] = useState(false)
+  const [sellerPartnerSelections, setSellerPartnerSelections] = useState({})
+  const [sellerAssigningPartnerOrderId, setSellerAssigningPartnerOrderId] = useState('')
+  const [sellerNotifications, setSellerNotifications] = useState([])
+  const [deliveryPartnerOrders, setDeliveryPartnerOrders] = useState([])
+  const [deliveryPartnerOrderStatusFilter, setDeliveryPartnerOrderStatusFilter] = useState('all')
+  const [isLoadingDeliveryPartnerOrders, setIsLoadingDeliveryPartnerOrders] = useState(false)
+  const [deliveryPartnerMarkingOrderId, setDeliveryPartnerMarkingOrderId] = useState('')
+  const [isSubmittingSellerOrderAction, setIsSubmittingSellerOrderAction] = useState(false)
+  const [isLoadingSellerTimeline, setIsLoadingSellerTimeline] = useState(false)
   const [adminSellerRequests, setAdminSellerRequests] = useState([])
   const [isLoadingAdminSellerRequests, setIsLoadingAdminSellerRequests] = useState(false)
   const [adminUpdatingSellerId, setAdminUpdatingSellerId] = useState('')
@@ -527,6 +726,27 @@ function App() {
     is_default: false,
   })
   const isLoggedIn = Boolean(authToken)
+  const isAdminPortal = portalMode === 'admin'
+  const isSellerPortal = portalMode === 'seller'
+  const isDeliveryPortal = portalMode === 'delivery'
+  const hasSellerPortalAccess = isLoggedIn && (userRole === 'seller' || sellerOnboarding.status === 'verified')
+  const hasAdminPortalAccess = isLoggedIn && userRole === 'admin'
+  const hasDeliveryPortalAccess = isLoggedIn && userRole === 'delivery_partner'
+
+  const sellerProductFilePreviews = useMemo(
+    () => sellerProductUploadFiles.map((file, index) => ({
+      id: `${file.name}-${file.size}-${file.lastModified}-${index}`,
+      name: file.name,
+      url: URL.createObjectURL(file),
+    })),
+    [sellerProductUploadFiles],
+  )
+
+  useEffect(() => {
+    return () => {
+      sellerProductFilePreviews.forEach((item) => URL.revokeObjectURL(item.url))
+    }
+  }, [sellerProductFilePreviews])
 
   const buildLocalSuggestions = (query) => {
     const needle = query.trim().toLowerCase()
@@ -651,10 +871,23 @@ function App() {
   }, [userRole])
 
   useEffect(() => {
+    const syncPortalMode = () => {
+      setPortalMode(readPortalMode())
+    }
+    window.addEventListener('popstate', syncPortalMode)
+    return () => {
+      window.removeEventListener('popstate', syncPortalMode)
+    }
+  }, [])
+
+  useEffect(() => {
     if (!authToken) {
       setUserPhone('')
       setUserRole('buyer')
       setAddresses([])
+      setBuyerOrders([])
+      setBuyerOrderTimeline([])
+      setActiveBuyerTimelineOrderId('')
       setAdminSellerRequests([])
       setAdminActiveSellers([])
       setAdminSellerRanking([])
@@ -687,6 +920,9 @@ function App() {
           setUserPhone('')
           setUserRole('buyer')
           setAddresses([])
+          setBuyerOrders([])
+          setBuyerOrderTimeline([])
+          setActiveBuyerTimelineOrderId('')
           setAdminSellerRequests([])
           setAdminActiveSellers([])
           setAdminSellerRanking([])
@@ -706,7 +942,7 @@ function App() {
   }, [authToken])
 
   useEffect(() => {
-    if (!authToken || accountView !== 'sell') {
+    if (!authToken) {
       return
     }
 
@@ -720,7 +956,9 @@ function App() {
         }
         const status = response?.seller_status || 'none'
         const request = response?.request && typeof response.request === 'object' ? response.request : null
-        setUserRole(response?.role || 'buyer')
+        // if onboarding has been verified, treat user as seller regardless of backend role field
+        const inferredRole = status === 'verified' ? 'seller' : (response?.role || 'buyer')
+        setUserRole(inferredRole)
         setSellerOnboarding({
           status,
           requestedAt: response?.requested_at || '',
@@ -762,7 +1000,100 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [authToken, accountView])
+  }, [authToken])
+
+  // load seller dashboard data when role/status indicates seller access
+  useEffect(() => {
+    const hasSellerAccess = Boolean(authToken) && hasSellerPortalAccess && isSellerPortal
+
+    if (!hasSellerAccess) {
+      setSellerPerformance(null)
+      setSellerProducts([])
+      setSellerWallet(null)
+      setSellerDashboardProfile(null)
+      setSellerSavedBankAccount(null)
+      setSellerAllIndia(false)
+      setSellerServiceableRegions([])
+      setSellerOffers([])
+      setSellerOrders([])
+      setSellerDeliveryPartners([])
+      setSellerDeliveryAppPartners([])
+      setSellerNotifications([])
+      setSellerPartnerSelections({})
+      setIsLoadingSellerData(false)
+      setIsLoadingSellerOffers(false)
+      setSellerDataError('')
+      return
+    }
+
+    const loadSellerData = async () => {
+      setIsLoadingSellerData(true)
+      setIsLoadingSellerOffers(true)
+      setSellerDataError('')
+      try {
+        const [perfData, prodData, walletData, profData, regionsData, offersData, bankData, ordersData, partnersData, notificationsData, appPartnersData] = await Promise.all([
+          apiGet('/api/seller/performance', { token: authToken }).catch(() => null),
+          apiGet('/api/seller/my-products', { token: authToken }).catch(() => null),
+          apiGet('/api/seller/wallet', { token: authToken }).catch(() => null),
+          apiGet('/api/seller/profile', { token: authToken }).catch(() => null),
+          apiGet('/api/seller/serviceable-regions', { token: authToken }).catch(() => null),
+          apiGet('/api/seller/offers', { token: authToken }).catch(() => null),
+          apiGet('/api/seller/bank-account', { token: authToken }).catch(() => null),
+          apiGet('/api/seller/orders?status=all&limit=50&page=1', { token: authToken }).catch(() => null),
+          apiGet('/api/seller/delivery-partners', { token: authToken }).catch(() => null),
+          apiGet('/api/seller/notifications?limit=20', { token: authToken }).catch(() => null),
+          apiGet('/api/seller/delivery-app/partners?limit=100', { token: authToken }).catch(() => null),
+        ])
+        const nextOrders = Array.isArray(ordersData?.orders) ? ordersData.orders : []
+        setSellerPerformance(perfData)
+        setSellerProducts(Array.isArray(prodData?.products) ? prodData.products : [])
+        setSellerWallet(walletData && typeof walletData === 'object' ? walletData : null)
+        setSellerDashboardProfile(profData)
+        setSellerProfileForm({
+          support_email: profData?.brand?.email || '',
+          short_tagline: profData?.brand?.short_tagline || '',
+          logo_url: profData?.brand?.logo_url || '',
+          description: profData?.brand?.description || '',
+        })
+        setSellerAllIndia(Boolean(regionsData?.all_india))
+        setSellerServiceableRegions(Array.isArray(regionsData?.serviceable_regions) ? regionsData.serviceable_regions : [])
+        setSellerOffers(Array.isArray(offersData?.offers) ? offersData.offers : [])
+        setSellerOrders(nextOrders)
+        setSellerDeliveryPartners(Array.isArray(partnersData?.partners) ? partnersData.partners : [])
+        setSellerNotifications(Array.isArray(notificationsData?.notifications) ? notificationsData.notifications : [])
+        setSellerDeliveryAppPartners(Array.isArray(appPartnersData?.partners) ? appPartnersData.partners : [])
+        setSellerPartnerSelections((prev) => {
+          const next = { ...(prev || {}) }
+          nextOrders.forEach((order) => {
+            const orderId = String(order?.id || '').trim()
+            const partnerId = String(order?.delivery_partner?.id || '').trim()
+            if (orderId && partnerId && !next[orderId]) {
+              next[orderId] = partnerId
+            }
+          })
+          return next
+        })
+        const savedBank = bankData?.bank_account || null
+        setSellerSavedBankAccount(savedBank)
+        setUseSavedBankForPayout(Boolean(savedBank))
+        if (savedBank) {
+          setSellerBankAccountForm((prev) => ({
+            ...prev,
+            account_holder_name: savedBank.account_holder_name || '',
+            ifsc_code: savedBank.ifsc_code || '',
+            bank_name: savedBank.bank_name || '',
+            bank_account_number: '',
+          }))
+        }
+      } catch (err) {
+        setSellerDataError('Failed to load seller data')
+      } finally {
+        setIsLoadingSellerData(false)
+        setIsLoadingSellerOffers(false)
+      }
+    }
+    loadSellerData()
+  }, [authToken, hasSellerPortalAccess, isSellerPortal])
 
   useEffect(() => {
     if (!Array.isArray(wishlistIds) || wishlistIds.length === 0) {
@@ -832,6 +1163,12 @@ function App() {
   useEffect(() => {
     localStorage.setItem(ACCOUNT_REVIEWS_KEY, JSON.stringify(reviewDrafts))
   }, [reviewDrafts])
+
+  useEffect(() => {
+    if (activeQuickPanel !== 'account' || accountView !== 'menu') {
+      setAccountMenuQuery('')
+    }
+  }, [activeQuickPanel, accountView])
 
   useEffect(() => {
     if (!userPhone) {
@@ -1232,6 +1569,9 @@ function App() {
     setAuthOtpInput('')
     setCheckoutPending(false)
     setAddresses([])
+    setBuyerOrders([])
+    setBuyerOrderTimeline([])
+    setActiveBuyerTimelineOrderId('')
     setAdminSellerRequests([])
     setAdminActiveSellers([])
     setAdminSellerRanking([])
@@ -1241,6 +1581,8 @@ function App() {
     setAdminPayoutRequests([])
     setAdminRiskSnapshots({})
     setAdminRejectReasons({})
+    setActiveQuickPanel('')
+    setAccountView('menu')
     flashNotice('Logged out')
   }
 
@@ -1581,8 +1923,14 @@ function App() {
     flashNotice('Removed from wishlist')
   }
 
-  const openWishlistPanel = () => {
-    setActiveQuickPanel((prev) => (prev === 'wishlist' ? '' : 'wishlist'))
+  const openOrdersPanel = () => {
+    if (!isLoggedIn) {
+      setCheckoutPending(false)
+      setActiveQuickPanel((prev) => (prev === 'auth' ? '' : 'auth'))
+      return
+    }
+    setAccountView('orders')
+    setActiveQuickPanel('account')
   }
 
   const openCartPanel = () => {
@@ -1698,6 +2046,62 @@ function App() {
     flashNotice('Review draft saved')
   }
 
+  const loadBuyerOrders = async (statusOverride = buyerOrderStatusFilter) => {
+    if (!authToken) {
+      return
+    }
+    setIsLoadingBuyerOrders(true)
+    try {
+      const response = await apiGet(`/api/orders/buyer/my-orders?status=${encodeURIComponent(statusOverride || 'all')}&limit=50&page=1`, { token: authToken })
+      setBuyerOrders(Array.isArray(response?.orders) ? response.orders : [])
+    } catch (error) {
+      setBuyerOrders([])
+      flashNotice(error instanceof Error ? error.message : 'Could not load your orders')
+    } finally {
+      setIsLoadingBuyerOrders(false)
+    }
+  }
+
+  const loadBuyerOrderTimeline = async (orderId) => {
+    const id = String(orderId || '').trim()
+    if (!id) {
+      flashNotice('Invalid order id')
+      return
+    }
+    setIsLoadingBuyerTimeline(true)
+    setActiveBuyerTimelineOrderId(id)
+    try {
+      const order = buyerOrders.find((row) => String(row?.id || '').trim() === id)
+      if (!order) {
+        setBuyerOrderTimeline([])
+        flashNotice('Timeline unavailable for this order')
+        return
+      }
+      const timeline = buildOrderTrackingTimeline(order)
+      setBuyerOrderTimeline(timeline)
+      flashNotice('Order status loaded')
+    } finally {
+      setIsLoadingBuyerTimeline(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!authToken || activeQuickPanel !== 'account' || accountView !== 'orders') {
+      return
+    }
+    loadBuyerOrders(buyerOrderStatusFilter)
+  }, [authToken, activeQuickPanel, accountView, buyerOrderStatusFilter])
+
+  useEffect(() => {
+    if (!authToken || activeQuickPanel !== 'account' || accountView !== 'orders') {
+      return
+    }
+    const timer = setInterval(() => {
+      loadBuyerOrders(buyerOrderStatusFilter)
+    }, 15000)
+    return () => clearInterval(timer)
+  }, [authToken, activeQuickPanel, accountView, buyerOrderStatusFilter])
+
   const submitSellerRequest = async (event) => {
     event.preventDefault()
     if (!authToken) {
@@ -1759,6 +2163,691 @@ function App() {
       setIsSubmittingSellerRequest(false)
     }
   }
+
+  const refreshSellerDashboard = async () => {
+    if (!authToken || (userRole !== 'seller' && sellerOnboarding.status !== 'verified')) {
+      return
+    }
+    try {
+      const [perfData, prodData, walletData, profData, regionsData, offersData, bankData, ordersData, partnersData, notificationsData, appPartnersData] = await Promise.all([
+        apiGet('/api/seller/performance', { token: authToken }).catch(() => null),
+        apiGet('/api/seller/my-products', { token: authToken }).catch(() => null),
+        apiGet('/api/seller/wallet', { token: authToken }).catch(() => null),
+        apiGet('/api/seller/profile', { token: authToken }).catch(() => null),
+        apiGet('/api/seller/serviceable-regions', { token: authToken }).catch(() => null),
+        apiGet('/api/seller/offers', { token: authToken }).catch(() => null),
+        apiGet('/api/seller/bank-account', { token: authToken }).catch(() => null),
+        apiGet(`/api/seller/orders?status=${encodeURIComponent(sellerOrderStatusFilter)}&limit=50&page=1`, { token: authToken }).catch(() => null),
+        apiGet('/api/seller/delivery-partners', { token: authToken }).catch(() => null),
+        apiGet('/api/seller/notifications?limit=20', { token: authToken }).catch(() => null),
+        apiGet('/api/seller/delivery-app/partners?limit=100', { token: authToken }).catch(() => null),
+      ])
+      const nextOrders = Array.isArray(ordersData?.orders) ? ordersData.orders : []
+      setSellerPerformance(perfData)
+      setSellerProducts(Array.isArray(prodData?.products) ? prodData.products : [])
+      setSellerWallet(walletData && typeof walletData === 'object' ? walletData : null)
+      setSellerDashboardProfile(profData)
+      setSellerAllIndia(Boolean(regionsData?.all_india))
+      setSellerServiceableRegions(Array.isArray(regionsData?.serviceable_regions) ? regionsData.serviceable_regions : [])
+      setSellerOffers(Array.isArray(offersData?.offers) ? offersData.offers : [])
+      setSellerOrders(nextOrders)
+      setSellerDeliveryPartners(Array.isArray(partnersData?.partners) ? partnersData.partners : [])
+      setSellerNotifications(Array.isArray(notificationsData?.notifications) ? notificationsData.notifications : [])
+      setSellerDeliveryAppPartners(Array.isArray(appPartnersData?.partners) ? appPartnersData.partners : [])
+      setSellerPartnerSelections((prev) => {
+        const next = { ...(prev || {}) }
+        nextOrders.forEach((order) => {
+          const orderId = String(order?.id || '').trim()
+          const partnerId = String(order?.delivery_partner?.id || '').trim()
+          if (orderId && partnerId && !next[orderId]) {
+            next[orderId] = partnerId
+          }
+        })
+        return next
+      })
+      const savedBank = bankData?.bank_account || null
+      setSellerSavedBankAccount(savedBank)
+      setUseSavedBankForPayout(Boolean(savedBank))
+      if (savedBank) {
+        setSellerBankAccountForm((prev) => ({
+          ...prev,
+          account_holder_name: savedBank.account_holder_name || '',
+          ifsc_code: savedBank.ifsc_code || '',
+          bank_name: savedBank.bank_name || '',
+          bank_account_number: '',
+        }))
+        setSellerPayoutForm((prev) => ({
+          ...prev,
+          account_holder_name: savedBank.account_holder_name || prev.account_holder_name,
+          ifsc_code: savedBank.ifsc_code || prev.ifsc_code,
+          bank_name: savedBank.bank_name || prev.bank_name,
+          bank_account_number: '',
+        }))
+      }
+      setSellerProfileForm({
+        support_email: profData?.brand?.email || '',
+        short_tagline: profData?.brand?.short_tagline || '',
+        logo_url: profData?.brand?.logo_url || '',
+        description: profData?.brand?.description || '',
+      })
+    } catch {
+      flashNotice('Could not refresh seller dashboard')
+    }
+  }
+
+  const loadSellerOrders = async (statusOverride = sellerOrderStatusFilter) => {
+    if (!authToken || (userRole !== 'seller' && sellerOnboarding.status !== 'verified')) {
+      return
+    }
+    setIsLoadingSellerOrders(true)
+    try {
+      const response = await apiGet(`/api/seller/orders?status=${encodeURIComponent(statusOverride || 'all')}&limit=50&page=1`, { token: authToken })
+      const nextOrders = Array.isArray(response?.orders) ? response.orders : []
+      setSellerOrders(nextOrders)
+      setSellerPartnerSelections((prev) => {
+        const next = { ...(prev || {}) }
+        nextOrders.forEach((order) => {
+          const orderId = String(order?.id || '').trim()
+          const partnerId = String(order?.delivery_partner?.id || '').trim()
+          if (orderId && partnerId && !next[orderId]) {
+            next[orderId] = partnerId
+          }
+        })
+        return next
+      })
+    } catch (error) {
+      setSellerOrders([])
+      flashNotice(error instanceof Error ? error.message : 'Could not load seller orders')
+    } finally {
+      setIsLoadingSellerOrders(false)
+    }
+  }
+
+  const saveSellerProfile = async (event) => {
+    event.preventDefault()
+    if (!authToken) {
+      return
+    }
+    setIsSavingSellerProfile(true)
+    try {
+      await apiPatch('/api/seller/profile', {
+        support_email: sellerProfileForm.support_email.trim() || undefined,
+        short_tagline: sellerProfileForm.short_tagline.trim() || undefined,
+        logo_url: sellerProfileForm.logo_url.trim() || undefined,
+        description: sellerProfileForm.description.trim() || undefined,
+      }, { token: authToken })
+      flashNotice('Seller profile updated')
+      await refreshSellerDashboard()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not update seller profile')
+    } finally {
+      setIsSavingSellerProfile(false)
+    }
+  }
+
+  const uploadSellerLogo = async () => {
+    if (!authToken) {
+      return
+    }
+    if (!sellerLogoFile) {
+      flashNotice('Select a logo image first')
+      return
+    }
+    setIsUploadingSellerLogo(true)
+    try {
+      const formData = new FormData()
+      formData.append('file', sellerLogoFile)
+      const response = await apiPost('/api/uploads/brand-logo', formData, { token: authToken })
+      const logoUrl = response?.logo_url || ''
+      if (logoUrl) {
+        setSellerProfileForm((prev) => ({ ...prev, logo_url: logoUrl }))
+      }
+      setSellerLogoFile(null)
+      flashNotice('Logo uploaded')
+      await refreshSellerDashboard()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not upload logo')
+    } finally {
+      setIsUploadingSellerLogo(false)
+    }
+  }
+
+  const submitSellerDocuments = async (event) => {
+    event.preventDefault()
+    if (!authToken) {
+      return
+    }
+    const payload = {
+      pan_card: sellerDocumentsForm.pan_card.trim().toUpperCase(),
+      gst_certificate: sellerDocumentsForm.gst_certificate.trim().toUpperCase(),
+      address_proof: sellerDocumentsForm.address_proof.trim(),
+    }
+    if (!payload.pan_card || !payload.gst_certificate || !payload.address_proof) {
+      flashNotice('Complete all document fields')
+      return
+    }
+    setIsSubmittingSellerDocuments(true)
+    try {
+      await apiPost('/api/seller/documents', payload, { token: authToken })
+      flashNotice('Seller documents submitted')
+      setSellerDocumentsForm({ pan_card: '', gst_certificate: '', address_proof: '' })
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not submit documents')
+    } finally {
+      setIsSubmittingSellerDocuments(false)
+    }
+  }
+
+  const enableSellerAllIndiaDelivery = async () => {
+    if (!authToken) {
+      return
+    }
+    setIsSavingSellerAllIndia(true)
+    try {
+      await apiPost('/api/seller/serviceable-regions/all-india', {}, { token: authToken })
+      flashNotice('All India delivery enabled')
+      await refreshSellerDashboard()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not enable All India delivery')
+    } finally {
+      setIsSavingSellerAllIndia(false)
+    }
+  }
+
+  const addSellerRegion = () => {
+    const state = sellerRegionForm.state.trim()
+    const city = sellerRegionForm.city.trim()
+    if (!state) {
+      flashNotice('Select a state')
+      return
+    }
+    const exists = sellerServiceableRegions.some((item) =>
+      item?.state?.toLowerCase() === state.toLowerCase()
+      && (item?.city || '').toLowerCase() === city.toLowerCase(),
+    )
+    if (exists) {
+      flashNotice('Region already added')
+      return
+    }
+    setSellerServiceableRegions((prev) => ([
+      ...prev,
+      {
+        state,
+        city: city || null,
+        delivery_enabled: true,
+        cod_enabled: Boolean(sellerRegionForm.cod_enabled),
+      },
+    ]))
+    setSellerRegionForm({ state: '', city: '', cod_enabled: false })
+  }
+
+  const removeSellerRegion = (state, city) => {
+    setSellerServiceableRegions((prev) =>
+      prev.filter((item) => !(
+        item?.state?.toLowerCase() === (state || '').toLowerCase()
+        && (item?.city || '').toLowerCase() === (city || '').toLowerCase()
+      )),
+    )
+  }
+
+  const saveSellerServiceableRegions = async () => {
+    if (!authToken) {
+      return
+    }
+    if (sellerAllIndia) {
+      flashNotice('Disable All India first to use state/city serviceability')
+      return
+    }
+    if (!sellerServiceableRegions.length) {
+      flashNotice('Add at least one state/city region')
+      return
+    }
+    setIsSavingSellerRegions(true)
+    try {
+      await apiPost('/api/seller/serviceable-regions', sellerServiceableRegions, { token: authToken })
+      flashNotice('State/city serviceability updated')
+      await refreshSellerDashboard()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not update state/city serviceability')
+    } finally {
+      setIsSavingSellerRegions(false)
+    }
+  }
+
+  const saveSellerBankAccount = async (event) => {
+    event.preventDefault()
+    if (!authToken) {
+      return
+    }
+    const payload = {
+      account_holder_name: sellerBankAccountForm.account_holder_name.trim(),
+      bank_account_number: sellerBankAccountForm.bank_account_number.replace(/\s+/g, ''),
+      ifsc_code: sellerBankAccountForm.ifsc_code.trim().toUpperCase(),
+      bank_name: sellerBankAccountForm.bank_name.trim() || undefined,
+    }
+    if (!payload.account_holder_name || !payload.bank_account_number || payload.ifsc_code.length !== 11) {
+      flashNotice('Complete valid bank account details')
+      return
+    }
+    setIsSavingSellerBankAccount(true)
+    try {
+      const response = await apiPost('/api/seller/bank-account', payload, { token: authToken })
+      const saved = response?.bank_account || null
+      setSellerSavedBankAccount(saved)
+      setUseSavedBankForPayout(true)
+      setSellerBankAccountForm((prev) => ({ ...prev, bank_account_number: '' }))
+      setSellerPayoutForm((prev) => ({
+        ...prev,
+        account_holder_name: saved?.account_holder_name || prev.account_holder_name,
+        ifsc_code: saved?.ifsc_code || prev.ifsc_code,
+        bank_name: saved?.bank_name || prev.bank_name,
+        bank_account_number: '',
+      }))
+      flashNotice('Bank account saved')
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not save bank account')
+    } finally {
+      setIsSavingSellerBankAccount(false)
+    }
+  }
+
+  const enableSellerCod = async () => {
+    if (!authToken) {
+      return
+    }
+    setIsEnablingSellerCod(true)
+    try {
+      await apiPost('/api/seller/enable-cod', {}, { token: authToken })
+      flashNotice('COD enabled')
+      await refreshSellerDashboard()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not enable COD')
+    } finally {
+      setIsEnablingSellerCod(false)
+    }
+  }
+
+  const createSellerProduct = async (event) => {
+    event.preventDefault()
+    if (!authToken) {
+      return
+    }
+    const images = sellerCreateProductForm.images
+      .split(/[\n,]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+    const payload = {
+      title: sellerCreateProductForm.title.trim(),
+      description: sellerCreateProductForm.description.trim() || undefined,
+      category: sellerCreateProductForm.category.trim(),
+      sub_category: sellerCreateProductForm.sub_category.trim() || undefined,
+      tags: sellerCreateProductForm.tags.split(',').map((tag) => tag.trim()).filter(Boolean),
+      mrp: Number(sellerCreateProductForm.mrp),
+      selling_price: Number(sellerCreateProductForm.selling_price),
+      stock: Number(sellerCreateProductForm.stock),
+      images,
+    }
+    if (!payload.title || !payload.category || !Number.isFinite(payload.mrp) || !Number.isFinite(payload.selling_price) || !Number.isFinite(payload.stock) || payload.stock < 0 || images.length === 0) {
+      flashNotice('Complete valid product details')
+      return
+    }
+    if (payload.selling_price > payload.mrp) {
+      flashNotice('Selling price cannot exceed MRP')
+      return
+    }
+    setIsCreatingSellerProduct(true)
+    try {
+      await apiPost('/api/products/create', payload, { token: authToken })
+      flashNotice('Product created')
+      setSellerCreateProductForm({
+        title: '',
+        description: '',
+        category: '',
+        sub_category: '',
+        tags: '',
+        mrp: '',
+        selling_price: '',
+        stock: '',
+        images: '',
+      })
+      await refreshSellerDashboard()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not create product')
+    } finally {
+      setIsCreatingSellerProduct(false)
+    }
+  }
+
+  const uploadSellerProductImages = async () => {
+    if (!authToken) {
+      return
+    }
+    if (!Array.isArray(sellerProductUploadFiles) || sellerProductUploadFiles.length === 0) {
+      flashNotice('Select image files first')
+      return
+    }
+
+    const currentUrls = sellerCreateProductForm.images
+      .split(/[\n,]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+
+    if (currentUrls.length + sellerProductUploadFiles.length > 7) {
+      flashNotice('Maximum 7 images allowed per product')
+      return
+    }
+
+    setIsUploadingSellerProductImages(true)
+    try {
+      const uploadedUrls = []
+      for (const file of sellerProductUploadFiles) {
+        const formData = new FormData()
+        formData.append('file', file)
+        const response = await apiPost('/api/uploads/product-image', formData, { token: authToken })
+        if (response?.image_url) {
+          uploadedUrls.push(response.image_url)
+        }
+      }
+      const merged = [...currentUrls, ...uploadedUrls]
+      setSellerCreateProductForm((prev) => ({ ...prev, images: merged.join('\n') }))
+      setSellerProductUploadFiles([])
+      flashNotice(`${uploadedUrls.length} image(s) uploaded`)
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not upload product images')
+    } finally {
+      setIsUploadingSellerProductImages(false)
+    }
+  }
+
+  const removeSelectedSellerProductFile = (fileId) => {
+    setSellerProductUploadFiles((prev) => prev.filter((file, index) => `${file.name}-${file.size}-${file.lastModified}-${index}` !== fileId))
+  }
+
+  const createSellerOffer = async (event) => {
+    event.preventDefault()
+    if (!authToken) {
+      return
+    }
+    const payload = {
+      product_id: sellerOfferForm.product_id.trim(),
+      offer_price: Number(sellerOfferForm.offer_price),
+      start_at: sellerOfferForm.start_at ? new Date(sellerOfferForm.start_at).toISOString() : '',
+      end_at: sellerOfferForm.end_at ? new Date(sellerOfferForm.end_at).toISOString() : '',
+      festival_slug: sellerOfferForm.festival_slug.trim() || undefined,
+    }
+    if (!payload.product_id || !Number.isFinite(payload.offer_price) || !payload.start_at || !payload.end_at) {
+      flashNotice('Complete offer fields')
+      return
+    }
+    setIsCreatingSellerOffer(true)
+    try {
+      await apiPost('/api/seller/offers', payload, { token: authToken })
+      flashNotice('Offer created')
+      setSellerOfferForm({
+        product_id: '',
+        offer_price: '',
+        start_at: '',
+        end_at: '',
+        festival_slug: '',
+      })
+      await refreshSellerDashboard()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not create offer')
+    } finally {
+      setIsCreatingSellerOffer(false)
+    }
+  }
+
+  const pauseSellerOffer = async (offerId) => {
+    if (!authToken || !offerId) {
+      return
+    }
+    setSellerUpdatingOfferId(offerId)
+    try {
+      await apiPatch(`/api/seller/offers/${offerId}/pause`, {}, { token: authToken })
+      flashNotice('Offer paused')
+      await refreshSellerDashboard()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not pause offer')
+    } finally {
+      setSellerUpdatingOfferId('')
+    }
+  }
+
+  const deleteSellerOffer = async (offerId) => {
+    if (!authToken || !offerId) {
+      return
+    }
+    setSellerUpdatingOfferId(offerId)
+    try {
+      await apiDelete(`/api/seller/offers/${offerId}`, { token: authToken })
+      flashNotice('Offer deleted')
+      await refreshSellerDashboard()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not delete offer')
+    } finally {
+      setSellerUpdatingOfferId('')
+    }
+  }
+
+  const requestEmergencyPayout = async (event) => {
+    event.preventDefault()
+    if (!authToken) {
+      return
+    }
+    const payload = {
+      amount: Number(sellerPayoutForm.amount),
+      account_holder_name: useSavedBankForPayout ? undefined : sellerPayoutForm.account_holder_name.trim(),
+      bank_account_number: useSavedBankForPayout ? undefined : sellerPayoutForm.bank_account_number.replace(/\s+/g, ''),
+      ifsc_code: useSavedBankForPayout ? undefined : sellerPayoutForm.ifsc_code.trim().toUpperCase(),
+      bank_name: useSavedBankForPayout ? undefined : (sellerPayoutForm.bank_name.trim() || undefined),
+    }
+    const hasSavedBank = Boolean(sellerSavedBankAccount)
+    if (!Number.isFinite(payload.amount) || payload.amount <= 0) {
+      flashNotice('Enter valid payout amount')
+      return
+    }
+    if (!useSavedBankForPayout && (!payload.account_holder_name || !payload.bank_account_number || payload.ifsc_code.length !== 11)) {
+      flashNotice('Complete payout bank fields')
+      return
+    }
+    if (useSavedBankForPayout && !hasSavedBank) {
+      flashNotice('Save bank account first or disable "use saved bank account"')
+      return
+    }
+    setIsRequestingEmergencyPayout(true)
+    try {
+      await apiPost('/api/seller/wallet/emergency-payout', payload, { token: authToken })
+      flashNotice('Emergency payout requested')
+      setSellerPayoutForm({
+        amount: '',
+        account_holder_name: '',
+        bank_account_number: '',
+        ifsc_code: '',
+        bank_name: '',
+      })
+      await refreshSellerDashboard()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not request payout')
+    } finally {
+      setIsRequestingEmergencyPayout(false)
+    }
+  }
+
+  const createSellerDeliveryPartner = async (event) => {
+    event.preventDefault()
+    if (!authToken) {
+      return
+    }
+    const appPartnerId = String(sellerSelectedDeliveryAppPartnerId || '').trim()
+    if (!appPartnerId) {
+      flashNotice('Select a delivery app partner to hire')
+      return
+    }
+    setIsSavingSellerDeliveryPartner(true)
+    try {
+      await apiPost(`/api/seller/delivery-app/partners/${encodeURIComponent(appPartnerId)}/hire`, {}, { token: authToken })
+      setSellerSelectedDeliveryAppPartnerId('')
+      flashNotice('Delivery app partner hired')
+      await refreshSellerDashboard()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not hire delivery app partner')
+    } finally {
+      setIsSavingSellerDeliveryPartner(false)
+    }
+  }
+
+  const assignSellerOrderDeliveryPartner = async (orderId, partnerIdOverride = '') => {
+    if (!authToken) {
+      return
+    }
+    const normalizedOrderId = String(orderId || '').trim()
+    const selectedPartnerId = String(
+      partnerIdOverride
+      || sellerPartnerSelections[normalizedOrderId]
+      || sellerOrders.find((row) => String(row?.id || '').trim() === normalizedOrderId)?.delivery_partner?.id
+      || '',
+    ).trim()
+    if (!normalizedOrderId || !selectedPartnerId) {
+      flashNotice('Choose a delivery partner first')
+      return
+    }
+    setSellerAssigningPartnerOrderId(normalizedOrderId)
+    try {
+      await apiPost(
+        `/api/seller/orders/${encodeURIComponent(normalizedOrderId)}/assign-delivery-partner`,
+        { partner_id: selectedPartnerId },
+        { token: authToken },
+      )
+      flashNotice('Delivery partner assigned')
+      await loadSellerOrders(sellerOrderStatusFilter)
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not assign delivery partner')
+    } finally {
+      setSellerAssigningPartnerOrderId('')
+    }
+  }
+
+  const loadDeliveryPartnerOrders = async (statusOverride = deliveryPartnerOrderStatusFilter) => {
+    if (!authToken || userRole !== 'delivery_partner') {
+      return
+    }
+    setIsLoadingDeliveryPartnerOrders(true)
+    try {
+      const response = await apiGet(`/api/orders/delivery-partner/my-orders?status=${encodeURIComponent(statusOverride || 'all')}&limit=50&page=1`, { token: authToken })
+      setDeliveryPartnerOrders(Array.isArray(response?.orders) ? response.orders : [])
+    } catch (error) {
+      setDeliveryPartnerOrders([])
+      flashNotice(error instanceof Error ? error.message : 'Could not load delivery orders')
+    } finally {
+      setIsLoadingDeliveryPartnerOrders(false)
+    }
+  }
+
+  const markDeliveryPartnerOrderOutForDelivery = async (orderId) => {
+    if (!authToken || userRole !== 'delivery_partner') {
+      return
+    }
+    const normalizedOrderId = String(orderId || '').trim()
+    if (!normalizedOrderId) {
+      flashNotice('Invalid order id')
+      return
+    }
+    setDeliveryPartnerMarkingOrderId(normalizedOrderId)
+    try {
+      const response = await apiPost(`/api/orders/delivery-partner/out-for-delivery/${encodeURIComponent(normalizedOrderId)}`, {}, { token: authToken })
+      const otpInfo = response?.otp ? ` OTP: ${response.otp}` : ''
+      flashNotice(`Out for delivery updated.${otpInfo}`)
+      await loadDeliveryPartnerOrders(deliveryPartnerOrderStatusFilter)
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not update order status')
+    } finally {
+      setDeliveryPartnerMarkingOrderId('')
+    }
+  }
+
+  const markSellerOrderShipped = async (orderIdOverride = '') => {
+    if (!authToken) {
+      return
+    }
+    const orderId = String(orderIdOverride || sellerOrderOps.order_id || '').trim()
+    if (!orderId) {
+      flashNotice('Enter order ID')
+      return
+    }
+    setIsSubmittingSellerOrderAction(true)
+    try {
+      await apiPost(`/api/orders/seller/mark-shipped/${encodeURIComponent(orderId)}`, {}, { token: authToken })
+      flashNotice('Order marked as shipped')
+      await loadSellerOrders()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not mark shipped')
+    } finally {
+      setIsSubmittingSellerOrderAction(false)
+    }
+  }
+
+  const submitSellerReturnAction = async (orderIdOverride = '', actionOverride = '') => {
+    if (!authToken) {
+      return
+    }
+    const orderId = String(orderIdOverride || sellerOrderOps.order_id || '').trim()
+    const actionInput = String(actionOverride || sellerOrderOps.return_action || '').toLowerCase()
+    const action = actionInput === 'reject' ? 'reject' : 'accept'
+    if (!orderId) {
+      flashNotice('Enter order ID')
+      return
+    }
+    setIsSubmittingSellerOrderAction(true)
+    try {
+      await apiPost(`/api/orders/seller/return-action/${encodeURIComponent(orderId)}?action=${encodeURIComponent(action)}`, {}, { token: authToken })
+      flashNotice(action === 'accept' ? 'Return approved' : 'Return rejected')
+      await loadSellerOrders()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not submit return action')
+    } finally {
+      setIsSubmittingSellerOrderAction(false)
+    }
+  }
+
+  const loadSellerOrderTimeline = async (orderIdOverride = '') => {
+    const orderId = String(orderIdOverride || sellerOrderOps.order_id || '').trim()
+    if (!orderId) {
+      flashNotice('Enter order ID')
+      return
+    }
+    setIsLoadingSellerTimeline(true)
+    try {
+      const order = sellerOrders.find((row) => String(row?.id || '').trim() === orderId)
+      if (!order) {
+        setSellerOrderTimeline([])
+        flashNotice('Timeline not available: order not found for this seller account')
+        return
+      }
+      const timeline = buildOrderTrackingTimeline(order)
+      setSellerOrderTimeline(timeline)
+      flashNotice('Order status loaded')
+    } finally {
+      setIsLoadingSellerTimeline(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!isSellerPortal || !hasSellerPortalAccess) {
+      return
+    }
+    if (sellerActiveSection !== 'orders') {
+      return
+    }
+    loadSellerOrders(sellerOrderStatusFilter)
+  }, [sellerActiveSection, sellerOrderStatusFilter, isSellerPortal, hasSellerPortalAccess])
+
+  useEffect(() => {
+    if (!isDeliveryPortal || !hasDeliveryPortalAccess) {
+      return
+    }
+    loadDeliveryPartnerOrders(deliveryPartnerOrderStatusFilter)
+  }, [isDeliveryPortal, hasDeliveryPortalAccess, deliveryPartnerOrderStatusFilter])
 
   const loadAdminSellerRequests = async () => {
     if (!authToken || userRole !== 'admin') {
@@ -2056,16 +3145,54 @@ function App() {
   }
 
   useEffect(() => {
-    if (authToken && userRole === 'admin') {
+    if (authToken && userRole === 'admin' && isAdminPortal) {
       loadAdminSnapshot()
     }
-  }, [authToken, userRole])
+  }, [authToken, userRole, isAdminPortal])
 
   useEffect(() => {
-    if (authToken && userRole === 'admin') {
+    if (authToken && userRole === 'admin' && isAdminPortal) {
       loadAdminPayoutRequests(adminPayoutStatusFilter)
     }
-  }, [adminPayoutStatusFilter])
+  }, [adminPayoutStatusFilter, authToken, userRole, isAdminPortal])
+
+  const openPortalInNewTab = (mode) => {
+    const target = mode === 'admin' ? 'admin' : (mode === 'delivery' ? 'delivery' : 'seller')
+    const url = new URL(window.location.href)
+    url.searchParams.set('portal', target)
+    url.searchParams.delete('p')
+    const popup = window.open(url.toString(), '_blank', 'noopener,noreferrer')
+    if (!popup) {
+      flashNotice('Popup blocked. Please allow popups for this site.')
+    } else {
+      const label = target === 'admin' ? 'Admin' : (target === 'delivery' ? 'Delivery Partner' : 'Seller')
+      flashNotice(`${label} dashboard opened in new tab`)
+    }
+  }
+
+  const exitPortalMode = () => {
+    const url = new URL(window.location.href)
+    url.searchParams.delete('portal')
+    window.history.replaceState({}, '', url)
+    setPortalMode('')
+  }
+
+  useEffect(() => {
+    if (!portalMode) {
+      return
+    }
+    if (portalMode === 'admin' && hasAdminPortalAccess) {
+      return
+    }
+    if (portalMode === 'seller' && hasSellerPortalAccess) {
+      return
+    }
+    if (portalMode === 'delivery' && hasDeliveryPortalAccess) {
+      return
+    }
+    exitPortalMode()
+    flashNotice('Portal access unavailable. Returned to storefront.')
+  }, [portalMode, hasAdminPortalAccess, hasSellerPortalAccess, hasDeliveryPortalAccess])
 
   const handleAccountAction = (action) => {
     if (action === 'manage_devices') {
@@ -2096,6 +3223,14 @@ function App() {
       setAccountView('privacy')
       return
     }
+    if (action === 'my_orders') {
+      setAccountView('orders')
+      return
+    }
+    if (action === 'wishlist') {
+      setAccountView('wishlist')
+      return
+    }
     if (action === 'reviews') {
       setAccountView('reviews')
       return
@@ -2105,7 +3240,28 @@ function App() {
       return
     }
     if (action === 'sell') {
+      const canOpenSellerPortal = userRole === 'seller' || sellerOnboarding.status === 'verified'
+      if (canOpenSellerPortal) {
+        openPortalInNewTab('seller')
+        return
+      }
       setAccountView('sell')
+      return
+    }
+    if (action === 'admin_portal') {
+      if (userRole !== 'admin') {
+        flashNotice('Admin role required')
+        return
+      }
+      openPortalInNewTab('admin')
+      return
+    }
+    if (action === 'delivery_portal') {
+      if (userRole !== 'delivery_partner') {
+        flashNotice('Delivery partner role required')
+        return
+      }
+      openPortalInNewTab('delivery')
       return
     }
     if (action === 'terms') {
@@ -2282,12 +3438,22 @@ function App() {
     language: 'Select Language',
     notifications: 'Notification Settings',
     privacy: 'Privacy Center',
+    orders: 'My Orders',
+    wishlist: 'My Wishlist',
     reviews: 'Reviews',
     qa: 'Questions & Answers',
     sell: 'Sell on Brandcart',
     terms: 'Terms & Policies',
     faqs: 'FAQs',
   })[accountView] || 'Account Settings'
+  const accountMenuNeedle = accountMenuQuery.trim().toLowerCase()
+  const accountMenuMatches = (label) => {
+    if (!accountMenuNeedle) {
+      return true
+    }
+    const text = typeof label === 'string' ? label : String(label || '')
+    return text.toLowerCase().includes(accountMenuNeedle)
+  }
 
   useEffect(() => {
     const previous = prevIsPdpRef.current
@@ -2301,7 +3467,7 @@ function App() {
     return undefined
   }, [isPdp])
 
-  if (isLoggedIn && userRole === 'admin') {
+  if (isAdminPortal && hasAdminPortalAccess) {
     return (
       <main className="admin-shell">
         <header className="admin-header">
@@ -2311,6 +3477,7 @@ function App() {
             <p className="admin-meta">Logged in as {userPhone || 'admin'}</p>
           </div>
           <div className="admin-header-actions">
+            <button type="button" className="account-inline-btn" onClick={exitPortalMode}>Back to Storefront</button>
             <button
               type="button"
               className="account-inline-btn"
@@ -2369,6 +3536,45 @@ function App() {
               <strong>Total Orders</strong>
               <p>{isLoadingAdminOrderSummary ? '...' : Number(adminOrderSummary?.total_orders || 0)}</p>
             </article>
+            <article className="admin-metric-card">
+              <strong>Delivered Orders</strong>
+              <p>{isLoadingAdminOrderSummary ? '...' : Number(adminOrderSummary?.delivered_orders || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>RTO Orders</strong>
+              <p>{isLoadingAdminOrderSummary ? '...' : Number(adminOrderSummary?.rto_orders || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Refunds Completed</strong>
+              <p>{isLoadingAdminOrderSummary ? '...' : Number(adminOrderSummary?.refunds_completed || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>High Risk Sellers</strong>
+              <p>{isLoadingAdminRiskDashboard ? '...' : Number(adminRiskDashboard?.risky_sellers?.length || 0)}</p>
+            </article>
+          </div>
+        </section>
+
+        <section className="admin-panel">
+          <div className="admin-panel-head">
+            <h2>High Risk Sellers</h2>
+            <span>{Array.isArray(adminRiskDashboard?.risky_sellers) ? adminRiskDashboard.risky_sellers.length : 0} listed</span>
+          </div>
+          {isLoadingAdminRiskDashboard && <p className="quick-panel-meta">Loading risk seller list...</p>}
+          {!isLoadingAdminRiskDashboard && (!Array.isArray(adminRiskDashboard?.risky_sellers) || adminRiskDashboard.risky_sellers.length === 0) && (
+            <p className="quick-panel-meta">No high risk sellers found.</p>
+          )}
+          <div className="admin-request-list">
+            {(Array.isArray(adminRiskDashboard?.risky_sellers) ? adminRiskDashboard.risky_sellers : []).map((seller) => (
+              <article className="account-tile" key={seller?.seller_id || `risk-${Math.random()}`}>
+                <strong>{seller?.email || seller?.seller_id || 'Unknown seller'}</strong>
+                <p>Seller ID: {seller?.seller_id || '-'}</p>
+                <p>Status: {seller?.status || '-'}</p>
+                <p>Tier: {seller?.tier || '-'}</p>
+                <p>Trust Score: {Number(seller?.trust_score || 0)}</p>
+                <p>Probation: {seller?.probation ? 'Yes' : 'No'}</p>
+              </article>
+            ))}
           </div>
         </section>
 
@@ -2688,7 +3894,78 @@ function App() {
     )
   }
 
-  return (
+  if (isDeliveryPortal && hasDeliveryPortalAccess) {
+    return (
+      <main className="seller-shell">
+        <header className="seller-header">
+          <h1>Delivery Partner Dashboard</h1>
+          <nav className="seller-nav">
+            <button type="button" onClick={exitPortalMode}>Back to Storefront</button>
+            <button type="button" onClick={() => loadDeliveryPartnerOrders(deliveryPartnerOrderStatusFilter)}>Refresh Orders</button>
+            <button type="button" onClick={logout} className="logout-btn">Logout</button>
+          </nav>
+          <p className="seller-meta">Logged in as delivery partner {userPhone || '-'}</p>
+        </header>
+        <section className="seller-content">
+          <div className="seller-section">
+            <h2>Assigned Orders</h2>
+            <div className="seller-toolbar">
+              <div className="form-group">
+                <label>Status Filter</label>
+                <select
+                  value={deliveryPartnerOrderStatusFilter}
+                  onChange={(event) => setDeliveryPartnerOrderStatusFilter(event.target.value)}
+                >
+                  {['all', 'shipped', 'out_for_delivery', 'delivery_otp_pending', 'delivered', 'rto'].map((status) => (
+                    <option key={status} value={status}>{status}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            {isLoadingDeliveryPartnerOrders && <p className="quick-panel-meta">Loading assigned orders...</p>}
+            {!isLoadingDeliveryPartnerOrders && deliveryPartnerOrders.length === 0 && <p className="quick-panel-meta">No assigned orders found.</p>}
+            {!isLoadingDeliveryPartnerOrders && deliveryPartnerOrders.length > 0 && (
+              <div className="admin-request-list">
+                {deliveryPartnerOrders.map((order) => {
+                  const orderId = String(order?.id || '').trim()
+                  const status = String(order?.status || '').toLowerCase()
+                  const canMarkOut = ['shipped', 'delivery_otp_pending', 'out_for_delivery'].includes(status)
+                  return (
+                    <article className="account-tile" key={orderId || Math.random()}>
+                      <strong>{order?.product?.title || 'Order'} ({orderId || '-'})</strong>
+                      <p>Status: {order?.status || '-'}</p>
+                      <p>Qty: {Number(order?.quantity || 0)}</p>
+                      <p>Customer: {order?.delivery_address?.name || '-'} | {order?.delivery_address?.phone || '-'}</p>
+                      <p>
+                        Address: {order?.delivery_address?.city || '-'}, {order?.delivery_address?.state || '-'} {order?.delivery_address?.pincode || ''}
+                      </p>
+                      <p>Assigned At: {formatDateTime(order?.delivery_partner?.assigned_at)}</p>
+                      {order?.delivery_partner?.out_for_delivery_at && (
+                        <p>Out for Delivery Since: {formatDateTime(order?.delivery_partner?.out_for_delivery_at)}</p>
+                      )}
+                      <div className="product-actions">
+                        <button
+                          type="button"
+                          className="action-btn edit"
+                          disabled={!canMarkOut || deliveryPartnerMarkingOrderId === orderId}
+                          onClick={() => markDeliveryPartnerOrderOutForDelivery(orderId)}
+                        >
+                          {deliveryPartnerMarkingOrderId === orderId ? 'Updating...' : 'Mark Out For Delivery + Generate OTP'}
+                        </button>
+                      </div>
+                    </article>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        </section>
+      </main>
+    )
+  }
+
+  if (!(isSellerPortal && hasSellerPortalAccess)) {
+    return (
     <main className="page-shell">
       {!isPdp && !isCategoryView && !activeQuickPanel && (
         <header className="premium-header">
@@ -3176,10 +4453,13 @@ function App() {
           <span>Home</span>
         </button>
 
-        <button type="button" className={`bottom-nav-item ${activeQuickPanel === 'wishlist' ? 'is-active' : ''}`} onClick={openWishlistPanel}>
-          <FooterNavIcon icon="wishlist" />
-          <span>Wishlist</span>
-          {wishlistIds.length > 0 && <span className="bottom-nav-badge">{wishlistIds.length}</span>}
+        <button
+          type="button"
+          className={`bottom-nav-item ${(activeQuickPanel === 'account' && accountView === 'orders') ? 'is-active' : ''}`}
+          onClick={openOrdersPanel}
+        >
+          <FooterNavIcon icon="orders" />
+          <span>My Orders</span>
         </button>
 
         <button type="button" className={`bottom-nav-item ${isCategoryView && !activeQuickPanel ? 'is-active' : ''}`} onClick={handleCategoriesShortcut}>
@@ -3425,24 +4705,76 @@ function App() {
         {activeQuickPanel === 'account' && (
           <>
             <div className="quick-panel-head">
-              <h3>{accountViewTitle}</h3>
-              <button type="button" onClick={() => (accountView === 'menu' ? closeQuickPanel() : setAccountView('menu'))}>Back</button>
+              <div className="account-head-copy">
+                <h3>{accountViewTitle}</h3>
+                <p>{userPhone || 'Buyer account'}</p>
+              </div>
+              <button type="button" onClick={() => (accountView === 'menu' ? closeQuickPanel() : setAccountView('menu'))}>
+                {accountView === 'menu' ? 'Close' : 'Back'}
+              </button>
             </div>
             <div className="quick-panel-body account-body">
+              <div className="account-view-shell" key={accountView}>
               {accountView === 'menu' && (
                 <>
+                  <section className="account-hero">
+                    <div className="account-hero-top">
+                      <div>
+                        <strong>{profileForm.fullName?.trim() || 'Brandcart User'}</strong>
+                        <p>{userPhone || '-'}</p>
+                      </div>
+                      <span className="account-chip">{userRole === 'admin' ? 'Admin' : (userRole === 'delivery_partner' ? 'Delivery Partner' : 'Buyer')}</span>
+                    </div>
+                    <div className="account-hero-stats">
+                      <article>
+                        <strong>{addresses.length}</strong>
+                        <span>Addresses</span>
+                      </article>
+                      <article>
+                        <strong>{savedCards.length}</strong>
+                        <span>Cards</span>
+                      </article>
+                      <article>
+                        <strong>{reviewDrafts.length + qaItems.length}</strong>
+                        <span>Drafts</span>
+                      </article>
+                    </div>
+                    <div className="account-hero-actions">
+                      <button type="button" className="account-inline-btn" onClick={() => setAccountView('profile')}>Edit Profile</button>
+                      <button type="button" className="account-inline-btn" onClick={openAddressPanel}>Manage Address</button>
+                    </div>
+                  </section>
+
+                  <section className="account-section">
+                    <div className="account-content">
+                      <label className="account-search-label" htmlFor="account-menu-search">Find setting</label>
+                      <input
+                        id="account-menu-search"
+                        type="text"
+                        className="account-search"
+                        placeholder="Search profile, cards, privacy..."
+                        value={accountMenuQuery}
+                        onChange={(event) => setAccountMenuQuery(event.target.value)}
+                      />
+                    </div>
+                  </section>
+
                   <section className="account-section">
                     <div className="account-list">
+                      {accountMenuMatches('Manage Checkout Addresses') && (
                       <button type="button" className="account-row" onClick={openAddressPanel}>
                         <span className="account-row-icon"><AccountMenuIcon type="address" /></span>
                         <span>Manage Checkout Addresses</span>
                         <em>&#8250;</em>
                       </button>
+                      )}
+                      {accountMenuMatches(`Logout ${userPhone || 'buyer'}`) && (
                       <button type="button" className="account-row" onClick={logout}>
                         <span className="account-row-icon"><AccountMenuIcon type="profile" /></span>
                         <span>Logout ({userPhone || 'buyer'})</span>
                         <em>&#8250;</em>
                       </button>
+                      )}
                     </div>
                   </section>
 
@@ -3456,7 +4788,7 @@ function App() {
                         ['language', `Select Language (${accountLanguage})`, 'language'],
                         ['notification', `Notification Settings (${notificationsEnabled ? 'On' : 'Off'})`, 'notifications'],
                         ['privacy', 'Privacy Center', 'privacy'],
-                      ].map(([type, label, action]) => (
+                      ].filter(([, label]) => accountMenuMatches(label)).map(([type, label, action]) => (
                         <button type="button" className="account-row" key={label} onClick={() => handleAccountAction(action)}>
                           <span className="account-row-icon"><AccountMenuIcon type={type} /></span>
                           <span>{label}</span>
@@ -3470,9 +4802,11 @@ function App() {
                     <h4>My Activity</h4>
                     <div className="account-list">
                       {[
+                        ['wishlist', 'My Wishlist', 'wishlist'],
+                        ['docs', 'My Orders', 'my_orders'],
                         ['reviews', 'Reviews', 'reviews'],
                         ['qa', 'Questions & Answers', 'qa'],
-                      ].map(([type, label, action]) => (
+                      ].filter(([, label]) => accountMenuMatches(label)).map(([type, label, action]) => (
                         <button type="button" className="account-row" key={label} onClick={() => handleAccountAction(action)}>
                           <span className="account-row-icon"><AccountMenuIcon type={type} /></span>
                           <span>{label}</span>
@@ -3485,11 +4819,31 @@ function App() {
                   <section className="account-section">
                     <h4>Earn with Brandcart</h4>
                     <div className="account-list">
+                      {accountMenuMatches('Sell on Brandcart') && (
                       <button type="button" className="account-row" onClick={() => handleAccountAction('sell')}>
                         <span className="account-row-icon"><AccountMenuIcon type="seller" /></span>
-                        <span>Sell on Brandcart</span>
+                        <span>{(userRole === 'seller' || sellerOnboarding.status === 'verified') ? 'Open Seller Dashboard (New Tab)' : 'Sell on Brandcart'}</span>
                         <em>&#8250;</em>
                       </button>
+                      )}
+                      {userRole === 'admin' && (
+                        accountMenuMatches('Open Admin Dashboard New Tab') && (
+                        <button type="button" className="account-row" onClick={() => handleAccountAction('admin_portal')}>
+                          <span className="account-row-icon"><AccountMenuIcon type="admin" /></span>
+                          <span>Open Admin Dashboard (New Tab)</span>
+                          <em>&#8250;</em>
+                        </button>
+                        )
+                      )}
+                      {userRole === 'delivery_partner' && (
+                        accountMenuMatches('Open Delivery Dashboard New Tab') && (
+                        <button type="button" className="account-row" onClick={() => handleAccountAction('delivery_portal')}>
+                          <span className="account-row-icon"><AccountMenuIcon type="seller" /></span>
+                          <span>Open Delivery Dashboard (New Tab)</span>
+                          <em>&#8250;</em>
+                        </button>
+                        )
+                      )}
                     </div>
                   </section>
 
@@ -3499,7 +4853,7 @@ function App() {
                       {[
                         ['docs', 'Terms, Policies and Licenses', 'terms'],
                         ['info', 'Browse FAQs', 'faqs'],
-                      ].map(([type, label, action]) => (
+                      ].filter(([, label]) => accountMenuMatches(label)).map(([type, label, action]) => (
                         <button type="button" className="account-row" key={label} onClick={() => handleAccountAction(action)}>
                           <span className="account-row-icon"><AccountMenuIcon type={type} /></span>
                           <span>{label}</span>
@@ -3508,6 +4862,28 @@ function App() {
                       ))}
                     </div>
                   </section>
+                  {accountMenuNeedle && ![
+                    'Manage Checkout Addresses',
+                    `Logout ${userPhone || 'buyer'}`,
+                    'Manage Devices',
+                    'Edit Profile',
+                    'Saved Credit / Debit & Gift Cards',
+                    'Saved Addresses',
+                    `Select Language (${accountLanguage})`,
+                    `Notification Settings (${notificationsEnabled ? 'On' : 'Off'})`,
+                    'Privacy Center',
+                    'My Wishlist',
+                    'My Orders',
+                    'Reviews',
+                    'Questions & Answers',
+                    'Sell on Brandcart',
+                    'Open Admin Dashboard (New Tab)',
+                    'Open Delivery Dashboard (New Tab)',
+                    'Terms, Policies and Licenses',
+                    'Browse FAQs',
+                  ].some((label) => accountMenuMatches(label)) && (
+                    <p className="quick-panel-meta">No matching settings found.</p>
+                  )}
                 </>
               )}
 
@@ -3647,6 +5023,94 @@ function App() {
                 </section>
               )}
 
+              {accountView === 'wishlist' && (
+                <section className="account-section">
+                  <div className="account-content">
+                    {isLoadingWishlistItems && <p className="quick-panel-meta">Loading wishlist...</p>}
+                    {!isLoadingWishlistItems && wishlistItems.length === 0 && <p className="quick-panel-meta">No items in wishlist.</p>}
+                    {!isLoadingWishlistItems && wishlistItems.map((item) => (
+                      <article className="quick-panel-item" key={item.id}>
+                        <button type="button" className="quick-panel-thumb" onClick={() => { openProduct(item); closeQuickPanel() }}>
+                          {Array.isArray(item.images) && item.images[0] ? <img src={item.images[0]} alt={item.title} /> : <span>No image</span>}
+                        </button>
+                        <div className="quick-panel-copy">
+                          <strong>{item.title}</strong>
+                          <p>{formatInr(item.selling_price) || '-'}</p>
+                          <div className="quick-panel-row">
+                            <button type="button" onClick={() => addProductToCart(item)}>Add to Cart</button>
+                            <button type="button" onClick={() => removeFromWishlist(item.id)}>Remove</button>
+                          </div>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {accountView === 'orders' && (
+                <section className="account-section">
+                  <div className="account-content">
+                    <div className="form-group">
+                      <label>Order Status</label>
+                      <select value={buyerOrderStatusFilter} onChange={(event) => setBuyerOrderStatusFilter(event.target.value)}>
+                        {['all', 'created', 'shipped', 'out_for_delivery', 'delivery_otp_pending', 'delivered', 'cancelled', 'rto', 'return_requested'].map((status) => (
+                          <option key={status} value={status}>{status}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <button type="button" className="account-inline-btn" disabled={isLoadingBuyerOrders} onClick={() => loadBuyerOrders()}>
+                      {isLoadingBuyerOrders ? 'Loading...' : 'Refresh Orders'}
+                    </button>
+                    {isLoadingBuyerOrders && <p className="quick-panel-meta">Loading your orders...</p>}
+                    {!isLoadingBuyerOrders && buyerOrders.length === 0 && <p className="quick-panel-meta">No orders found.</p>}
+                    {!isLoadingBuyerOrders && buyerOrders.map((order) => (
+                      <article className="account-tile" key={order.id || Math.random()}>
+                        <strong>{order?.product?.title || 'Product'} ({order?.id || '-'})</strong>
+                        <p>Status: {order?.status || '-'}</p>
+                        <p>Payment: {order?.payment?.method || '-'} ({order?.payment?.status || '-'})</p>
+                        <p>Amount: {formatCurrency(order?.pricing?.subtotal || 0)} | Qty: {Number(order?.quantity || 0)}</p>
+                        <p>Seller: {order?.seller_snapshot?.brand_name || '-'}</p>
+                        <p>Delivery Partner: {order?.delivery_partner?.name || 'Pending assignment'}</p>
+                        {order?.delivery_otp && (
+                          <p>Delivery OTP: <strong>{order.delivery_otp}</strong></p>
+                        )}
+                        {!order?.delivery_otp && order?.status === 'out_for_delivery' && (
+                          <p>Delivery OTP: waiting for delivery partner update</p>
+                        )}
+                        {order?.delivery_partner?.out_for_delivery_at && (
+                          <p>Out for Delivery Since: {formatDateTime(order?.delivery_partner?.out_for_delivery_at)}</p>
+                        )}
+                        <p>Placed: {formatDateTime(order?.created_at)}</p>
+                        <button
+                          type="button"
+                          className="account-inline-btn"
+                          disabled={isLoadingBuyerTimeline}
+                          onClick={() => loadBuyerOrderTimeline(order?.id)}
+                        >
+                          {isLoadingBuyerTimeline && activeBuyerTimelineOrderId === order?.id ? 'Loading...' : 'Track Order'}
+                        </button>
+                      </article>
+                    ))}
+                    <h4>Timeline</h4>
+                    {buyerOrderTimeline.length === 0 ? (
+                      <p className="quick-panel-meta">Select an order and tap "Track Order".</p>
+                    ) : (
+                      <div className="order-status-track">
+                        {buyerOrderTimeline.map((event, idx) => (
+                          <div key={`${event.event || 'evt'}-${idx}`} className={`order-status-step ${event?.done ? 'done' : ''}`}>
+                            <span className="order-status-dot" />
+                            <div className="order-status-content">
+                              <strong>{event.label || event.event || 'EVENT'}</strong>
+                              <p>{formatDateTime(event.created_at)}</p>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </section>
+              )}
+
               {accountView === 'reviews' && (
                 <section className="account-section">
                   <div className="account-content">
@@ -3662,6 +5126,9 @@ function App() {
                         <p>{new Date(item.created_at).toLocaleString()}</p>
                       </article>
                     ))}
+                    {reviewDrafts.length > 0 && (
+                      <button type="button" className="account-inline-btn" onClick={() => setReviewDrafts([])}>Clear All Drafts</button>
+                    )}
                   </div>
                 </section>
               )}
@@ -3682,6 +5149,9 @@ function App() {
                         <p>{new Date(item.created_at).toLocaleString()}</p>
                       </article>
                     ))}
+                    {qaItems.length > 0 && (
+                      <button type="button" className="account-inline-btn" onClick={() => setQaItems([])}>Clear Q&A History</button>
+                    )}
                   </div>
                 </section>
               )}
@@ -3770,11 +5240,984 @@ function App() {
                   </div>
                 </section>
               )}
+              </div>
             </div>
           </>
         )}
       </section>
       )}
+    </main>
+    )
+  }
+
+  // Sellers go directly to seller dashboard
+  // treat a verified onboarding as a seller as well, in case the backend role field lags
+  if (isSellerPortal && hasSellerPortalAccess) {
+    return (
+      <main className="seller-shell">
+        <header className="seller-header">
+          <h1>Seller Dashboard</h1>
+          <nav className="seller-nav">
+            <button type="button" onClick={exitPortalMode}>Back to Storefront</button>
+            <button
+              className={sellerActiveSection === 'overview' ? 'active' : ''}
+              onClick={() => setSellerActiveSection('overview')}
+            >
+              Overview
+            </button>
+            <button
+              className={sellerActiveSection === 'products' ? 'active' : ''}
+              onClick={() => setSellerActiveSection('products')}
+            >
+              Products
+            </button>
+            <button
+              className={sellerActiveSection === 'orders' ? 'active' : ''}
+              onClick={() => setSellerActiveSection('orders')}
+            >
+              Orders
+            </button>
+            <button
+              className={sellerActiveSection === 'offers' ? 'active' : ''}
+              onClick={() => setSellerActiveSection('offers')}
+            >
+              Offers
+            </button>
+            <button
+              className={sellerActiveSection === 'wallet' ? 'active' : ''}
+              onClick={() => setSellerActiveSection('wallet')}
+            >
+              Wallet
+            </button>
+            <button
+              className={sellerActiveSection === 'account' ? 'active' : ''}
+              onClick={() => setSellerActiveSection('account')}
+            >
+              Account
+            </button>
+            <button type="button" onClick={refreshSellerDashboard}>Refresh</button>
+            <button onClick={logout} className="logout-btn">Logout</button>
+          </nav>
+          <p className="seller-meta">Logged in as {userPhone || 'seller'}</p>
+        </header>
+        <section className="seller-content">
+          {isLoadingSellerData ? (
+            <div className="seller-section"><p>Loading seller data...</p></div>
+          ) : sellerDataError ? (
+            <div className="seller-section"><p style={{color: '#d32f2f'}}>{sellerDataError}</p></div>
+          ) : (() => {
+            switch (sellerActiveSection) {
+              case 'overview':
+                return (
+                  <div className="seller-section">
+                    <h2>Dashboard Overview</h2>
+                    {sellerPerformance && (
+                      <div className="metrics-grid">
+                        <div className="metric-card">
+                          <strong>Total Orders</strong>
+                          <p className="metric-value">{sellerPerformance.orders?.total || 0}</p>
+                        </div>
+                        <div className="metric-card">
+                          <strong>Delivered</strong>
+                          <p className="metric-value">{sellerPerformance.orders?.delivered || 0}</p>
+                        </div>
+                        <div className="metric-card">
+                          <strong>Cancelled</strong>
+                          <p className="metric-value">{sellerPerformance.orders?.cancelled || 0}</p>
+                        </div>
+                        <div className="metric-card">
+                          <strong>Net Revenue</strong>
+                          <p className="metric-value">{formatCurrency(sellerPerformance.revenue?.net)}</p>
+                        </div>
+                      </div>
+                    )}
+                    {sellerDashboardProfile && (
+                      <div className="seller-info-card">
+                        <h3>Store Information</h3>
+                        <div className="info-row">
+                          <span className="label">Brand Name:</span>
+                          <span className="value">{sellerDashboardProfile.brand?.brand_name || '-'}</span>
+                        </div>
+                        <div className="info-row">
+                          <span className="label">Seller ID:</span>
+                          <span className="value">{sellerDashboardProfile.seller_id || '-'}</span>
+                        </div>
+                        <div className="info-row">
+                          <span className="label">Status:</span>
+                          <span className="value">{sellerDashboardProfile.status?.seller_status || '-'}</span>
+                        </div>
+                        <div className="info-row">
+                          <span className="label">Frozen:</span>
+                          <span className="value">{sellerDashboardProfile.status?.is_frozen ? 'Yes' : 'No'}</span>
+                        </div>
+                        <div className="info-row">
+                          <span className="label">COD Enabled:</span>
+                          <span className="value">{sellerDashboardProfile.status?.cod_enabled ? 'Yes' : 'No'}</span>
+                        </div>
+                        <div className="info-row">
+                          <span className="label">All India Delivery:</span>
+                          <span className="value">{sellerAllIndia ? 'Enabled' : 'Disabled'}</span>
+                        </div>
+                      </div>
+                    )}
+                    <div className="seller-info-card">
+                      <h3>Serviceable Areas</h3>
+                      <p>{sellerAllIndia ? 'Delivering across India' : `${sellerServiceableRegions.length} state/city regions configured`}</p>
+                      <button
+                        type="button"
+                        className="seller-button primary"
+                        onClick={enableSellerCod}
+                        disabled={isEnablingSellerCod}
+                      >
+                        {isEnablingSellerCod ? 'Enabling COD...' : 'Enable COD'}
+                      </button>
+                    </div>
+                    <div className="seller-info-card">
+                      <h3>Delivery Notifications</h3>
+                      {sellerNotifications.length === 0 ? (
+                        <p className="quick-panel-meta">No delivery notifications yet.</p>
+                      ) : (
+                        <div className="delivery-notification-list">
+                          {sellerNotifications.slice(0, 6).map((item, idx) => (
+                            <article key={`${item?.order_id || 'note'}-${idx}`} className="delivery-notification-item">
+                              <strong>{item?.title || 'Update'}</strong>
+                              <p>{item?.message || '-'}</p>
+                              <span>{formatDateTime(item?.created_at)}</span>
+                            </article>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              case 'products':
+                return (
+                  <div className="seller-section">
+                    <h2>Create Product</h2>
+                    <form className="account-form" onSubmit={createSellerProduct}>
+                      <div className="form-group">
+                        <label>Title</label>
+                        <input
+                          type="text"
+                          value={sellerCreateProductForm.title}
+                          onChange={(event) => setSellerCreateProductForm((prev) => ({ ...prev, title: event.target.value }))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Description</label>
+                        <textarea
+                          rows={3}
+                          value={sellerCreateProductForm.description}
+                          onChange={(event) => setSellerCreateProductForm((prev) => ({ ...prev, description: event.target.value }))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Category</label>
+                        <input
+                          type="text"
+                          value={sellerCreateProductForm.category}
+                          onChange={(event) => setSellerCreateProductForm((prev) => ({ ...prev, category: event.target.value }))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Sub Category</label>
+                        <input
+                          type="text"
+                          value={sellerCreateProductForm.sub_category}
+                          onChange={(event) => setSellerCreateProductForm((prev) => ({ ...prev, sub_category: event.target.value }))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Tags (comma separated)</label>
+                        <input
+                          type="text"
+                          value={sellerCreateProductForm.tags}
+                          onChange={(event) => setSellerCreateProductForm((prev) => ({ ...prev, tags: event.target.value }))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>MRP</label>
+                        <input
+                          type="number"
+                          value={sellerCreateProductForm.mrp}
+                          onChange={(event) => setSellerCreateProductForm((prev) => ({ ...prev, mrp: event.target.value }))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Selling Price</label>
+                        <input
+                          type="number"
+                          value={sellerCreateProductForm.selling_price}
+                          onChange={(event) => setSellerCreateProductForm((prev) => ({ ...prev, selling_price: event.target.value }))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Stock</label>
+                        <input
+                          type="number"
+                          value={sellerCreateProductForm.stock}
+                          onChange={(event) => setSellerCreateProductForm((prev) => ({ ...prev, stock: event.target.value }))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Image URLs (comma or new-line separated)</label>
+                        <textarea
+                          rows={3}
+                          value={sellerCreateProductForm.images}
+                          onChange={(event) => setSellerCreateProductForm((prev) => ({ ...prev, images: event.target.value }))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Upload Product Images From Device</label>
+                        <input
+                          type="file"
+                          accept="image/*"
+                          multiple
+                          onChange={(event) => setSellerProductUploadFiles(Array.from(event.target.files || []))}
+                        />
+                        {sellerProductUploadFiles.length > 0 && (
+                          <p className="quick-panel-meta">{sellerProductUploadFiles.length} file(s) selected</p>
+                        )}
+                        {sellerProductFilePreviews.length > 0 && (
+                          <div className="seller-upload-preview-grid">
+                            {sellerProductFilePreviews.map((item) => (
+                              <article key={item.id} className="seller-upload-preview-card">
+                                <img src={item.url} alt={item.name} />
+                                <p title={item.name}>{item.name}</p>
+                                <button type="button" className="account-inline-btn" onClick={() => removeSelectedSellerProductFile(item.id)}>
+                                  Remove
+                                </button>
+                              </article>
+                            ))}
+                          </div>
+                        )}
+                        <button
+                          type="button"
+                          className="account-inline-btn"
+                          onClick={uploadSellerProductImages}
+                          disabled={isUploadingSellerProductImages}
+                        >
+                          {isUploadingSellerProductImages ? 'Uploading...' : 'Upload Selected Images'}
+                        </button>
+                      </div>
+                      <button type="submit" className="seller-button primary" disabled={isCreatingSellerProduct}>
+                        {isCreatingSellerProduct ? 'Creating...' : 'Create Product'}
+                      </button>
+                    </form>
+                    <h2>My Products ({sellerProducts.length})</h2>
+                    {sellerProducts.length === 0 ? (
+                      <p>No products yet. Start adding products to your store.</p>
+                    ) : (
+                      <div className="products-list">
+                        {sellerProducts.map((product) => (
+                          <div key={product.id} className="product-row">
+                            <div className="product-info">
+                              <strong>{product.title}</strong>
+                              <p className="product-category">Stock: {product.stock} | Reserved: {product.reserved_stock} | Available: {product.available_stock}</p>
+                            </div>
+                            <div className="product-pricing">
+                              <strong>{formatCurrency(product.selling_price)}</strong>
+                              {product.mrp > product.selling_price && (
+                                <span style={{textDecoration: 'line-through', color: '#999', marginLeft: '8px'}}>
+                                  {formatCurrency(product.mrp)}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )
+              case 'orders':
+                return (
+                  <div className="seller-section">
+                    <h2>Orders</h2>
+                    <div className="seller-info-card">
+                      <h3>Hire Delivery Partner From Delivery App</h3>
+                      <form className="delivery-partner-form" onSubmit={createSellerDeliveryPartner}>
+                        <div className="form-group">
+                          <label>Delivery App Partner</label>
+                          <select
+                            value={sellerSelectedDeliveryAppPartnerId}
+                            onChange={(event) => setSellerSelectedDeliveryAppPartnerId(event.target.value)}
+                          >
+                            <option value="">Select delivery app partner</option>
+                            {sellerDeliveryAppPartners.map((partner) => (
+                              <option key={partner?.id || Math.random()} value={partner?.id || ''}>
+                                {partner?.name || '-'} ({partner?.code || '-'}) | Rating: {partner?.rating || '-'} | {partner?.coverage || '-'}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <button type="submit" className="seller-button primary" disabled={isSavingSellerDeliveryPartner}>
+                          {isSavingSellerDeliveryPartner ? 'Hiring...' : 'Hire Partner'}
+                        </button>
+                      </form>
+                      {sellerDeliveryPartners.length === 0 ? (
+                        <p className="quick-panel-meta">No hired delivery partners yet.</p>
+                      ) : (
+                        <div className="delivery-partner-list">
+                          {sellerDeliveryPartners.map((partner) => (
+                            <article key={partner?.id || Math.random()} className="delivery-partner-chip">
+                              <strong>{partner?.name || '-'}</strong>
+                              <span>{partner?.phone_masked || partner?.phone || '-'}</span>
+                              <small>{partner?.code ? `${partner.code.toUpperCase()} | ` : ''}{partner?.is_active ? 'Active' : 'Inactive'}</small>
+                            </article>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    <div className="seller-toolbar">
+                      <div className="form-group">
+                        <label>Status Filter</label>
+                        <select
+                          value={sellerOrderStatusFilter}
+                          onChange={(event) => setSellerOrderStatusFilter(event.target.value)}
+                        >
+                          {['all', 'created', 'shipped', 'out_for_delivery', 'delivery_otp_pending', 'delivered', 'return_requested', 'cancelled', 'rto'].map((status) => (
+                            <option key={status} value={status}>{status}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <button type="button" className="account-inline-btn" disabled={isLoadingSellerOrders} onClick={() => loadSellerOrders()}>
+                        {isLoadingSellerOrders ? 'Loading...' : 'Refresh Orders'}
+                      </button>
+                    </div>
+                    {isLoadingSellerOrders && <p className="quick-panel-meta">Loading orders...</p>}
+                    {!isLoadingSellerOrders && sellerOrders.length === 0 && <p className="quick-panel-meta">No orders found for selected filter.</p>}
+                    {!isLoadingSellerOrders && sellerOrders.length > 0 && (
+                      <div className="admin-request-list">
+                        {sellerOrders.map((order) => {
+                          const orderId = order?.id || ''
+                          const status = String(order?.status || '-').toLowerCase()
+                          const statusLabel = order?.status || '-'
+                          const returnStatus = order?.return?.status || ''
+                          const selectedPartnerId = String(
+                            sellerPartnerSelections[orderId]
+                            || order?.delivery_partner?.id
+                            || '',
+                          )
+                          const assignedPartnerName = order?.delivery_partner?.name || ''
+                          const canShip = status === 'created'
+                          const canReturnAction = returnStatus === 'requested'
+                          const canMarkOutForDelivery = ['shipped', 'delivery_otp_pending', 'out_for_delivery'].includes(status)
+                          return (
+                            <article className="account-tile" key={orderId || `seller-order-${Math.random()}`}>
+                              <strong>{order?.product?.title || 'Order'} ({orderId || '-'})</strong>
+                              <p>Status: {statusLabel}</p>
+                              <p>Payment: {order?.payment?.method || '-'} ({order?.payment?.status || '-'})</p>
+                              <p>Qty: {Number(order?.quantity || 0)} | Amount: {formatCurrency(order?.pricing?.subtotal || 0)}</p>
+                              <p>Payout: {formatCurrency(order?.pricing?.seller_payout || 0)}</p>
+                              <p>Assigned Partner: {assignedPartnerName || 'Not assigned'}</p>
+                              {order?.delivery_partner?.out_for_delivery_at && (
+                                <p>Out for Delivery Since: {formatDateTime(order?.delivery_partner?.out_for_delivery_at)}</p>
+                              )}
+                              <p>
+                                Deliver to: {order?.delivery_address?.name || '-'} | {order?.delivery_address?.city || '-'},
+                                {' '}{order?.delivery_address?.state || '-'} {order?.delivery_address?.pincode || ''}
+                              </p>
+                              <p>Placed: {formatDateTime(order?.created_at)}</p>
+                              <div className="form-group">
+                                <label>Delivery Partner</label>
+                                <select
+                                  value={selectedPartnerId}
+                                  onChange={(event) => setSellerPartnerSelections((prev) => ({
+                                    ...prev,
+                                    [orderId]: event.target.value,
+                                  }))}
+                                >
+                                  <option value="">Select partner</option>
+                                  {sellerDeliveryPartners.map((partner) => (
+                                    <option key={partner?.id || Math.random()} value={partner?.id || ''}>
+                                      {partner?.name || '-'} ({partner?.phone_masked || partner?.phone || '-'})
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                              <div className="product-actions">
+                                <button
+                                  type="button"
+                                  className="action-btn edit"
+                                  disabled={!selectedPartnerId || sellerAssigningPartnerOrderId === orderId}
+                                  onClick={() => assignSellerOrderDeliveryPartner(orderId, selectedPartnerId)}
+                                >
+                                  {sellerAssigningPartnerOrderId === orderId ? 'Assigning...' : 'Assign Partner'}
+                                </button>
+                                {canMarkOutForDelivery && <span className="quick-panel-meta">Assigned delivery partner will generate OTP from delivery app.</span>}
+                                {canShip && (
+                                  <button
+                                    type="button"
+                                    className="action-btn edit"
+                                    disabled={isSubmittingSellerOrderAction}
+                                    onClick={() => {
+                                      setSellerOrderOps((prev) => ({ ...prev, order_id: orderId }))
+                                      markSellerOrderShipped(orderId)
+                                    }}
+                                  >
+                                    Mark Shipped
+                                  </button>
+                                )}
+                                {canReturnAction && (
+                                  <>
+                                    <button
+                                      type="button"
+                                      className="action-btn edit"
+                                      disabled={isSubmittingSellerOrderAction}
+                                      onClick={() => {
+                                        setSellerOrderOps((prev) => ({ ...prev, order_id: orderId, return_action: 'accept' }))
+                                        submitSellerReturnAction(orderId, 'accept')
+                                      }}
+                                    >
+                                      Accept Return
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="action-btn delete"
+                                      disabled={isSubmittingSellerOrderAction}
+                                      onClick={() => {
+                                        setSellerOrderOps((prev) => ({ ...prev, order_id: orderId, return_action: 'reject' }))
+                                        submitSellerReturnAction(orderId, 'reject')
+                                      }}
+                                    >
+                                      Reject Return
+                                    </button>
+                                  </>
+                                )}
+                                <button
+                                  type="button"
+                                  className="action-btn edit"
+                                  disabled={isLoadingSellerTimeline}
+                                  onClick={() => {
+                                    setSellerOrderOps((prev) => ({ ...prev, order_id: orderId }))
+                                    loadSellerOrderTimeline(orderId)
+                                  }}
+                                >
+                                  {isLoadingSellerTimeline && sellerOrderOps.order_id === orderId ? 'Loading...' : 'Timeline'}
+                                </button>
+                              </div>
+                            </article>
+                          )
+                        })}
+                      </div>
+                    )}
+                    <h3>Timeline</h3>
+                    {sellerOrderTimeline.length === 0 ? <p className="quick-panel-meta">No events loaded.</p> : (
+                      <div className="order-status-track">
+                        {sellerOrderTimeline.map((event, idx) => (
+                          <div key={`${event.event || 'evt'}-${idx}`} className={`order-status-step ${event?.done ? 'done' : ''}`}>
+                            <span className="order-status-dot" />
+                            <div className="order-status-content">
+                              <strong>{event.label || event.event || 'EVENT'}</strong>
+                              <p>{formatDateTime(event.created_at)}</p>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )
+              case 'offers':
+                return (
+                  <div className="seller-section">
+                    <h2>Offers</h2>
+                    <form className="account-form" onSubmit={createSellerOffer}>
+                      <div className="form-group">
+                        <label>Product</label>
+                        <select
+                          value={sellerOfferForm.product_id}
+                          onChange={(event) => setSellerOfferForm((prev) => ({ ...prev, product_id: event.target.value }))}
+                        >
+                          <option value="">Select Product</option>
+                          {sellerProducts.map((product) => (
+                            <option key={product.id} value={product.id}>
+                              {product.title}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="form-group">
+                        <label>Offer Price</label>
+                        <input
+                          type="number"
+                          value={sellerOfferForm.offer_price}
+                          onChange={(event) => setSellerOfferForm((prev) => ({ ...prev, offer_price: event.target.value }))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Start</label>
+                        <input
+                          type="datetime-local"
+                          value={sellerOfferForm.start_at}
+                          onChange={(event) => setSellerOfferForm((prev) => ({ ...prev, start_at: event.target.value }))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>End</label>
+                        <input
+                          type="datetime-local"
+                          value={sellerOfferForm.end_at}
+                          onChange={(event) => setSellerOfferForm((prev) => ({ ...prev, end_at: event.target.value }))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Festival Slug (optional)</label>
+                        <input
+                          type="text"
+                          value={sellerOfferForm.festival_slug}
+                          onChange={(event) => setSellerOfferForm((prev) => ({ ...prev, festival_slug: event.target.value }))}
+                        />
+                      </div>
+                      <button type="submit" className="seller-button primary" disabled={isCreatingSellerOffer}>
+                        {isCreatingSellerOffer ? 'Creating...' : 'Create Offer'}
+                      </button>
+                    </form>
+                    <h3>Existing Offers</h3>
+                    {isLoadingSellerOffers ? (
+                      <p>Loading offers...</p>
+                    ) : sellerOffers.length === 0 ? (
+                      <p className="quick-panel-meta">No offers created yet.</p>
+                    ) : (
+                      <div className="products-list">
+                        {sellerOffers.map((offer, index) => {
+                          const offerId = String(offer?._id || offer?.id || '')
+                          return (
+                            <div key={offerId || `offer-${index}`} className="product-row">
+                              <div className="product-info">
+                                <strong>Product: {String(offer.product_id || '-')}</strong>
+                                <p className="product-category">Offer: {formatCurrency(offer.offer_price)} | Status: {offer.status || '-'}</p>
+                                <p className="product-category">{formatDateTime(offer.start_at)} to {formatDateTime(offer.end_at)}</p>
+                              </div>
+                              <div className="product-actions">
+                                <button
+                                  type="button"
+                                  className="action-btn edit"
+                                  disabled={!offerId || sellerUpdatingOfferId === offerId}
+                                  onClick={() => pauseSellerOffer(offerId)}
+                                >
+                                  Pause
+                                </button>
+                                <button
+                                  type="button"
+                                  className="action-btn delete"
+                                  disabled={!offerId || sellerUpdatingOfferId === offerId}
+                                  onClick={() => deleteSellerOffer(offerId)}
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )
+              case 'wallet':
+                return (
+                  <div className="seller-section">
+                    <h2>Wallet & Payouts</h2>
+                    {sellerWallet && (
+                      <>
+                        <div className="wallet-summary">
+                          <div className="wallet-card primary">
+                            <p className="wallet-label">Available Balance</p>
+                            <p className="wallet-amount">{formatCurrency(sellerWallet.balances?.available)}</p>
+                          </div>
+                          <div className="wallet-card warning">
+                            <p className="wallet-label">Reserved Amount</p>
+                            <p className="wallet-amount">{formatCurrency(sellerWallet.balances?.reserved)}</p>
+                          </div>
+                        </div>
+                        <div className="seller-info-card">
+                          <h3>Totals</h3>
+                          <div className="info-row">
+                            <span className="label">Earned</span>
+                            <span className="value">{formatCurrency(sellerWallet.totals?.earned)}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Commission</span>
+                            <span className="value">{formatCurrency(sellerWallet.totals?.commission)}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Platform Fees</span>
+                            <span className="value">{formatCurrency(sellerWallet.totals?.platform_fees)}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Refunds</span>
+                            <span className="value">{formatCurrency(sellerWallet.totals?.refunds)}</span>
+                          </div>
+                        </div>
+                        <form className="account-form" onSubmit={requestEmergencyPayout}>
+                          <h3>Emergency Payout</h3>
+                          <div className="form-group">
+                            <label>Amount</label>
+                            <input type="number" value={sellerPayoutForm.amount} onChange={(event) => setSellerPayoutForm((prev) => ({ ...prev, amount: event.target.value }))} />
+                          </div>
+                          <div className="form-group">
+                            <label className="address-default">
+                              <input
+                                type="checkbox"
+                                checked={useSavedBankForPayout}
+                                onChange={(event) => setUseSavedBankForPayout(event.target.checked)}
+                                disabled={!sellerSavedBankAccount}
+                              />
+                              <span>Use saved bank account {sellerSavedBankAccount?.bank_account_masked ? `(${sellerSavedBankAccount.bank_account_masked})` : ''}</span>
+                            </label>
+                          </div>
+                          <div className="form-group">
+                            <label>Account Holder Name</label>
+                            <input type="text" value={sellerPayoutForm.account_holder_name} onChange={(event) => setSellerPayoutForm((prev) => ({ ...prev, account_holder_name: event.target.value }))} disabled={useSavedBankForPayout} />
+                          </div>
+                          <div className="form-group">
+                            <label>Bank Account Number</label>
+                            <input type="text" value={sellerPayoutForm.bank_account_number} onChange={(event) => setSellerPayoutForm((prev) => ({ ...prev, bank_account_number: event.target.value }))} disabled={useSavedBankForPayout} />
+                          </div>
+                          <div className="form-group">
+                            <label>IFSC Code</label>
+                            <input type="text" value={sellerPayoutForm.ifsc_code} onChange={(event) => setSellerPayoutForm((prev) => ({ ...prev, ifsc_code: event.target.value.toUpperCase() }))} disabled={useSavedBankForPayout} />
+                          </div>
+                          <div className="form-group">
+                            <label>Bank Name (optional)</label>
+                            <input type="text" value={sellerPayoutForm.bank_name} onChange={(event) => setSellerPayoutForm((prev) => ({ ...prev, bank_name: event.target.value }))} disabled={useSavedBankForPayout} />
+                          </div>
+                          <button type="submit" className="seller-button primary" disabled={isRequestingEmergencyPayout}>
+                            {isRequestingEmergencyPayout ? 'Requesting...' : 'Request Emergency Payout'}
+                          </button>
+                        </form>
+                        {sellerWallet.ledger && (
+                          <div className="wallet-ledger">
+                            <h3>Recent Transactions</h3>
+                            <div className="ledger-list">
+                              {sellerWallet.ledger.slice(0, 10).map((txn, idx) => (
+                                <div key={idx} className="ledger-row">
+                                  <span className="txn-description">{txn.reason_code || txn.entry_type || '-'}</span>
+                                  <span className={`txn-amount ${Number(txn.credit || 0) > 0 ? 'positive' : 'negative'}`}>
+                                    {Number(txn.credit || 0) > 0 ? '+' : '-'} {formatCurrency(Math.abs(Number(txn.credit || 0) - Number(txn.debit || 0)))}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )
+              case 'account':
+                return (
+                  <div className="seller-section">
+                    <h2>Account Settings</h2>
+                    {sellerDashboardProfile && (
+                      <>
+                        <div className="seller-info-card">
+                          <h3>Account Overview</h3>
+                          <div className="info-row">
+                            <span className="label">Seller ID</span>
+                            <span className="value">{sellerDashboardProfile.seller_id || '-'}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Legal Name</span>
+                            <span className="value">{sellerDashboardProfile.brand?.legal_name || '-'}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Brand Name</span>
+                            <span className="value">{sellerDashboardProfile.brand?.brand_name || '-'}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Store Slug</span>
+                            <span className="value">{sellerDashboardProfile.public?.slug || '-'}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Seller Status</span>
+                            <span className="value">{sellerDashboardProfile.status?.seller_status || '-'}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Is Frozen</span>
+                            <span className="value">{sellerDashboardProfile.status?.is_frozen ? 'Yes' : 'No'}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">PAN Verified</span>
+                            <span className="value">{sellerDashboardProfile.verification?.pan_verified ? 'Yes' : 'No'}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">GST Verified</span>
+                            <span className="value">{sellerDashboardProfile.verification?.gst_verified ? 'Yes' : 'No'}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Address Verified</span>
+                            <span className="value">{sellerDashboardProfile.verification?.address_verified ? 'Yes' : 'No'}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Products</span>
+                            <span className="value">{sellerProducts.length}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Offers</span>
+                            <span className="value">{sellerOffers.length}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Serviceable Regions (State/City)</span>
+                            <span className="value">{sellerServiceableRegions.length}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Wallet Available</span>
+                            <span className="value">{formatCurrency(sellerWallet?.balances?.available)}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Settlement Policy</span>
+                            <span className="value">{sellerWallet?.settlement_promise?.release_type || '-'}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Bank Account</span>
+                            <span className="value">{sellerSavedBankAccount?.bank_account_masked || 'Not saved'}</span>
+                          </div>
+                        </div>
+                        <form className="account-form" onSubmit={saveSellerProfile}>
+                          <h3>Update Store Profile</h3>
+                          <div className="form-group">
+                            <label>Support Email</label>
+                            <input
+                              type="email"
+                              value={sellerProfileForm.support_email}
+                              onChange={(event) => setSellerProfileForm((prev) => ({ ...prev, support_email: event.target.value }))}
+                            />
+                          </div>
+                          <div className="form-group">
+                            <label>Tagline</label>
+                            <input
+                              type="text"
+                              value={sellerProfileForm.short_tagline}
+                              onChange={(event) => setSellerProfileForm((prev) => ({ ...prev, short_tagline: event.target.value }))}
+                            />
+                          </div>
+                          <div className="form-group">
+                            <label>Logo URL</label>
+                            <input
+                              type="text"
+                              value={sellerProfileForm.logo_url}
+                              onChange={(event) => setSellerProfileForm((prev) => ({ ...prev, logo_url: event.target.value }))}
+                            />
+                          </div>
+                          <div className="form-group">
+                            <label>Upload Brand Logo From Device</label>
+                            <input
+                              type="file"
+                              accept="image/*"
+                              onChange={(event) => setSellerLogoFile(event.target.files?.[0] || null)}
+                            />
+                            <button
+                              type="button"
+                              className="account-inline-btn"
+                              onClick={uploadSellerLogo}
+                              disabled={isUploadingSellerLogo}
+                            >
+                              {isUploadingSellerLogo ? 'Uploading...' : 'Upload Logo'}
+                            </button>
+                          </div>
+                          <div className="form-group">
+                            <label>Description</label>
+                            <textarea
+                              rows={3}
+                              value={sellerProfileForm.description}
+                              onChange={(event) => setSellerProfileForm((prev) => ({ ...prev, description: event.target.value }))}
+                            />
+                          </div>
+                          <button type="submit" className="seller-button primary" disabled={isSavingSellerProfile}>
+                            {isSavingSellerProfile ? 'Saving...' : 'Save Profile'}
+                          </button>
+                        </form>
+                        <form className="account-form" onSubmit={saveSellerBankAccount}>
+                          <h3>Bank Account Settings</h3>
+                          {sellerSavedBankAccount && (
+                            <p className="quick-panel-meta">
+                              Saved: {sellerSavedBankAccount.account_holder_name || '-'} | {sellerSavedBankAccount.bank_account_masked || '-'} | {sellerSavedBankAccount.ifsc_code || '-'}
+                            </p>
+                          )}
+                          <div className="form-group">
+                            <label>Account Holder Name</label>
+                            <input
+                              type="text"
+                              value={sellerBankAccountForm.account_holder_name}
+                              onChange={(event) => setSellerBankAccountForm((prev) => ({ ...prev, account_holder_name: event.target.value }))}
+                            />
+                          </div>
+                          <div className="form-group">
+                            <label>Bank Account Number</label>
+                            <input
+                              type="text"
+                              value={sellerBankAccountForm.bank_account_number}
+                              onChange={(event) => setSellerBankAccountForm((prev) => ({ ...prev, bank_account_number: event.target.value }))}
+                            />
+                          </div>
+                          <div className="form-group">
+                            <label>IFSC Code</label>
+                            <input
+                              type="text"
+                              value={sellerBankAccountForm.ifsc_code}
+                              onChange={(event) => setSellerBankAccountForm((prev) => ({ ...prev, ifsc_code: event.target.value.toUpperCase() }))}
+                            />
+                          </div>
+                          <div className="form-group">
+                            <label>Bank Name (optional)</label>
+                            <input
+                              type="text"
+                              value={sellerBankAccountForm.bank_name}
+                              onChange={(event) => setSellerBankAccountForm((prev) => ({ ...prev, bank_name: event.target.value }))}
+                            />
+                          </div>
+                          <button type="submit" className="seller-button primary" disabled={isSavingSellerBankAccount}>
+                            {isSavingSellerBankAccount ? 'Saving...' : 'Save Bank Account'}
+                          </button>
+                        </form>
+                        <section className="account-form">
+                          <h3>Serviceable Areas</h3>
+                          <div className="form-group">
+                            <label className="address-default">
+                              <input
+                                type="checkbox"
+                                checked={sellerAllIndia}
+                                onChange={(event) => setSellerAllIndia(event.target.checked)}
+                              />
+                              <span>Deliverable Across All India</span>
+                            </label>
+                          </div>
+                          <button
+                            type="button"
+                            className="seller-button primary"
+                            onClick={enableSellerAllIndiaDelivery}
+                            disabled={!sellerAllIndia || isSavingSellerAllIndia}
+                          >
+                            {isSavingSellerAllIndia ? 'Saving...' : 'Enable All India Delivery'}
+                          </button>
+                          <p className="quick-panel-meta">
+                            Current: {sellerAllIndia ? 'All India' : 'Region-based serviceability'}
+                          </p>
+                        </section>
+                        <section className="account-form">
+                          <h3>Serviceable by State/City</h3>
+                          <div className="form-group">
+                            <label>State</label>
+                            <select
+                              value={sellerRegionForm.state}
+                              onChange={(event) => setSellerRegionForm((prev) => ({ ...prev, state: event.target.value }))}
+                              disabled={sellerAllIndia}
+                            >
+                              <option value="">Select State</option>
+                              {indiaStates.map((state) => (
+                                <option value={state} key={state}>{state}</option>
+                              ))}
+                            </select>
+                          </div>
+                          <div className="form-group">
+                            <label>City (optional)</label>
+                            <input
+                              type="text"
+                              value={sellerRegionForm.city}
+                              onChange={(event) => setSellerRegionForm((prev) => ({ ...prev, city: event.target.value }))}
+                              disabled={sellerAllIndia}
+                            />
+                          </div>
+                          <div className="form-group">
+                            <label className="address-default">
+                              <input
+                                type="checkbox"
+                                checked={sellerRegionForm.cod_enabled}
+                                onChange={(event) => setSellerRegionForm((prev) => ({ ...prev, cod_enabled: event.target.checked }))}
+                                disabled={sellerAllIndia}
+                              />
+                              <span>COD allowed for this region</span>
+                            </label>
+                          </div>
+                          <div className="product-actions">
+                            <button type="button" className="action-btn edit" onClick={addSellerRegion} disabled={sellerAllIndia}>Add Region</button>
+                            <button type="button" className="seller-button primary" onClick={saveSellerServiceableRegions} disabled={sellerAllIndia || isSavingSellerRegions}>
+                              {isSavingSellerRegions ? 'Saving...' : 'Save Regions'}
+                            </button>
+                          </div>
+                          {sellerServiceableRegions.length === 0 ? (
+                            <p className="quick-panel-meta">No state/city rules configured.</p>
+                          ) : (
+                            <div className="products-list">
+                              {sellerServiceableRegions.map((region, idx) => (
+                                <div className="product-row" key={`${region.state}-${region.city || 'all'}-${idx}`}>
+                                  <div className="product-info">
+                                    <strong>{region.state}</strong>
+                                    <p className="product-category">{region.city || 'All cities'} | COD: {region.cod_enabled ? 'Yes' : 'No'}</p>
+                                  </div>
+                                  <div className="product-actions">
+                                    <button
+                                      type="button"
+                                      className="action-btn delete"
+                                      onClick={() => removeSellerRegion(region.state, region.city)}
+                                      disabled={sellerAllIndia}
+                                    >
+                                      Remove
+                                    </button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </section>
+                        <form className="account-form" onSubmit={submitSellerDocuments}>
+                          <h3>Submit Verification Documents</h3>
+                          <div className="form-group">
+                            <label>PAN Card</label>
+                            <input
+                              type="text"
+                              value={sellerDocumentsForm.pan_card}
+                              onChange={(event) => setSellerDocumentsForm((prev) => ({ ...prev, pan_card: event.target.value.toUpperCase() }))}
+                            />
+                          </div>
+                          <div className="form-group">
+                            <label>GST Certificate</label>
+                            <input
+                              type="text"
+                              value={sellerDocumentsForm.gst_certificate}
+                              onChange={(event) => setSellerDocumentsForm((prev) => ({ ...prev, gst_certificate: event.target.value.toUpperCase() }))}
+                            />
+                          </div>
+                          <div className="form-group">
+                            <label>Address Proof</label>
+                            <input
+                              type="text"
+                              value={sellerDocumentsForm.address_proof}
+                              onChange={(event) => setSellerDocumentsForm((prev) => ({ ...prev, address_proof: event.target.value }))}
+                            />
+                          </div>
+                          <button type="submit" className="seller-button primary" disabled={isSubmittingSellerDocuments}>
+                            {isSubmittingSellerDocuments ? 'Submitting...' : 'Submit Documents'}
+                          </button>
+                        </form>
+                      </>
+                    )}
+                  </div>
+                )
+              default:
+                return null
+            }
+          })()}
+        </section>
+      </main>
+    );
+  }
+
+  // Buyers see a simple shell with header/navigation
+  return (
+    <main className="buyer-shell">
+      <header className="buyer-header">
+        <h1>Brandcart</h1>
+        <nav className="buyer-nav">
+          <button onClick={() => window.location.reload()}>Home</button>
+          <button onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}>Top</button>
+          <button onClick={openAccountPanel}>Account</button>
+        </nav>
+        <p className="buyer-meta">Logged in as {userPhone || 'buyer'}</p>
+      </header>
+      <section className="buyer-content">
+        {pageShell}
+      </section>
     </main>
   )
 }

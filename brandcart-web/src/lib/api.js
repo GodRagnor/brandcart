@@ -24,8 +24,9 @@ function getCsrfToken() {
 async function apiRequest(path, options = {}) {
   const { method = 'GET', body, token } = options
   const headers = {}
+  const isFormData = typeof FormData !== 'undefined' && body instanceof FormData
 
-  if (body !== undefined) {
+  if (body !== undefined && !isFormData) {
     headers['Content-Type'] = 'application/json'
   }
   if (token) {
@@ -43,7 +44,7 @@ async function apiRequest(path, options = {}) {
     method,
     credentials: 'same-origin',
     headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
+    body: body !== undefined ? (isFormData ? body : JSON.stringify(body)) : undefined,
   })
 
   if (!res.ok) {
@@ -90,4 +91,8 @@ export async function apiPost(path, body, options = {}) {
 
 export async function apiPatch(path, body, options = {}) {
   return apiRequest(path, { ...options, method: 'PATCH', body })
+}
+
+export async function apiDelete(path, options = {}) {
+  return apiRequest(path, { ...options, method: 'DELETE' })
 }

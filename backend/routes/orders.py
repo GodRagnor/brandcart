@@ -2,9 +2,10 @@
 from datetime import datetime, timedelta
 from fastapi import Request
 import asyncio
+from typing import Optional
 
 from database import get_db
-from utils.security import require_role
+from utils.security import require_role, require_roles
 from utils.otp import generate_otp, hash_otp, verify_hash
 from utils.wallet_service import add_ledger_entry
 from utils.audit import log_audit
@@ -19,12 +20,15 @@ from utils.idempotency import (
     clear_idempotency_key,
 )
 from utils.rate_limit import rate_limit
+from utils.otp_notify import notify_otp
+from utils.validators import normalize_phone
+from utils.crypto import encrypt_sensitive_value, decrypt_sensitive_value
 from utils.razorpay import (
     amount_to_paise,
     create_razorpay_order,
     verify_checkout_signature,
 )
-from config.env import RAZORPAY_KEY_ID
+from config.env import RAZORPAY_KEY_ID, OTP_DEV_MODE
 from pydantic import BaseModel
 from utils.guards import parse_object_id
 
@@ -59,6 +63,24 @@ def normalize_payment_method(payment_method: str) -> str:
         )
     return method
 
+
+def resolve_visible_delivery_otp(order: dict) -> Optional[str]:
+    encrypted = order.get("delivery_otp_encrypted")
+    generated_at = order.get("delivery_otp_generated_at")
+    status = str(order.get("status") or "").strip().lower()
+
+    if not encrypted or not isinstance(generated_at, datetime):
+        return None
+    if status not in {"out_for_delivery", "delivery_otp_pending"}:
+        return None
+    if datetime.utcnow() > generated_at + timedelta(minutes=DELIVERY_OTP_EXPIRY_MINUTES):
+        return None
+
+    try:
+        return decrypt_sensitive_value(encrypted)
+    except Exception:
+        return None
+
 class ReturnRequest(BaseModel):
     reason: str
 
@@ -84,7 +106,7 @@ async def create_order(
     address_id: str | None = Query(None),
     offer_id: str | None = Query(None),
     idempotency_key: str = Query(...),
-    buyer=Depends(require_role("buyer")),
+    buyer=Depends(require_roles("buyer", "seller")),
     db=Depends(get_db),
 ):
     now = datetime.utcnow()
@@ -193,14 +215,28 @@ async def create_order(
         if not address:
             raise HTTPException(400, "No address found. Please add an address first.")
 
-        area = next(
-            (a for a in seller.get("serviceable_areas", []) if a["pincode"] == address["pincode"]),
-            None,
-        )
-        if not area or not area.get("delivery_enabled"):
-            raise HTTPException(403, "Delivery not available to this pincode")
+        all_india_enabled = bool(seller.get("serviceability_all_india", False))
+        if not all_india_enabled:
+            region_match = None
+            address_state = (address.get("state") or "").strip().lower()
+            address_city = (address.get("city") or "").strip().lower()
+            for region in seller.get("serviceable_regions", []):
+                state = (region.get("state") or "").strip().lower()
+                city = (region.get("city") or "").strip().lower()
+                if not state:
+                    continue
+                if state == address_state and (not city or city == address_city):
+                    region_match = region
+                    break
 
-        if payment_method == "COD" and not seller.get("cod_settings", {}).get("enabled", False):
+            if region_match and not region_match.get("delivery_enabled"):
+                raise HTTPException(403, "Delivery not available to this location")
+
+            if not region_match:
+                raise HTTPException(403, "Delivery not available to this location")
+
+        cod_enabled = bool(seller.get("cod_settings", {}).get("enabled", False) or seller.get("cod_enabled", False))
+        if payment_method == "COD" and not cod_enabled:
             raise HTTPException(403, "Seller has not enabled COD")
 
         subtotal = final_price * quantity
@@ -358,7 +394,7 @@ async def create_order(
 @router.post("/payment/razorpay/verify")
 async def verify_razorpay_payment(
     data: RazorpayVerifyPayload,
-    buyer=Depends(require_role("buyer")),
+    buyer=Depends(require_roles("buyer", "seller")),
     db=Depends(get_db),
 ):
     existing = await reserve_idempotency_key(
@@ -461,6 +497,117 @@ async def verify_razorpay_payment(
         raise
 
 # ======================================================
+# BUYER ORDER LIST
+# ======================================================
+@router.get("/buyer/my-orders")
+async def buyer_my_orders(
+    status: Optional[str] = Query(default="all"),
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=100),
+    buyer=Depends(require_roles("buyer", "seller")),
+    db=Depends(get_db),
+):
+    query = {"buyer_id": buyer["_id"]}
+    normalized_status = (status or "all").strip().lower()
+    if normalized_status and normalized_status != "all":
+        query["status"] = normalized_status
+
+    skip = (page - 1) * limit
+    total = await db.orders.count_documents(query)
+    rows = await db.orders.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+
+    product_ids = [row.get("product_id") for row in rows if row.get("product_id")]
+    products_map = {}
+    if product_ids:
+        products = await db.products.find(
+            {"_id": {"$in": product_ids}},
+            {"title": 1, "images": 1}
+        ).to_list(len(product_ids))
+        products_map = {prod["_id"]: prod for prod in products}
+
+    items = []
+    for row in rows:
+        delivery = row.get("delivery_address") or {}
+        payment = row.get("payment") or {}
+        pricing = row.get("pricing") or {}
+        ret = row.get("return") or {}
+        snapshot = row.get("seller_snapshot") or {}
+        product = products_map.get(row.get("product_id")) or {}
+        delivery_partner = row.get("delivery_partner") or {}
+        partner_id_value = delivery_partner.get("id") or delivery_partner.get("_id")
+        if partner_id_value is not None:
+            partner_id_value = str(partner_id_value)
+        delivery_otp_visible = resolve_visible_delivery_otp(row)
+        tracking_rows = []
+        for track in (row.get("tracking") or []):
+            if isinstance(track, dict):
+                tracking_rows.append({
+                    "status": track.get("status"),
+                    "message": track.get("message"),
+                    "at": track.get("at"),
+                })
+
+        items.append({
+            "id": str(row["_id"]),
+            "status": row.get("status"),
+            "quantity": row.get("quantity", 0),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+            "delivered_at": row.get("delivered_at"),
+            "delivery_otp_generated_at": row.get("delivery_otp_generated_at"),
+            "product": {
+                "id": str(row.get("product_id")) if row.get("product_id") else None,
+                "title": product.get("title"),
+                "image": (product.get("images") or [None])[0],
+            },
+            "pricing": {
+                "subtotal": pricing.get("subtotal", 0),
+                "unit_price": pricing.get("unit_price", 0),
+            },
+            "payment": {
+                "method": payment.get("method"),
+                "status": payment.get("status"),
+            },
+            "return": {
+                "status": ret.get("status"),
+                "reason": ret.get("reason"),
+                "pickup_status": ret.get("pickup_status"),
+                "refund_status": ret.get("refund_status"),
+            },
+            "seller_snapshot": {
+                "brand_name": snapshot.get("brand_name"),
+                "brand_logo": snapshot.get("brand_logo"),
+            },
+            "delivery_partner": {
+                "id": partner_id_value,
+                "name": delivery_partner.get("name"),
+                "phone_masked": delivery_partner.get("phone_masked"),
+                "source": delivery_partner.get("source"),
+                "code": delivery_partner.get("code"),
+                "user_id": delivery_partner.get("user_id"),
+                "assigned_at": delivery_partner.get("assigned_at"),
+                "out_for_delivery_at": delivery_partner.get("out_for_delivery_at"),
+            },
+            "delivery_otp": delivery_otp_visible,
+            "delivery_address": {
+                "name": delivery.get("name"),
+                "city": delivery.get("city"),
+                "state": delivery.get("state"),
+                "pincode": delivery.get("pincode"),
+            },
+            "tracking": tracking_rows[-20:],
+        })
+
+    return {
+        "count": len(items),
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "has_more": (skip + len(items)) < total,
+        "orders": items,
+    }
+
+# ======================================================
 # SELLER MARK ORDER AS SHIPPED
 # ======================================================
 
@@ -512,6 +659,231 @@ async def seller_mark_shipped(
 
     return {"message": "Order marked as shipped"}
 
+
+@router.post("/seller/mark-out-for-delivery/{order_id}")
+async def seller_mark_out_for_delivery(
+    order_id: str,
+    partner_id: Optional[str] = Query(default=None),
+    seller=Depends(require_role("seller")),
+):
+    raise HTTPException(
+        403,
+        "Delivery OTP can only be generated by assigned delivery partner from delivery app",
+    )
+
+
+@router.get("/delivery-partner/my-orders")
+async def delivery_partner_my_orders(
+    status: Optional[str] = Query(default="all"),
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=100),
+    delivery_partner=Depends(require_role("delivery_partner")),
+    db=Depends(get_db),
+):
+    filters = []
+    partner_phone = (delivery_partner.get("phone") or "").strip()
+    if partner_phone:
+        filters.append({"delivery_partner.phone": partner_phone})
+    filters.append({"delivery_partner.user_id": str(delivery_partner["_id"])})
+
+    query = {"$or": filters}
+    normalized_status = (status or "all").strip().lower()
+    if normalized_status and normalized_status != "all":
+        query["status"] = normalized_status
+
+    skip = (page - 1) * limit
+    total = await db.orders.count_documents(query)
+    rows = await db.orders.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+
+    product_ids = [row.get("product_id") for row in rows if row.get("product_id")]
+    products_map = {}
+    if product_ids:
+        products = await db.products.find(
+            {"_id": {"$in": product_ids}},
+            {"title": 1, "images": 1}
+        ).to_list(len(product_ids))
+        products_map = {prod["_id"]: prod for prod in products}
+
+    orders = []
+    for row in rows:
+        product = products_map.get(row.get("product_id")) or {}
+        address = row.get("delivery_address") or {}
+        partner = row.get("delivery_partner") or {}
+        orders.append({
+            "id": str(row["_id"]),
+            "status": row.get("status"),
+            "quantity": row.get("quantity", 0),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+            "delivery_otp_generated_at": row.get("delivery_otp_generated_at"),
+            "product": {
+                "id": str(row.get("product_id")) if row.get("product_id") else None,
+                "title": product.get("title"),
+                "image": (product.get("images") or [None])[0],
+            },
+            "delivery_address": {
+                "name": address.get("name"),
+                "phone": address.get("phone"),
+                "city": address.get("city"),
+                "state": address.get("state"),
+                "pincode": address.get("pincode"),
+            },
+            "delivery_partner": {
+                "id": partner.get("id"),
+                "name": partner.get("name"),
+                "phone_masked": partner.get("phone_masked"),
+                "source": partner.get("source"),
+                "code": partner.get("code"),
+                "assigned_at": partner.get("assigned_at"),
+                "out_for_delivery_at": partner.get("out_for_delivery_at"),
+            },
+        })
+
+    return {
+        "count": len(orders),
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "has_more": (skip + len(orders)) < total,
+        "orders": orders,
+    }
+
+
+@router.post("/delivery-partner/out-for-delivery/{order_id}")
+async def delivery_partner_mark_out_for_delivery(
+    order_id: str,
+    delivery_partner=Depends(require_role("delivery_partner")),
+    db=Depends(get_db),
+):
+    now = datetime.utcnow()
+    order = await db.orders.find_one({"_id": parse_object_id(order_id, "order_id")})
+    if not order:
+        raise HTTPException(404, "Order not found")
+
+    partner_info = order.get("delivery_partner") or {}
+    assigned_user_id = str(partner_info.get("user_id") or "").strip()
+    assigned_phone = str(partner_info.get("phone") or "").strip()
+    caller_user_id = str(delivery_partner["_id"])
+    caller_phone = str(delivery_partner.get("phone") or "").strip()
+    is_assigned = (assigned_user_id and assigned_user_id == caller_user_id) or (assigned_phone and assigned_phone == caller_phone)
+    if not is_assigned:
+        raise HTTPException(403, "This order is not assigned to your delivery partner account")
+
+    if order.get("status") not in {"shipped", "delivery_otp_pending", "out_for_delivery"}:
+        raise HTTPException(400, "Only shipped orders can be marked out for delivery")
+
+    otp = generate_otp()
+    partner_payload = {
+        "id": partner_info.get("id"),
+        "name": partner_info.get("name"),
+        "phone": assigned_phone,
+        "phone_masked": partner_info.get("phone_masked"),
+        "email": partner_info.get("email"),
+        "source": partner_info.get("source"),
+        "code": partner_info.get("code"),
+        "user_id": caller_user_id,
+        "assigned_at": partner_info.get("assigned_at"),
+        "assigned_by": partner_info.get("assigned_by"),
+        "out_for_delivery_at": now,
+    }
+
+    await db.orders.update_one(
+        {"_id": order["_id"]},
+        {
+            "$set": {
+                "status": "out_for_delivery",
+                "delivery_partner": partner_payload,
+                "delivery_otp_hash": hash_otp(otp),
+                "delivery_otp_encrypted": encrypt_sensitive_value(otp),
+                "delivery_otp_generated_at": now,
+                "updated_at": now,
+            },
+            "$push": {
+                "tracking": {
+                    "status": "OUT_FOR_DELIVERY",
+                    "message": f"Out for delivery by {partner_payload.get('name') or 'delivery partner'}",
+                    "at": now,
+                }
+            },
+        },
+    )
+
+    await record_order_event(
+        db=db,
+        order_id=order["_id"],
+        event="OUT_FOR_DELIVERY_MARKED",
+        actor_role="delivery_partner",
+        actor_id=delivery_partner["_id"],
+        metadata={
+            "partner_id": partner_payload.get("id"),
+            "partner_name": partner_payload.get("name"),
+        },
+    )
+
+    seller_notice = {
+        "type": "delivery_update",
+        "title": "Out for delivery",
+        "message": f"{partner_payload.get('name') or 'Delivery partner'} marked order {str(order['_id'])} as out for delivery",
+        "order_id": str(order["_id"]),
+        "created_at": now,
+        "read": False,
+    }
+    buyer_notice = {
+        "type": "delivery_update",
+        "title": "Out for delivery",
+        "message": f"Your order is out for delivery with {partner_payload.get('name') or 'delivery partner'}",
+        "order_id": str(order["_id"]),
+        "created_at": now,
+        "read": False,
+    }
+
+    await db.users.update_one(
+        {"_id": order["seller_id"]},
+        {"$push": {"seller_notifications": {"$each": [seller_notice], "$slice": -100}}},
+    )
+    await db.users.update_one(
+        {"_id": order["buyer_id"]},
+        {"$push": {"buyer_notifications": {"$each": [buyer_notice], "$slice": -100}}},
+    )
+
+    notify_result = {"sms_sent": False, "email_sent": False, "message": "Buyer phone unavailable"}
+    buyer_phone = ((order.get("delivery_address") or {}).get("phone") or "").strip()
+    if buyer_phone:
+        try:
+            normalized_buyer_phone = normalize_phone(buyer_phone.replace(" ", "").replace("-", ""))
+            notify_result = await notify_otp(phone=normalized_buyer_phone, otp=otp)
+        except Exception:
+            notify_result = {"sms_sent": False, "email_sent": False, "message": "Could not send OTP"}
+
+    await log_audit(
+        db=db,
+        actor_id=str(delivery_partner["_id"]),
+        actor_role="delivery_partner",
+        action="ORDER_OUT_FOR_DELIVERY_MARKED",
+        metadata={
+            "order_id": str(order["_id"]),
+            "partner_id": partner_payload.get("id"),
+            "partner_name": partner_payload.get("name"),
+        },
+    )
+
+    response = {
+        "message": "Order marked out for delivery and OTP generated",
+        "order_id": order_id,
+        "status": "out_for_delivery",
+        "otp_sent": bool(notify_result.get("sms_sent") or notify_result.get("email_sent")),
+        "delivery_partner": {
+            "id": partner_payload.get("id"),
+            "name": partner_payload.get("name"),
+            "phone_masked": partner_payload.get("phone_masked"),
+            "out_for_delivery_at": partner_payload.get("out_for_delivery_at"),
+        },
+    }
+    if OTP_DEV_MODE:
+        response["otp"] = otp
+
+    return response
+
 # ======================================================
 # SYSTEM â†’ GENERATE DELIVERY OTP
 # ======================================================
@@ -540,6 +912,7 @@ async def generate_delivery_otp_system(
         {
             "$set": {
                 "delivery_otp_hash": hash_otp(otp),
+                "delivery_otp_encrypted": encrypt_sensitive_value(otp),
                 "delivery_otp_generated_at": now,
                 "status": "delivery_otp_pending",
                 "updated_at": now
@@ -564,7 +937,7 @@ async def generate_delivery_otp_system(
 async def confirm_delivery(
     order_id: str,
     otp: str,
-    buyer=Depends(require_role("buyer")),
+    buyer=Depends(require_roles("buyer", "seller")),
 ):
     db = get_db()
     now = datetime.utcnow()
@@ -617,6 +990,7 @@ async def confirm_delivery(
             },
             "$unset": {
                 "delivery_otp_hash": "",
+                "delivery_otp_encrypted": "",
                 "delivery_otp_generated_at": ""
             }
         }
@@ -824,7 +1198,7 @@ async def cod_rto(
 async def request_return(
     order_id: str,
     data: dict,  # { "reason": "damaged / wrong item / etc" }
-    buyer=Depends(require_role("buyer")),
+    buyer=Depends(require_roles("buyer", "seller")),
     db=Depends(get_db),
 ):
     now = datetime.utcnow()
@@ -1300,7 +1674,7 @@ async def system_refund(
 @router.get("/{order_id}/return-status")
 async def buyer_return_status(
     order_id: str,
-    buyer=Depends(require_role("buyer"))
+    buyer=Depends(require_roles("buyer", "seller"))
 ):
     db = get_db()
 
@@ -1336,23 +1710,31 @@ async def buyer_return_status(
 # ORDER TIMELINE (BUYER VIEW)
 # =========================================================
 
+@router.get("/buyer/{order_id}/timeline")
 @router.get("/{order_id}/timeline")
 async def get_order_timeline_buyer(
     order_id: str,
-    buyer=Depends(require_role("buyer")),
+    buyer=Depends(require_roles("buyer", "seller")),
     db=Depends(get_db),
 ):
-
-    order = await db.orders.find_one({
-        "_id": parse_object_id(order_id, "order_id"),
-        "buyer_id": buyer["_id"],
-    })
+    order = None
+    try:
+        order = await db.orders.find_one({
+            "_id": parse_object_id(order_id, "order_id"),
+            "buyer_id": buyer["_id"],
+        })
+    except HTTPException:
+        # Backward compatibility: some legacy rows may have string _id values.
+        order = await db.orders.find_one({
+            "_id": order_id,
+            "buyer_id": buyer["_id"],
+        })
 
     if not order:
         raise HTTPException(404, "Order not found")
 
     events = await db.order_timeline.find(
-        {"order_id": order["_id"]},
+        {"$or": [{"order_id": order["_id"]}, {"order_id": str(order["_id"])}]},
         {"_id": 0}
     ).sort("created_at", 1).to_list(None)
 
@@ -1371,17 +1753,24 @@ async def get_order_timeline_seller(
     seller=Depends(require_role("seller")),
     db=Depends(get_db),
 ):
-
-    order = await db.orders.find_one({
-        "_id": parse_object_id(order_id, "order_id"),
-        "seller_id": seller["_id"],
-    })
+    order = None
+    try:
+        order = await db.orders.find_one({
+            "_id": parse_object_id(order_id, "order_id"),
+            "seller_id": seller["_id"],
+        })
+    except HTTPException:
+        # Backward compatibility: some legacy rows may have string _id values.
+        order = await db.orders.find_one({
+            "_id": order_id,
+            "seller_id": seller["_id"],
+        })
 
     if not order:
         raise HTTPException(404, "Order not found")
 
     events = await db.order_timeline.find(
-        {"order_id": order["_id"]},
+        {"$or": [{"order_id": order["_id"]}, {"order_id": str(order["_id"])}]},
         {"_id": 0}
     ).sort("created_at", 1).to_list(None)
 

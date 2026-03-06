@@ -50,6 +50,20 @@ def require_role(required_role: str):
 
     return checker
 
+
+def require_roles(*allowed_roles: str):
+    allowed = {role for role in allowed_roles if role}
+
+    async def checker(user=Depends(get_current_user)):
+        if user.get("role") not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions",
+            )
+        return user
+
+    return checker
+
 async def get_current_seller(
     user=Depends(get_current_user),
 ):

@@ -149,6 +149,8 @@ async def verify_identity(
                 "seller_verified_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
                 "cod_enabled": True,
+                "cod_settings.enabled": True,
+                "cod_settings.activated_at": datetime.utcnow(),
                 "seller_rejected_reason": None,
                 "seller_rejected_at": None,
             }}

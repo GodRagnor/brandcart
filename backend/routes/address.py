@@ -5,7 +5,7 @@ from datetime import datetime
 from bson import ObjectId
 
 from database import get_db
-from utils.security import require_role
+from utils.security import require_roles
 from utils.guards import parse_object_id
 
 router = APIRouter(
@@ -44,7 +44,7 @@ class AddressUpdate(BaseModel):
 @router.post("")
 async def add_address(
     data: AddressCreate,
-    buyer=Depends(require_role("buyer"))
+    buyer=Depends(require_roles("buyer", "seller"))
 ):
     db = get_db()
 
@@ -78,7 +78,7 @@ async def add_address(
 
 @router.get("")
 async def list_addresses(
-    buyer=Depends(require_role("buyer"))
+    buyer=Depends(require_roles("buyer", "seller"))
 ):
     addresses = buyer.get("addresses", [])
     for a in addresses:
@@ -94,7 +94,7 @@ async def list_addresses(
 async def update_address(
     address_id: str,
     data: AddressUpdate,
-    buyer=Depends(require_role("buyer"))
+    buyer=Depends(require_roles("buyer", "seller"))
 ):
     db = get_db()
 
@@ -130,7 +130,7 @@ async def update_address(
 @router.delete("/{address_id}")
 async def delete_address(
     address_id: str,
-    buyer=Depends(require_role("buyer"))
+    buyer=Depends(require_roles("buyer", "seller"))
 ):
     db = get_db()
 
