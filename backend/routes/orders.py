@@ -26,6 +26,7 @@ from utils.crypto import encrypt_sensitive_value, decrypt_sensitive_value
 from utils.razorpay import (
     amount_to_paise,
     create_razorpay_order,
+    fetch_razorpay_payment,
     verify_checkout_signature,
 )
 from config.env import RAZORPAY_KEY_ID, OTP_DEV_MODE
@@ -81,6 +82,26 @@ def resolve_visible_delivery_otp(order: dict) -> Optional[str]:
     except Exception:
         return None
 
+
+def serialize_order_shipping(row: dict) -> dict:
+    shipping_partner = row.get("shipping_partner") or {}
+    shipment = row.get("shipment") or {}
+
+    partner_id = shipping_partner.get("id") or shipping_partner.get("_id")
+    if partner_id is not None:
+        partner_id = str(partner_id)
+
+    return {
+        "partner_id": partner_id,
+        "partner_name": shipping_partner.get("name"),
+        "partner_code": shipping_partner.get("code"),
+        "provider_type": shipping_partner.get("provider_type") or "third_party_courier",
+        "tracking_number": shipment.get("tracking_number"),
+        "tracking_url": shipment.get("tracking_url"),
+        "booked_at": shipment.get("booked_at"),
+        "last_status_sync_at": shipment.get("last_status_sync_at"),
+    }
+
 class ReturnRequest(BaseModel):
     reason: str
 
@@ -91,6 +112,116 @@ class RazorpayVerifyPayload(BaseModel):
     razorpay_payment_id: str
     razorpay_signature: str
     idempotency_key: str
+
+
+class DeliveryConfirmationPayload(BaseModel):
+    otp: str
+
+
+async def finalize_delivery_confirmation(
+    db,
+    *,
+    order: dict,
+    otp: str,
+    actor_role: str,
+    actor_id,
+):
+    now = datetime.utcnow()
+
+    if order.get("delivered_at"):
+        raise HTTPException(400, "Order already delivered")
+
+    payment = order.get("payment", {})
+    if payment.get("method") == "RAZORPAY" and payment.get("status") != "paid":
+        raise HTTPException(400, "Online payment not completed")
+
+    generated_at = order.get("delivery_otp_generated_at")
+    if not generated_at:
+        raise HTTPException(400, "Delivery OTP not generated")
+
+    if now > generated_at + timedelta(minutes=DELIVERY_OTP_EXPIRY_MINUTES):
+        raise HTTPException(400, "OTP expired")
+
+    normalized_otp = str(otp or "").strip()
+    if not normalized_otp:
+        raise HTTPException(400, "OTP is required")
+    if not verify_hash(normalized_otp, order.get("delivery_otp_hash")):
+        raise HTTPException(400, "Invalid OTP")
+
+    product = await db.products.find_one({"_id": order["product_id"]})
+    if not product:
+        raise HTTPException(404, "Product not found")
+
+    qty = order["quantity"]
+    if product.get("reserved_stock", 0) < qty:
+        raise HTTPException(409, "Reserved stock corrupted")
+
+    await db.products.update_one(
+        {"_id": product["_id"]},
+        {"$inc": {"reserved_stock": -qty}}
+    )
+
+    await db.orders.update_one(
+        {"_id": order["_id"]},
+        {
+            "$set": {
+                "status": "delivered",
+                "delivered_at": now,
+                "payment.status": "cod_pending" if payment.get("method") == "COD" else "paid",
+                "settlement.status": "pending",
+                "settlement.settled_at": None,
+                "updated_at": now
+            },
+            "$unset": {
+                "delivery_otp_hash": "",
+                "delivery_otp_encrypted": "",
+                "delivery_otp_generated_at": ""
+            },
+            "$push": {
+                "tracking": {
+                    "status": "DELIVERED",
+                    "message": "Order delivered successfully",
+                    "at": now,
+                }
+            }
+        }
+    )
+
+    await record_order_event(
+        db,
+        order_id=order["_id"],
+        event="ORDER_DELIVERED",
+        actor_role=actor_role,
+        actor_id=actor_id,
+    )
+
+    seller_notice = {
+        "type": "delivery_update",
+        "title": "Order delivered",
+        "message": f"Order {str(order['_id'])} was marked delivered",
+        "order_id": str(order["_id"]),
+        "created_at": now,
+        "read": False,
+    }
+    buyer_notice = {
+        "type": "delivery_update",
+        "title": "Order delivered",
+        "message": "Your order has been delivered successfully",
+        "order_id": str(order["_id"]),
+        "created_at": now,
+        "read": False,
+    }
+
+    await db.users.update_one(
+        {"_id": order["seller_id"]},
+        {"$push": {"seller_notifications": {"$each": [seller_notice], "$slice": -100}}},
+    )
+    await db.users.update_one(
+        {"_id": order["buyer_id"]},
+        {"$push": {"buyer_notifications": {"$each": [buyer_notice], "$slice": -100}}},
+    )
+
+    return now
 
 
 # ======================================================
@@ -441,6 +572,23 @@ async def verify_razorpay_payment(
         ):
             raise HTTPException(401, "Invalid Razorpay signature")
 
+        provider_payment = await asyncio.to_thread(
+            fetch_razorpay_payment,
+            razorpay_payment_id=data.razorpay_payment_id,
+        )
+        provider_order_id = provider_payment.get("order_id")
+        provider_status = (provider_payment.get("status") or "").strip().lower()
+        provider_amount = provider_payment.get("amount")
+        provider_currency = provider_payment.get("currency")
+        if provider_order_id != data.razorpay_order_id:
+            raise HTTPException(400, "Razorpay payment does not belong to this order")
+        if provider_status != "captured":
+            raise HTTPException(400, "Razorpay payment is not captured yet")
+        if int(provider_amount or 0) != int(payment.get("amount_paise") or 0):
+            raise HTTPException(400, "Razorpay payment amount mismatch")
+        if (provider_currency or "").upper() != str(payment.get("currency") or "INR").upper():
+            raise HTTPException(400, "Razorpay payment currency mismatch")
+
         now = datetime.utcnow()
         await db.orders.update_one(
             {"_id": order_oid, "payment.status": "pending"},
@@ -449,6 +597,7 @@ async def verify_razorpay_payment(
                     "payment.status": "paid",
                     "payment.gateway_payment_id": data.razorpay_payment_id,
                     "payment.gateway_signature": data.razorpay_signature,
+                    "payment.gateway_verified_via": "signature_and_api_fetch",
                     "payment.paid_at": now,
                     "updated_at": now,
                 }
@@ -465,6 +614,7 @@ async def verify_razorpay_payment(
                 "gateway": "razorpay",
                 "razorpay_order_id": data.razorpay_order_id,
                 "razorpay_payment_id": data.razorpay_payment_id,
+                "provider_status": provider_status,
             },
         )
 
@@ -588,6 +738,7 @@ async def buyer_my_orders(
                 "assigned_at": delivery_partner.get("assigned_at"),
                 "out_for_delivery_at": delivery_partner.get("out_for_delivery_at"),
             },
+            "shipping": serialize_order_shipping(row),
             "delivery_otp": delivery_otp_visible,
             "delivery_address": {
                 "name": delivery.get("name"),
@@ -668,7 +819,7 @@ async def seller_mark_out_for_delivery(
 ):
     raise HTTPException(
         403,
-        "Delivery OTP can only be generated by assigned delivery partner from delivery app",
+        "Delivery OTP can only be generated by the assigned delivery partner from the delivery portal",
     )
 
 
@@ -940,7 +1091,6 @@ async def confirm_delivery(
     buyer=Depends(require_roles("buyer", "seller")),
 ):
     db = get_db()
-    now = datetime.utcnow()
 
     order = await db.orders.find_one({
         "_id": parse_object_id(order_id, "order_id"),
@@ -949,62 +1099,61 @@ async def confirm_delivery(
     if not order:
         raise HTTPException(404, "Order not found")
 
-    if order.get("delivered_at"):
-        raise HTTPException(400, "Order already delivered")
-
-    payment = order.get("payment", {})
-    if payment.get("method") == "RAZORPAY" and payment.get("status") != "paid":
-        raise HTTPException(400, "Online payment not completed")
-
-    generated_at = order.get("delivery_otp_generated_at")
-    if not generated_at:
-        raise HTTPException(400, "Delivery OTP not generated")
-
-    if now > generated_at + timedelta(minutes=DELIVERY_OTP_EXPIRY_MINUTES):
-        raise HTTPException(400, "OTP expired")
-
-    if not verify_hash(otp, order.get("delivery_otp_hash")):
-        raise HTTPException(400, "Invalid OTP")
-
-    product = await db.products.find_one({"_id": order["product_id"]})
-    qty = order["quantity"]
-
-    if product.get("reserved_stock", 0) < qty:
-        raise HTTPException(409, "Reserved stock corrupted")
-
-    await db.products.update_one(
-        {"_id": product["_id"]},
-        {"$inc": {"reserved_stock": -qty}}
-    )
-
-    await db.orders.update_one(
-        {"_id": order["_id"]},
-        {
-            "$set": {
-                "status": "delivered",
-                "delivered_at": now,
-                "payment.status": "cod_pending" if payment.get("method") == "COD" else "paid",
-                "settlement.status": "pending",
-                "settlement.settled_at": None,
-                "updated_at": now
-            },
-            "$unset": {
-                "delivery_otp_hash": "",
-                "delivery_otp_encrypted": "",
-                "delivery_otp_generated_at": ""
-            }
-        }
-    )
-
-    await record_order_event(
+    await finalize_delivery_confirmation(
         db,
-        order_id=order["_id"],
-        event="ORDER_DELIVERED",
+        order=order,
+        otp=otp,
         actor_role="buyer",
         actor_id=buyer["_id"],
     )
 
     return {"message": "Delivery confirmed successfully"}
+
+
+@router.post("/delivery-partner/complete-delivery/{order_id}")
+async def delivery_partner_complete_delivery(
+    order_id: str,
+    data: DeliveryConfirmationPayload,
+    delivery_partner=Depends(require_role("delivery_partner")),
+    db=Depends(get_db),
+):
+    order = await db.orders.find_one({"_id": parse_object_id(order_id, "order_id")})
+    if not order:
+        raise HTTPException(404, "Order not found")
+
+    partner_info = order.get("delivery_partner") or {}
+    assigned_user_id = str(partner_info.get("user_id") or "").strip()
+    assigned_phone = str(partner_info.get("phone") or "").strip()
+    caller_user_id = str(delivery_partner["_id"])
+    caller_phone = str(delivery_partner.get("phone") or "").strip()
+    is_assigned = (assigned_user_id and assigned_user_id == caller_user_id) or (assigned_phone and assigned_phone == caller_phone)
+    if not is_assigned:
+        raise HTTPException(403, "This order is not assigned to your delivery partner account")
+
+    if order.get("status") not in {"out_for_delivery", "delivery_otp_pending"}:
+        raise HTTPException(400, "Only out for delivery orders can be completed")
+
+    await finalize_delivery_confirmation(
+        db,
+        order=order,
+        otp=data.otp,
+        actor_role="delivery_partner",
+        actor_id=delivery_partner["_id"],
+    )
+
+    await log_audit(
+        db=db,
+        actor_id=str(delivery_partner["_id"]),
+        actor_role="delivery_partner",
+        action="ORDER_DELIVERED_CONFIRMED",
+        metadata={
+            "order_id": str(order["_id"]),
+            "partner_id": partner_info.get("id"),
+            "partner_name": partner_info.get("name"),
+        },
+    )
+
+    return {"message": "Order marked delivered successfully"}
 
 # ======================================================
 # COD RTO HANDLING 

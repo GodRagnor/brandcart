@@ -30,28 +30,17 @@ def _basic_auth_header(key_id: str, key_secret: str) -> str:
     return "Basic " + base64.b64encode(token).decode("utf-8")
 
 
-def amount_to_paise(amount_inr: float) -> int:
-    return int(round(float(amount_inr) * 100))
-
-
-def create_razorpay_order(*, amount_paise: int, receipt: str, notes: dict | None = None) -> dict:
+def _request_json(*, method: str, path: str, payload: dict | None = None) -> dict:
     key_id, key_secret = _require_razorpay_config()
 
-    payload = {
-        "amount": amount_paise,
-        "currency": RAZORPAY_CURRENCY,
-        "receipt": receipt,
-        "notes": notes or {},
-    }
-
     req = request.Request(
-        url=f"{RAZORPAY_API_BASE}/orders",
-        data=json.dumps(payload).encode("utf-8"),
+        url=f"{RAZORPAY_API_BASE}{path}",
+        data=json.dumps(payload).encode("utf-8") if payload is not None else None,
         headers={
-            "Content-Type": "application/json",
             "Authorization": _basic_auth_header(key_id, key_secret),
+            **({"Content-Type": "application/json"} if payload is not None else {}),
         },
-        method="POST",
+        method=method.upper(),
     )
 
     try:
@@ -60,9 +49,30 @@ def create_razorpay_order(*, amount_paise: int, receipt: str, notes: dict | None
             return json.loads(body)
     except error.HTTPError as e:
         details = e.read().decode("utf-8", errors="ignore")
-        raise HTTPException(status_code=502, detail=f"Razorpay order create failed: {details}")
+        raise HTTPException(status_code=502, detail=f"Razorpay API call failed: {details}")
     except Exception:
-        raise HTTPException(status_code=502, detail="Razorpay order create failed")
+        raise HTTPException(status_code=502, detail="Razorpay API call failed")
+
+
+def amount_to_paise(amount_inr: float) -> int:
+    return int(round(float(amount_inr) * 100))
+
+
+def create_razorpay_order(*, amount_paise: int, receipt: str, notes: dict | None = None) -> dict:
+    payload = {
+        "amount": amount_paise,
+        "currency": RAZORPAY_CURRENCY,
+        "receipt": receipt,
+        "notes": notes or {},
+    }
+    return _request_json(method="POST", path="/orders", payload=payload)
+
+
+def fetch_razorpay_payment(*, razorpay_payment_id: str) -> dict:
+    payment_id = (razorpay_payment_id or "").strip()
+    if not payment_id:
+        raise HTTPException(status_code=400, detail="Invalid Razorpay payment id")
+    return _request_json(method="GET", path=f"/payments/{payment_id}")
 
 
 def verify_checkout_signature(*, razorpay_order_id: str, razorpay_payment_id: str, razorpay_signature: str) -> bool:

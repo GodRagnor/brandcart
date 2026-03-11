@@ -74,15 +74,15 @@ def execute_bank_payout(*, payout_request: dict, seller: dict) -> dict:
     if provider != "razorpayx":
         raise HTTPException(status_code=500, detail="Unsupported payout provider")
 
-    key_id, key_secret, account_number = _require_razorpayx_config()
+    key_id, key_secret, source_account_number = _require_razorpayx_config()
     auth_header = _basic_auth_header(key_id, key_secret)
 
     bank = payout_request.get("bank_details", {})
-    account_number = bank.get("bank_account_number")
+    beneficiary_account_number = bank.get("bank_account_number")
     encrypted_account_number = bank.get("bank_account_encrypted")
     if encrypted_account_number:
-        account_number = decrypt_sensitive_value(encrypted_account_number)
-    if not account_number:
+        beneficiary_account_number = decrypt_sensitive_value(encrypted_account_number)
+    if not beneficiary_account_number:
         raise HTTPException(status_code=400, detail="Seller bank account is missing for payout")
 
     amount_paise = int(round(float(payout_request["amount"]) * 100))
@@ -111,7 +111,7 @@ def execute_bank_payout(*, payout_request: dict, seller: dict) -> dict:
         "bank_account": {
             "name": bank.get("account_holder_name"),
             "ifsc": bank.get("ifsc_code"),
-            "account_number": account_number,
+            "account_number": beneficiary_account_number,
         },
     }
     fund_account = _post(f"{RAZORPAYX_API_BASE}/fund_accounts", fund_account_payload, auth_header)
@@ -120,7 +120,7 @@ def execute_bank_payout(*, payout_request: dict, seller: dict) -> dict:
         raise HTTPException(status_code=502, detail="Payout provider fund account creation failed")
 
     payout_payload = {
-        "account_number": account_number,
+        "account_number": source_account_number,
         "fund_account_id": fund_account_id,
         "amount": amount_paise,
         "currency": "INR",
@@ -146,6 +146,12 @@ def execute_bank_payout(*, payout_request: dict, seller: dict) -> dict:
         "provider_fund_account_id": fund_account_id,
         "provider_payout_id": payout_id,
         "provider_payout_status": payout_status,
+        "provider_transfer_reference": payout.get("utr") or payout_id,
+        "provider_failure_reason": (
+            (payout.get("status_details") or {}).get("description")
+            or payout.get("status_description")
+            or payout.get("narration")
+        ),
         "provider_raw": payout,
     }
 
@@ -161,6 +167,12 @@ def fetch_payout_status(*, provider_payout_id: str) -> dict:
         "provider": "razorpayx",
         "provider_payout_id": payout.get("id"),
         "provider_payout_status": payout.get("status"),
+        "provider_transfer_reference": payout.get("utr") or payout.get("id"),
+        "provider_failure_reason": (
+            (payout.get("status_details") or {}).get("description")
+            or payout.get("status_description")
+            or payout.get("narration")
+        ),
         "provider_raw": payout,
     }
 

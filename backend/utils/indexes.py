@@ -165,6 +165,25 @@ async def ensure_indexes(db):
         expireAfterSeconds=IDEMPOTENCY_TTL_SECONDS,
     )
 
+    # Auth sessions
+    await _create_index_safe(
+        db.auth_sessions,
+        [("session_id", ASCENDING)],
+        name="auth_sessions_session_id_unique_idx",
+        unique=True,
+    )
+    await _create_index_safe(
+        db.auth_sessions,
+        [("user_id", ASCENDING), ("revoked_at", ASCENDING), ("expires_at", DESCENDING)],
+        name="auth_sessions_user_revoked_expires_idx",
+    )
+    await _create_index_safe(
+        db.auth_sessions,
+        [("expires_at", ASCENDING)],
+        name="auth_sessions_expires_ttl_idx",
+        expireAfterSeconds=0,
+    )
+
     # Payout requests
     await _create_index_safe(
         db.payout_requests,

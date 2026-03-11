@@ -51,6 +51,120 @@ def build_product_card(product, seller):
         }
     }
 
+
+async def resolve_location_from_pincode(db, pincode):
+    if not pincode:
+        return None
+
+    user = await db.users.find_one(
+        {"addresses.pincode": pincode},
+        {"addresses": 1},
+    )
+    if not user:
+        return None
+
+    for address in user.get("addresses", []):
+        if str(address.get("pincode") or "").strip() != pincode:
+            continue
+
+        state = (address.get("state") or "").strip()
+        city = (address.get("city") or "").strip()
+        if not state:
+            continue
+
+        return {
+            "state": state,
+            "city": city or None,
+        }
+
+    return None
+
+
+def match_serviceable_region(seller, location):
+    if not location:
+        return None
+
+    state = (location.get("state") or "").strip().lower()
+    city = (location.get("city") or "").strip().lower()
+    if not state:
+        return None
+
+    for region in seller.get("serviceable_regions", []):
+        region_state = (region.get("state") or "").strip().lower()
+        region_city = (region.get("city") or "").strip().lower()
+        if region_state == state and (not region_city or region_city == city):
+            return region
+
+    return None
+
+
+def get_public_delivery_status(seller, pincode, location=None):
+    seller_cod_enabled = bool(
+        seller.get("cod_settings", {}).get("enabled", False)
+        or seller.get("cod_enabled", False)
+    )
+
+    if bool(seller.get("serviceability_all_india", False)):
+        return {
+            "deliverable": True,
+            "cod_available": seller_cod_enabled,
+            "estimated_days": None,
+            "reason": "Delivery available across India",
+            "requires_address_confirmation": False,
+        }
+
+    area = next(
+        (
+            item for item in seller.get("serviceable_areas", [])
+            if str(item.get("pincode") or "") == pincode and item.get("delivery_enabled")
+        ),
+        None,
+    )
+    if area:
+        return {
+            "deliverable": True,
+            "cod_available": bool(area.get("cod_enabled")) and seller_cod_enabled,
+            "estimated_days": area.get("estimated_days"),
+            "reason": "Delivery available",
+            "requires_address_confirmation": False,
+        }
+
+    region = match_serviceable_region(seller, location)
+    if region:
+        if not region.get("delivery_enabled", True):
+            return {
+                "deliverable": False,
+                "cod_available": False,
+                "estimated_days": None,
+                "reason": "Delivery not available",
+                "requires_address_confirmation": False,
+            }
+
+        return {
+            "deliverable": True,
+            "cod_available": bool(region.get("cod_enabled")) and seller_cod_enabled,
+            "estimated_days": None,
+            "reason": "Delivery available",
+            "requires_address_confirmation": False,
+        }
+
+    if seller.get("serviceable_regions"):
+        return {
+            "deliverable": False,
+            "cod_available": False,
+            "estimated_days": None,
+            "reason": "Exact delivery will be confirmed after you choose your address",
+            "requires_address_confirmation": True,
+        }
+
+    return {
+        "deliverable": False,
+        "cod_available": False,
+        "estimated_days": None,
+        "reason": "Delivery not available",
+        "requires_address_confirmation": False,
+    }
+
 # ============================================================
 # HOME PAGE SECTIONS
 # ============================================================
@@ -223,43 +337,32 @@ async def list_products_by_pincode(
 ):
     db = get_db()
     cursor = db.products.find({"active": True})
+    location = await resolve_location_from_pincode(db, pincode)
 
     products = []
 
     async for p in cursor:
-        seller = await db.users.find_one(
-            {"_id": p["seller_id"]},
-            {"serviceable_areas": 1, "is_frozen": 1}
-        )
-
-        if not seller or seller.get("is_frozen"):
-            continue
-
-        area = next(
-            (
-                a for a in seller.get("serviceable_areas", [])
-                if a["pincode"] == pincode and a.get("delivery_enabled")
-            ),
-            None
-        )
-
-        if not area:
+        seller = await get_verified_seller(db, p["seller_id"])
+        if not seller:
             continue
 
         available_stock = p.get("stock", 0) - p.get("reserved_stock", 0)
         if available_stock <= 0:
             continue
 
-        seller_profile = await get_verified_seller(db, p["seller_id"])
-        if not seller_profile:
+        delivery = get_public_delivery_status(seller, pincode, location)
+        if not delivery.get("deliverable"):
             continue
 
-        card = build_product_card(p, seller_profile)
+        card = build_product_card(p, seller)
         card["available_stock"] = available_stock
         card["delivery"] = {
-            "cod_available": area.get("cod_enabled", False),
-            "online_available": True
+            "cod_available": delivery.get("cod_available", False),
+            "online_available": True,
+            "requires_address_confirmation": bool(delivery.get("requires_address_confirmation", False)),
         }
+        if delivery.get("estimated_days") is not None:
+            card["delivery"]["estimated_days"] = delivery.get("estimated_days")
 
         products.append(card)
 
@@ -326,26 +429,15 @@ async def check_product_delivery(product_id: str, pincode: str = Query(..., min_
     if not product:
         raise HTTPException(404, "Product not found")
 
-    seller = await db.users.find_one(
-        {"_id": product["seller_id"]},
-        {
-            "role": 1,
-            "seller_status": 1,
-            "is_frozen": 1,
-            "serviceable_areas": 1,
-            "cod_settings": 1,
-        },
-    )
+    seller = await get_verified_seller(db, product["seller_id"])
     if not seller:
-        raise HTTPException(404, "Seller not found")
-
-    if seller.get("is_frozen") or seller.get("seller_status") != "verified" or seller.get("role") != "seller":
         return {
             "product_id": product_id,
             "pincode": pincode,
             "deliverable": False,
             "cod_available": False,
             "reason": "Seller unavailable",
+            "requires_address_confirmation": False,
         }
 
     available_stock = max(0, int(product.get("stock", 0)) - int(product.get("reserved_stock", 0)))
@@ -356,34 +448,16 @@ async def check_product_delivery(product_id: str, pincode: str = Query(..., min_
             "deliverable": False,
             "cod_available": False,
             "reason": "Out of stock",
+            "requires_address_confirmation": False,
         }
 
-    area = next(
-        (
-            a for a in seller.get("serviceable_areas", [])
-            if str(a.get("pincode")) == pincode and a.get("delivery_enabled")
-        ),
-        None
-    )
-
-    if not area:
-        return {
-            "product_id": product_id,
-            "pincode": pincode,
-            "deliverable": False,
-            "cod_available": False,
-            "reason": "Delivery not available",
-        }
-
-    cod_available = bool(area.get("cod_enabled")) and bool(seller.get("cod_settings", {}).get("enabled", False))
+    location = await resolve_location_from_pincode(db, pincode)
+    delivery = get_public_delivery_status(seller, pincode, location)
 
     return {
         "product_id": product_id,
         "pincode": pincode,
-        "deliverable": True,
-        "cod_available": cod_available,
-        "estimated_days": area.get("estimated_days"),
-        "reason": "Delivery available",
+        **delivery,
     }
 
 # ============================================================

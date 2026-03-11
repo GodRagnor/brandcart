@@ -1,18 +1,22 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
 import random, hashlib, os, logging
 from typing import Optional
 from pydantic import EmailStr
 import re
+from uuid import uuid4
+
+from jose.exceptions import ExpiredSignatureError, JWTError
 
 from database import get_db
-from utils.jwt import create_access_token
-from utils.security import get_current_user, require_role
+from utils.jwt import ACCESS_TOKEN_TYPE, REFRESH_TOKEN_TYPE, create_access_token, create_refresh_token, decode_token
+from utils.security import ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME, get_current_user, require_role
 from utils.validators import normalize_phone
 from utils.audit import log_audit
 from utils.rate_limit import rate_limit
 from utils.otp_notify import notify_otp
+from config.env import BUYER_ACCESS_TOKEN_MINUTES, BUYER_REFRESH_TOKEN_DAYS, SELLER_ACCESS_TOKEN_MINUTES, SELLER_REFRESH_TOKEN_DAYS
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +28,8 @@ OTP_DEV_MODE = (os.getenv("OTP_DEV_MODE", "true" if ENV != "production" else "fa
 
 OTP_EXPIRY_MINUTES = 5
 OTP_MAX_ATTEMPTS = 5
+AUTH_COOKIE_SECURE = ENV == "production"
+AUTH_COOKIE_SAMESITE = "lax"
 
 # ======================
 # Schemas
@@ -45,6 +51,101 @@ def generate_otp() -> str:
 
 def hash_otp(otp: str) -> str:
     return hashlib.sha256(otp.encode()).hexdigest()
+
+
+def _session_ttls_for_role(role: str) -> tuple[timedelta, timedelta]:
+    normalized_role = (role or "").strip().lower()
+    if normalized_role in {"seller", "admin", "delivery_partner"}:
+        return (
+            timedelta(minutes=SELLER_ACCESS_TOKEN_MINUTES),
+            timedelta(days=SELLER_REFRESH_TOKEN_DAYS),
+        )
+    return (
+        timedelta(minutes=BUYER_ACCESS_TOKEN_MINUTES),
+        timedelta(days=BUYER_REFRESH_TOKEN_DAYS),
+    )
+
+
+def _set_auth_cookies(response: Response, *, access_token: str, refresh_token: str, access_ttl: timedelta, refresh_ttl: timedelta) -> None:
+    response.set_cookie(
+        key=ACCESS_COOKIE_NAME,
+        value=access_token,
+        httponly=True,
+        secure=AUTH_COOKIE_SECURE,
+        samesite=AUTH_COOKIE_SAMESITE,
+        max_age=max(1, int(access_ttl.total_seconds())),
+        path="/",
+    )
+    response.set_cookie(
+        key=REFRESH_COOKIE_NAME,
+        value=refresh_token,
+        httponly=True,
+        secure=AUTH_COOKIE_SECURE,
+        samesite=AUTH_COOKIE_SAMESITE,
+        max_age=max(1, int(refresh_ttl.total_seconds())),
+        path="/api/auth",
+    )
+
+
+def _clear_auth_cookies(response: Response) -> None:
+    response.delete_cookie(
+        key=ACCESS_COOKIE_NAME,
+        path="/",
+        secure=AUTH_COOKIE_SECURE,
+        samesite=AUTH_COOKIE_SAMESITE,
+    )
+    response.delete_cookie(
+        key=REFRESH_COOKIE_NAME,
+        path="/api/auth",
+        secure=AUTH_COOKIE_SECURE,
+        samesite=AUTH_COOKIE_SAMESITE,
+    )
+
+
+def _client_meta(request: Request) -> dict:
+    forwarded_for = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    client_host = request.client.host if request.client else ""
+    return {
+        "ip": forwarded_for or client_host or None,
+        "user_agent": request.headers.get("user-agent") or None,
+    }
+
+
+async def _create_session_tokens(*, db, user_id, phone: str, role: str, request: Request) -> tuple[str, str, timedelta, timedelta]:
+    access_ttl, refresh_ttl = _session_ttls_for_role(role)
+    now = datetime.utcnow()
+    session_id = uuid4().hex
+    refresh_token_id = uuid4().hex
+    client_meta = _client_meta(request)
+
+    await db.auth_sessions.insert_one({
+        "session_id": session_id,
+        "user_id": user_id,
+        "user_phone": phone,
+        "role": role,
+        "refresh_token_id": refresh_token_id,
+        "created_at": now,
+        "last_seen_at": now,
+        "expires_at": now + refresh_ttl,
+        "revoked_at": None,
+        "ip": client_meta["ip"],
+        "user_agent": client_meta["user_agent"],
+    })
+
+    access_token = create_access_token(
+        subject=phone,
+        role=role,
+        session_id=session_id,
+        expires_delta=access_ttl,
+    )
+    refresh_token = create_refresh_token(
+        subject=phone,
+        role=role,
+        session_id=session_id,
+        token_id=refresh_token_id,
+        expires_delta=refresh_ttl,
+    )
+    return access_token, refresh_token, access_ttl, refresh_ttl
 
 # ======================
 # Send OTP
@@ -97,7 +198,7 @@ async def send_otp(data: SendOtpRequest):
 # ======================
 
 @router.post("/verify-otp")
-async def verify_otp(data: VerifyOtpRequest):
+async def verify_otp(data: VerifyOtpRequest, request: Request, response: Response):
     db = get_db()
     phone = normalize_phone(data.phone)
 
@@ -126,6 +227,7 @@ async def verify_otp(data: VerifyOtpRequest):
 
     role = "admin" if phone == ADMIN_PHONE else (user.get("role") if user else "buyer")
 
+    user_id = None
     if not user:
         user = {
             "phone": phone,
@@ -135,22 +237,35 @@ async def verify_otp(data: VerifyOtpRequest):
             "created_at": datetime.utcnow(),
             "last_active_at": datetime.utcnow()
         }
-        await db.users.insert_one(user)
+        inserted = await db.users.insert_one(user)
+        user_id = inserted.inserted_id
+        user["_id"] = user_id
     else:
         await db.users.update_one(
             {"_id": user["_id"]},
             {"$set": {"last_active_at": datetime.utcnow()}}
         )
+        user_id = user["_id"]
 
-    token = create_access_token({
-        "sub": phone,
-        "role": role
-    })
+    access_token, refresh_token, access_ttl, refresh_ttl = await _create_session_tokens(
+        db=db,
+        user_id=user_id,
+        phone=phone,
+        role=role,
+        request=request,
+    )
+    _set_auth_cookies(
+        response,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        access_ttl=access_ttl,
+        refresh_ttl=refresh_ttl,
+    )
 
     return {
-        "access_token": token,
-        "token_type": "bearer",
-        "role": role
+        "message": "Login successful",
+        "role": role,
+        "phone": phone,
     }
 
 # ======================
@@ -164,6 +279,125 @@ async def me(user=Depends(get_current_user)):
         "role": user["role"],
         "is_frozen": user.get("is_frozen", False)
     }
+
+
+@router.post("/refresh")
+async def refresh_session(request: Request, response: Response):
+    db = get_db()
+    refresh_token = request.cookies.get(REFRESH_COOKIE_NAME) or ""
+    if not refresh_token:
+        _clear_auth_cookies(response)
+        raise HTTPException(status_code=401, detail="Refresh token missing")
+
+    try:
+        payload = decode_token(refresh_token, expected_type=REFRESH_TOKEN_TYPE)
+    except ExpiredSignatureError:
+        _clear_auth_cookies(response)
+        raise HTTPException(status_code=401, detail="Refresh token expired")
+    except (JWTError, ValueError):
+        _clear_auth_cookies(response)
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    phone = payload.get("sub")
+    session_id = str(payload.get("sid") or "").strip()
+    refresh_token_id = str(payload.get("jti") or "").strip()
+    if not phone or not session_id or not refresh_token_id:
+        _clear_auth_cookies(response)
+        raise HTTPException(status_code=401, detail="Invalid refresh token payload")
+
+    now = datetime.utcnow()
+    session = await db.auth_sessions.find_one({
+        "session_id": session_id,
+        "user_phone": phone,
+        "revoked_at": None,
+        "expires_at": {"$gt": now},
+    })
+    if not session or session.get("refresh_token_id") != refresh_token_id:
+        _clear_auth_cookies(response)
+        raise HTTPException(status_code=401, detail="Refresh session expired")
+
+    user = await db.users.find_one({"phone": phone})
+    if not user:
+        await db.auth_sessions.update_one(
+            {"_id": session["_id"]},
+            {"$set": {"revoked_at": now, "expires_at": now}},
+        )
+        _clear_auth_cookies(response)
+        raise HTTPException(status_code=401, detail="User not found")
+
+    role = "admin" if phone == ADMIN_PHONE else (user.get("role") or session.get("role") or "buyer")
+    access_ttl, refresh_ttl = _session_ttls_for_role(role)
+    next_refresh_token_id = uuid4().hex
+
+    await db.auth_sessions.update_one(
+        {"_id": session["_id"]},
+        {"$set": {
+            "role": role,
+            "refresh_token_id": next_refresh_token_id,
+            "last_seen_at": now,
+            "expires_at": now + refresh_ttl,
+            "ip": _client_meta(request)["ip"],
+            "user_agent": _client_meta(request)["user_agent"],
+        }},
+    )
+
+    access_token = create_access_token(
+        subject=phone,
+        role=role,
+        session_id=session_id,
+        expires_delta=access_ttl,
+    )
+    next_refresh_token = create_refresh_token(
+        subject=phone,
+        role=role,
+        session_id=session_id,
+        token_id=next_refresh_token_id,
+        expires_delta=refresh_ttl,
+    )
+    _set_auth_cookies(
+        response,
+        access_token=access_token,
+        refresh_token=next_refresh_token,
+        access_ttl=access_ttl,
+        refresh_ttl=refresh_ttl,
+    )
+
+    return {
+        "message": "Session refreshed",
+        "role": role,
+        "phone": phone,
+    }
+
+
+@router.post("/logout")
+async def logout(request: Request, response: Response):
+    db = get_db()
+    now = datetime.utcnow()
+    session_id = ""
+
+    for token_name, expected_type in (
+        (ACCESS_COOKIE_NAME, ACCESS_TOKEN_TYPE),
+        (REFRESH_COOKIE_NAME, REFRESH_TOKEN_TYPE),
+    ):
+        token = request.cookies.get(token_name) or ""
+        if not token:
+            continue
+        try:
+            payload = decode_token(token, expected_type=expected_type)
+        except Exception:
+            continue
+        session_id = str(payload.get("sid") or "").strip()
+        if session_id:
+            break
+
+    if session_id:
+        await db.auth_sessions.update_one(
+            {"session_id": session_id, "revoked_at": None},
+            {"$set": {"revoked_at": now, "expires_at": now}},
+        )
+
+    _clear_auth_cookies(response)
+    return {"message": "Logged out"}
 
 
 @router.get("/seller-request-status")

@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { apiDelete, apiGet, apiPatch, apiPost } from './lib/api'
-import { createRateLimiter, createTokenValidator, validateEmail, validatePhone } from './lib/security'
+import { createRateLimiter, validateEmail, validatePhone } from './lib/security'
 import { validateQuantity, validatePrice, sanitizeText } from './lib/validators'
 // buyer/seller dashboards have been merged into App.jsx; dashboard folder is no longer used
 
@@ -66,6 +66,7 @@ const readWishlistIds = () => {
 const AUTH_TOKEN_KEY = 'brandcartAuthToken'
 const AUTH_PHONE_KEY = 'brandcartAuthPhone'
 const AUTH_ROLE_KEY = 'brandcartAuthRole'
+const COOKIE_AUTH_TOKEN = '__cookie_session__'
 const ACCOUNT_PROFILE_KEY = 'brandcartAccountProfile'
 const ACCOUNT_CARDS_KEY = 'brandcartSavedCards'
 const ACCOUNT_DEVICES_KEY = 'brandcartDeviceSessions'
@@ -77,10 +78,11 @@ const paymentOptions = [
   { id: 'RAZORPAY', title: 'UPI / Card / Wallet / NetBanking', subtitle: 'Secure online payment via Razorpay' },
   { id: 'COD', title: 'Cash on Delivery', subtitle: 'Pay when product is delivered' },
 ]
+let razorpayCheckoutPromise = null
 
-const readAuthToken = () => localStorage.getItem(AUTH_TOKEN_KEY) || ''
-const readAuthPhone = () => localStorage.getItem(AUTH_PHONE_KEY) || ''
-const readAuthRole = () => localStorage.getItem(AUTH_ROLE_KEY) || 'buyer'
+const readAuthToken = () => ''
+const readAuthPhone = () => ''
+const readAuthRole = () => 'buyer'
 const readPortalMode = () => {
   const mode = new URLSearchParams(window.location.search).get('portal')
   return mode === 'seller' || mode === 'admin' || mode === 'delivery' ? mode : ''
@@ -511,6 +513,7 @@ function App() {
   const [notificationsEnabled, setNotificationsEnabled] = useState(true)
   const [accountLanguage, setAccountLanguage] = useState('English')
   const [authToken, setAuthToken] = useState(readAuthToken)
+  const [isRestoringSession, setIsRestoringSession] = useState(true)
   const [userPhone, setUserPhone] = useState(readAuthPhone)
   const [userRole, setUserRole] = useState(readAuthRole)
   const [portalMode, setPortalMode] = useState(readPortalMode)
@@ -541,6 +544,7 @@ function App() {
     codAvailable: null,
     reason: '',
     estimatedDays: null,
+    requiresAddressConfirmation: false,
   })
   const [accountView, setAccountView] = useState('menu')
   const [accountMenuQuery, setAccountMenuQuery] = useState('')
@@ -670,17 +674,18 @@ function App() {
   const [sellerOrderStatusFilter, setSellerOrderStatusFilter] = useState('all')
   const [isLoadingSellerOrders, setIsLoadingSellerOrders] = useState(false)
   const [sellerOrderTimeline, setSellerOrderTimeline] = useState([])
-  const [sellerDeliveryPartners, setSellerDeliveryPartners] = useState([])
-  const [sellerDeliveryAppPartners, setSellerDeliveryAppPartners] = useState([])
-  const [sellerSelectedDeliveryAppPartnerId, setSellerSelectedDeliveryAppPartnerId] = useState('')
-  const [isSavingSellerDeliveryPartner, setIsSavingSellerDeliveryPartner] = useState(false)
+  const [sellerShippingPartners, setSellerShippingPartners] = useState([])
   const [sellerPartnerSelections, setSellerPartnerSelections] = useState({})
+  const [sellerShipmentDrafts, setSellerShipmentDrafts] = useState({})
   const [sellerAssigningPartnerOrderId, setSellerAssigningPartnerOrderId] = useState('')
+  const [sellerUpdatingShipmentStatusOrderId, setSellerUpdatingShipmentStatusOrderId] = useState('')
   const [sellerNotifications, setSellerNotifications] = useState([])
   const [deliveryPartnerOrders, setDeliveryPartnerOrders] = useState([])
   const [deliveryPartnerOrderStatusFilter, setDeliveryPartnerOrderStatusFilter] = useState('all')
   const [isLoadingDeliveryPartnerOrders, setIsLoadingDeliveryPartnerOrders] = useState(false)
   const [deliveryPartnerMarkingOrderId, setDeliveryPartnerMarkingOrderId] = useState('')
+  const [deliveryPartnerOtpInputs, setDeliveryPartnerOtpInputs] = useState({})
+  const [deliveryPartnerCompletingOrderId, setDeliveryPartnerCompletingOrderId] = useState('')
   const [isSubmittingSellerOrderAction, setIsSubmittingSellerOrderAction] = useState(false)
   const [isLoadingSellerTimeline, setIsLoadingSellerTimeline] = useState(false)
   const [adminSellerRequests, setAdminSellerRequests] = useState([])
@@ -748,6 +753,38 @@ function App() {
     }
   }, [sellerProductFilePreviews])
 
+  const syncSellerShipmentState = (orders) => {
+    const nextOrders = Array.isArray(orders) ? orders : []
+    setSellerPartnerSelections((prev) => {
+      const next = { ...(prev || {}) }
+      nextOrders.forEach((order) => {
+        const orderId = String(order?.id || '').trim()
+        const partnerId = String(order?.shipping?.partner_id || '').trim()
+        if (orderId && partnerId && !next[orderId]) {
+          next[orderId] = partnerId
+        }
+      })
+      return next
+    })
+    setSellerShipmentDrafts((prev) => {
+      const next = { ...(prev || {}) }
+      nextOrders.forEach((order) => {
+        const orderId = String(order?.id || '').trim()
+        if (!orderId) {
+          return
+        }
+        if (next[orderId]) {
+          return
+        }
+        next[orderId] = {
+          tracking_number: String(order?.shipping?.tracking_number || '').trim(),
+          tracking_url: String(order?.shipping?.tracking_url || '').trim(),
+        }
+      })
+      return next
+    })
+  }
+
   const buildLocalSuggestions = (query) => {
     const needle = query.trim().toLowerCase()
     if (!needle || needle.length < 2) {
@@ -792,6 +829,8 @@ function App() {
     return unique
   }
 
+  const buildLocalSuggestionsEffect = useEffectEvent((query) => buildLocalSuggestions(query))
+
   const attachReviewStats = async (items) => {
     const safeItems = Array.isArray(items) ? items : []
     const enriched = await Promise.all(safeItems.map(async (item) => {
@@ -834,8 +873,45 @@ function App() {
     }
   }
 
+  const loadProductsEffect = useEffectEvent((search = '') => {
+    loadProducts(search)
+  })
+
+  const clearSessionState = (resetAuthMarker = false) => {
+    if (resetAuthMarker) {
+      setAuthToken('')
+    }
+    setUserPhone('')
+    setUserRole('buyer')
+    setIsOtpSent(false)
+    setAuthOtpInput('')
+    setCheckoutPending(false)
+    setAddresses([])
+    setBuyerOrders([])
+    setBuyerOrderTimeline([])
+    setActiveBuyerTimelineOrderId('')
+    setAdminSellerRequests([])
+    setAdminActiveSellers([])
+    setAdminSellerRanking([])
+    setAdminRiskDashboard(null)
+    setAdminFinanceSummary(null)
+    setAdminOrderSummary(null)
+    setAdminPayoutRequests([])
+    setAdminRiskSnapshots({})
+    setAdminRejectReasons({})
+    setActiveQuickPanel('')
+    setAccountView('menu')
+    setSellerOnboarding({
+      status: 'none',
+      requestedAt: '',
+      rejectedAt: '',
+      rejectedReason: '',
+      request: null,
+    })
+  }
+
   useEffect(() => {
-    loadProducts()
+    loadProductsEffect()
   }, [])
 
   useEffect(() => {
@@ -847,62 +923,61 @@ function App() {
   }, [wishlistIds])
 
   useEffect(() => {
-    if (authToken) {
-      localStorage.setItem(AUTH_TOKEN_KEY, authToken)
-    } else {
-      localStorage.removeItem(AUTH_TOKEN_KEY)
-    }
-  }, [authToken])
+    localStorage.removeItem(AUTH_TOKEN_KEY)
+    localStorage.removeItem(AUTH_PHONE_KEY)
+    localStorage.removeItem(AUTH_ROLE_KEY)
 
-  useEffect(() => {
-    if (userPhone) {
-      localStorage.setItem(AUTH_PHONE_KEY, userPhone)
-    } else {
-      localStorage.removeItem(AUTH_PHONE_KEY)
+    const handleAuthExpired = () => {
+      clearSessionState(true)
+      setIsRestoringSession(false)
+      setCartNotice('Session expired. Please sign in again.')
+      setTimeout(() => setCartNotice(''), 1800)
     }
-  }, [userPhone])
 
-  useEffect(() => {
-    if (userRole) {
-      localStorage.setItem(AUTH_ROLE_KEY, userRole)
-    } else {
-      localStorage.removeItem(AUTH_ROLE_KEY)
-    }
-  }, [userRole])
-
-  useEffect(() => {
     const syncPortalMode = () => {
       setPortalMode(readPortalMode())
     }
+
+    window.addEventListener('brandcart-auth-expired', handleAuthExpired)
     window.addEventListener('popstate', syncPortalMode)
     return () => {
+      window.removeEventListener('brandcart-auth-expired', handleAuthExpired)
       window.removeEventListener('popstate', syncPortalMode)
     }
   }, [])
 
   useEffect(() => {
+    let cancelled = false
+    const restoreSession = async () => {
+      try {
+        const me = await apiGet('/api/auth/me')
+        if (!cancelled) {
+          setAuthToken(COOKIE_AUTH_TOKEN)
+          setUserPhone(me?.phone || '')
+          setUserRole(me?.role || 'buyer')
+        }
+      } catch {
+        if (!cancelled) {
+          clearSessionState(true)
+        }
+      } finally {
+        if (!cancelled) {
+          setIsRestoringSession(false)
+        }
+      }
+    }
+
+    restoreSession()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
     if (!authToken) {
-      setUserPhone('')
-      setUserRole('buyer')
-      setAddresses([])
-      setBuyerOrders([])
-      setBuyerOrderTimeline([])
-      setActiveBuyerTimelineOrderId('')
-      setAdminSellerRequests([])
-      setAdminActiveSellers([])
-      setAdminSellerRanking([])
-      setAdminRiskDashboard(null)
-      setAdminFinanceSummary(null)
-      setAdminOrderSummary(null)
-      setAdminPayoutRequests([])
-      setAdminRiskSnapshots({})
-      setSellerOnboarding({
-        status: 'none',
-        requestedAt: '',
-        rejectedAt: '',
-        rejectedReason: '',
-        request: null,
-      })
+      if (!isRestoringSession) {
+        clearSessionState(false)
+      }
       return
     }
 
@@ -916,21 +991,7 @@ function App() {
         }
       } catch {
         if (!cancelled) {
-          setAuthToken('')
-          setUserPhone('')
-          setUserRole('buyer')
-          setAddresses([])
-          setBuyerOrders([])
-          setBuyerOrderTimeline([])
-          setActiveBuyerTimelineOrderId('')
-          setAdminSellerRequests([])
-          setAdminActiveSellers([])
-          setAdminSellerRanking([])
-          setAdminRiskDashboard(null)
-          setAdminFinanceSummary(null)
-          setAdminOrderSummary(null)
-          setAdminPayoutRequests([])
-          setAdminRiskSnapshots({})
+          clearSessionState(true)
         }
       }
     }
@@ -939,7 +1000,7 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [authToken])
+  }, [authToken, isRestoringSession])
 
   useEffect(() => {
     if (!authToken) {
@@ -1016,10 +1077,10 @@ function App() {
       setSellerServiceableRegions([])
       setSellerOffers([])
       setSellerOrders([])
-      setSellerDeliveryPartners([])
-      setSellerDeliveryAppPartners([])
+      setSellerShippingPartners([])
       setSellerNotifications([])
       setSellerPartnerSelections({})
+      setSellerShipmentDrafts({})
       setIsLoadingSellerData(false)
       setIsLoadingSellerOffers(false)
       setSellerDataError('')
@@ -1031,7 +1092,7 @@ function App() {
       setIsLoadingSellerOffers(true)
       setSellerDataError('')
       try {
-        const [perfData, prodData, walletData, profData, regionsData, offersData, bankData, ordersData, partnersData, notificationsData, appPartnersData] = await Promise.all([
+        const [perfData, prodData, walletData, profData, regionsData, offersData, bankData, ordersData, shippingPartnersData, notificationsData] = await Promise.all([
           apiGet('/api/seller/performance', { token: authToken }).catch(() => null),
           apiGet('/api/seller/my-products', { token: authToken }).catch(() => null),
           apiGet('/api/seller/wallet', { token: authToken }).catch(() => null),
@@ -1040,9 +1101,8 @@ function App() {
           apiGet('/api/seller/offers', { token: authToken }).catch(() => null),
           apiGet('/api/seller/bank-account', { token: authToken }).catch(() => null),
           apiGet('/api/seller/orders?status=all&limit=50&page=1', { token: authToken }).catch(() => null),
-          apiGet('/api/seller/delivery-partners', { token: authToken }).catch(() => null),
+          apiGet('/api/seller/shipping-partners/catalog?limit=100', { token: authToken }).catch(() => null),
           apiGet('/api/seller/notifications?limit=20', { token: authToken }).catch(() => null),
-          apiGet('/api/seller/delivery-app/partners?limit=100', { token: authToken }).catch(() => null),
         ])
         const nextOrders = Array.isArray(ordersData?.orders) ? ordersData.orders : []
         setSellerPerformance(perfData)
@@ -1059,20 +1119,9 @@ function App() {
         setSellerServiceableRegions(Array.isArray(regionsData?.serviceable_regions) ? regionsData.serviceable_regions : [])
         setSellerOffers(Array.isArray(offersData?.offers) ? offersData.offers : [])
         setSellerOrders(nextOrders)
-        setSellerDeliveryPartners(Array.isArray(partnersData?.partners) ? partnersData.partners : [])
+        setSellerShippingPartners(Array.isArray(shippingPartnersData?.partners) ? shippingPartnersData.partners : [])
         setSellerNotifications(Array.isArray(notificationsData?.notifications) ? notificationsData.notifications : [])
-        setSellerDeliveryAppPartners(Array.isArray(appPartnersData?.partners) ? appPartnersData.partners : [])
-        setSellerPartnerSelections((prev) => {
-          const next = { ...(prev || {}) }
-          nextOrders.forEach((order) => {
-            const orderId = String(order?.id || '').trim()
-            const partnerId = String(order?.delivery_partner?.id || '').trim()
-            if (orderId && partnerId && !next[orderId]) {
-              next[orderId] = partnerId
-            }
-          })
-          return next
-        })
+        syncSellerShipmentState(nextOrders)
         const savedBank = bankData?.bank_account || null
         setSellerSavedBankAccount(savedBank)
         setUseSavedBankForPayout(Boolean(savedBank))
@@ -1085,7 +1134,7 @@ function App() {
             bank_account_number: '',
           }))
         }
-      } catch (err) {
+      } catch {
         setSellerDataError('Failed to load seller data')
       } finally {
         setIsLoadingSellerData(false)
@@ -1192,11 +1241,11 @@ function App() {
         const data = await apiGet(`/api/products/search?q=${encodeURIComponent(trimmed)}&limit=8&page=1`)
         if (!cancelled) {
           const remote = Array.isArray(data) ? data : []
-          setSearchSuggestions(remote.length > 0 ? remote : buildLocalSuggestions(trimmed))
+          setSearchSuggestions(remote.length > 0 ? remote : buildLocalSuggestionsEffect(trimmed))
         }
       } catch {
         if (!cancelled) {
-          setSearchSuggestions(buildLocalSuggestions(trimmed))
+          setSearchSuggestions(buildLocalSuggestionsEffect(trimmed))
         }
       } finally {
         if (!cancelled) {
@@ -1230,6 +1279,7 @@ function App() {
         codAvailable: null,
         reason: '',
         estimatedDays: null,
+        requiresAddressConfirmation: false,
       })
       return
     }
@@ -1536,16 +1586,14 @@ function App() {
     setIsVerifyingOtp(true)
     try {
       const response = await apiPost('/api/auth/verify-otp', { phone: phoneValidation, otp })
-      const nextToken = response?.access_token || ''
-      if (!nextToken) {
-        throw new Error('Missing token')
-      }
+      const nextToken = COOKIE_AUTH_TOKEN
       setUserRole(response?.role || 'buyer')
       setAuthToken(nextToken)
-      setUserPhone(phoneValidation)
+      setUserPhone(response?.phone || phoneValidation)
       recordDeviceSession(phoneValidation)
       setIsOtpSent(false)
       setAuthOtpInput('')
+      setIsRestoringSession(false)
       flashNotice('Login successful')
       if (checkoutPending) {
         setCheckoutPending(false)
@@ -1561,29 +1609,21 @@ function App() {
     }
   }
 
-  const logout = () => {
-    setAuthToken('')
-    setUserPhone('')
-    setUserRole('buyer')
-    setIsOtpSent(false)
-    setAuthOtpInput('')
-    setCheckoutPending(false)
-    setAddresses([])
-    setBuyerOrders([])
-    setBuyerOrderTimeline([])
-    setActiveBuyerTimelineOrderId('')
-    setAdminSellerRequests([])
-    setAdminActiveSellers([])
-    setAdminSellerRanking([])
-    setAdminRiskDashboard(null)
-    setAdminFinanceSummary(null)
-    setAdminOrderSummary(null)
-    setAdminPayoutRequests([])
-    setAdminRiskSnapshots({})
-    setAdminRejectReasons({})
-    setActiveQuickPanel('')
-    setAccountView('menu')
-    flashNotice('Logged out')
+  const logout = async () => {
+    try {
+      await apiPost('/api/auth/logout', {}, { token: authToken })
+    } catch {
+      // Clear local state even if the server session has already expired.
+    } finally {
+      clearSessionState(true)
+      setIsOtpSent(false)
+      setAuthOtpInput('')
+      setCheckoutPending(false)
+      setAdminRejectReasons({})
+      setActiveQuickPanel('')
+      setAccountView('menu')
+      flashNotice('Logged out')
+    }
   }
 
   const updateAddressField = (field, value) => {
@@ -1646,18 +1686,34 @@ function App() {
     return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`
   }
 
-  const loadRazorpayCheckout = () => new Promise((resolve, reject) => {
+  const loadRazorpayCheckout = () => {
     if (window.Razorpay) {
-      resolve(true)
-      return
+      return Promise.resolve(true)
     }
-    const script = document.createElement('script')
-    script.src = 'https://checkout.razorpay.com/v1/checkout.js'
-    script.async = true
-    script.onload = () => resolve(true)
-    script.onerror = () => reject(new Error('Failed to load Razorpay SDK'))
-    document.body.appendChild(script)
-  })
+    if (razorpayCheckoutPromise) {
+      return razorpayCheckoutPromise
+    }
+    razorpayCheckoutPromise = new Promise((resolve, reject) => {
+      const existingScript = document.querySelector('script[data-brandcart-sdk="razorpay"]')
+      if (existingScript) {
+        existingScript.addEventListener('load', () => resolve(true), { once: true })
+        existingScript.addEventListener('error', () => reject(new Error('Failed to load Razorpay SDK')), { once: true })
+        return
+      }
+
+      const script = document.createElement('script')
+      script.src = 'https://checkout.razorpay.com/v1/checkout.js'
+      script.async = true
+      script.dataset.brandcartSdk = 'razorpay'
+      script.onload = () => resolve(true)
+      script.onerror = () => reject(new Error('Failed to load Razorpay SDK'))
+      document.body.appendChild(script)
+    }).catch((error) => {
+      razorpayCheckoutPromise = null
+      throw error
+    })
+    return razorpayCheckoutPromise
+  }
 
   const buildCreateOrderPath = ({ productId, quantity, paymentMethod, addressId, idempotencyKey }) => {
     const params = new URLSearchParams({
@@ -1683,7 +1739,7 @@ function App() {
       const response = await apiPost(
         buildCreateOrderPath({
           productId: item.id,
-          quantity: Number(item.qty || 1),
+          quantity: assertValidOrderQuantity(item.qty || 1),
           paymentMethod: 'COD',
           addressId,
           idempotencyKey: createIdempotencyKey('cod'),
@@ -1710,7 +1766,7 @@ function App() {
     const created = await apiPost(
       buildCreateOrderPath({
         productId: item.id,
-        quantity: Number(item.qty || 1),
+        quantity: assertValidOrderQuantity(item.qty || 1),
         paymentMethod: 'RAZORPAY',
         addressId,
         idempotencyKey: createIdempotencyKey('rzp-create'),
@@ -1911,7 +1967,7 @@ function App() {
     if (!productDetail?.id) {
       return
     }
-    if (deliveryCheck.checked && deliveryCheck.deliverable === false) {
+    if (deliveryCheck.checked && deliveryCheck.deliverable === false && !deliveryCheck.requiresAddressConfirmation) {
       flashNotice('Not deliverable to this pincode')
       return
     }
@@ -2062,6 +2118,10 @@ function App() {
     }
   }
 
+  const loadBuyerOrdersEffect = useEffectEvent((statusOverride = buyerOrderStatusFilter) => {
+    loadBuyerOrders(statusOverride)
+  })
+
   const loadBuyerOrderTimeline = async (orderId) => {
     const id = String(orderId || '').trim()
     if (!id) {
@@ -2089,7 +2149,7 @@ function App() {
     if (!authToken || activeQuickPanel !== 'account' || accountView !== 'orders') {
       return
     }
-    loadBuyerOrders(buyerOrderStatusFilter)
+    loadBuyerOrdersEffect(buyerOrderStatusFilter)
   }, [authToken, activeQuickPanel, accountView, buyerOrderStatusFilter])
 
   useEffect(() => {
@@ -2097,7 +2157,7 @@ function App() {
       return
     }
     const timer = setInterval(() => {
-      loadBuyerOrders(buyerOrderStatusFilter)
+      loadBuyerOrdersEffect(buyerOrderStatusFilter)
     }, 15000)
     return () => clearInterval(timer)
   }, [authToken, activeQuickPanel, accountView, buyerOrderStatusFilter])
@@ -2116,17 +2176,23 @@ function App() {
       flashNotice('Your account is already verified as seller')
       return
     }
+    const emailInput = sellerRequestForm.email.trim()
+    const normalizedEmail = emailInput ? validateEmail(emailInput) : undefined
+    if (emailInput && !normalizedEmail) {
+      flashNotice('Enter a valid seller support email')
+      return
+    }
     const payload = {
-      legal_name: sellerRequestForm.legal_name.trim(),
-      brand_name: sellerRequestForm.brand_name.trim(),
-      category: sellerRequestForm.category.trim(),
-      description: sellerRequestForm.description.trim(),
-      email: sellerRequestForm.email.trim() || undefined,
+      legal_name: sanitizeText(sellerRequestForm.legal_name, 120),
+      brand_name: sanitizeText(sellerRequestForm.brand_name, 120),
+      category: sanitizeText(sellerRequestForm.category, 80),
+      description: sanitizeText(sellerRequestForm.description, 600),
+      email: normalizedEmail,
       logo_url: sellerRequestForm.logo_url.trim() || undefined,
       documents: {
         pan_card: sellerRequestForm.pan_card.trim().toUpperCase(),
         gst_certificate: sellerRequestForm.gst_certificate.trim().toUpperCase(),
-        address_proof: sellerRequestForm.address_proof.trim(),
+        address_proof: sanitizeText(sellerRequestForm.address_proof, 240),
       },
     }
     if (!payload.legal_name || !payload.brand_name || !payload.category || !payload.documents.pan_card || !payload.documents.gst_certificate || !payload.documents.address_proof) {
@@ -2169,7 +2235,7 @@ function App() {
       return
     }
     try {
-      const [perfData, prodData, walletData, profData, regionsData, offersData, bankData, ordersData, partnersData, notificationsData, appPartnersData] = await Promise.all([
+      const [perfData, prodData, walletData, profData, regionsData, offersData, bankData, ordersData, shippingPartnersData, notificationsData] = await Promise.all([
         apiGet('/api/seller/performance', { token: authToken }).catch(() => null),
         apiGet('/api/seller/my-products', { token: authToken }).catch(() => null),
         apiGet('/api/seller/wallet', { token: authToken }).catch(() => null),
@@ -2178,9 +2244,8 @@ function App() {
         apiGet('/api/seller/offers', { token: authToken }).catch(() => null),
         apiGet('/api/seller/bank-account', { token: authToken }).catch(() => null),
         apiGet(`/api/seller/orders?status=${encodeURIComponent(sellerOrderStatusFilter)}&limit=50&page=1`, { token: authToken }).catch(() => null),
-        apiGet('/api/seller/delivery-partners', { token: authToken }).catch(() => null),
+        apiGet('/api/seller/shipping-partners/catalog?limit=100', { token: authToken }).catch(() => null),
         apiGet('/api/seller/notifications?limit=20', { token: authToken }).catch(() => null),
-        apiGet('/api/seller/delivery-app/partners?limit=100', { token: authToken }).catch(() => null),
       ])
       const nextOrders = Array.isArray(ordersData?.orders) ? ordersData.orders : []
       setSellerPerformance(perfData)
@@ -2191,20 +2256,9 @@ function App() {
       setSellerServiceableRegions(Array.isArray(regionsData?.serviceable_regions) ? regionsData.serviceable_regions : [])
       setSellerOffers(Array.isArray(offersData?.offers) ? offersData.offers : [])
       setSellerOrders(nextOrders)
-      setSellerDeliveryPartners(Array.isArray(partnersData?.partners) ? partnersData.partners : [])
+      setSellerShippingPartners(Array.isArray(shippingPartnersData?.partners) ? shippingPartnersData.partners : [])
       setSellerNotifications(Array.isArray(notificationsData?.notifications) ? notificationsData.notifications : [])
-      setSellerDeliveryAppPartners(Array.isArray(appPartnersData?.partners) ? appPartnersData.partners : [])
-      setSellerPartnerSelections((prev) => {
-        const next = { ...(prev || {}) }
-        nextOrders.forEach((order) => {
-          const orderId = String(order?.id || '').trim()
-          const partnerId = String(order?.delivery_partner?.id || '').trim()
-          if (orderId && partnerId && !next[orderId]) {
-            next[orderId] = partnerId
-          }
-        })
-        return next
-      })
+      syncSellerShipmentState(nextOrders)
       const savedBank = bankData?.bank_account || null
       setSellerSavedBankAccount(savedBank)
       setUseSavedBankForPayout(Boolean(savedBank))
@@ -2244,17 +2298,7 @@ function App() {
       const response = await apiGet(`/api/seller/orders?status=${encodeURIComponent(statusOverride || 'all')}&limit=50&page=1`, { token: authToken })
       const nextOrders = Array.isArray(response?.orders) ? response.orders : []
       setSellerOrders(nextOrders)
-      setSellerPartnerSelections((prev) => {
-        const next = { ...(prev || {}) }
-        nextOrders.forEach((order) => {
-          const orderId = String(order?.id || '').trim()
-          const partnerId = String(order?.delivery_partner?.id || '').trim()
-          if (orderId && partnerId && !next[orderId]) {
-            next[orderId] = partnerId
-          }
-        })
-        return next
-      })
+      syncSellerShipmentState(nextOrders)
     } catch (error) {
       setSellerOrders([])
       flashNotice(error instanceof Error ? error.message : 'Could not load seller orders')
@@ -2263,19 +2307,30 @@ function App() {
     }
   }
 
+  const loadSellerOrdersEffect = useEffectEvent((statusOverride = sellerOrderStatusFilter) => {
+    loadSellerOrders(statusOverride)
+  })
+
   const saveSellerProfile = async (event) => {
     event.preventDefault()
     if (!authToken) {
       return
     }
+    const supportEmailInput = sellerProfileForm.support_email.trim()
+    const supportEmail = supportEmailInput ? validateEmail(supportEmailInput) : undefined
+    if (supportEmailInput && !supportEmail) {
+      flashNotice('Enter a valid support email')
+      return
+    }
+    const payload = {
+      support_email: supportEmail,
+      short_tagline: sanitizeText(sellerProfileForm.short_tagline, 120) || undefined,
+      logo_url: sellerProfileForm.logo_url.trim() || undefined,
+      description: sanitizeText(sellerProfileForm.description, 800) || undefined,
+    }
     setIsSavingSellerProfile(true)
     try {
-      await apiPatch('/api/seller/profile', {
-        support_email: sellerProfileForm.support_email.trim() || undefined,
-        short_tagline: sellerProfileForm.short_tagline.trim() || undefined,
-        logo_url: sellerProfileForm.logo_url.trim() || undefined,
-        description: sellerProfileForm.description.trim() || undefined,
-      }, { token: authToken })
+      await apiPatch('/api/seller/profile', payload, { token: authToken })
       flashNotice('Seller profile updated')
       await refreshSellerDashboard()
     } catch (error) {
@@ -2467,27 +2522,38 @@ function App() {
     }
   }
 
+  const assertValidOrderQuantity = (quantity) => {
+    const validation = validateQuantity(quantity, 99)
+    if (!validation.valid) {
+      throw new Error(validation.error || 'Invalid quantity')
+    }
+    return validation.quantity
+  }
+
   const createSellerProduct = async (event) => {
     event.preventDefault()
     if (!authToken) {
       return
     }
+    const mrpValidation = validatePrice(sellerCreateProductForm.mrp)
+    const sellingPriceValidation = validatePrice(sellerCreateProductForm.selling_price)
     const images = sellerCreateProductForm.images
       .split(/[\n,]+/)
       .map((item) => item.trim())
       .filter(Boolean)
+    const stock = Number(sellerCreateProductForm.stock)
     const payload = {
-      title: sellerCreateProductForm.title.trim(),
-      description: sellerCreateProductForm.description.trim() || undefined,
-      category: sellerCreateProductForm.category.trim(),
-      sub_category: sellerCreateProductForm.sub_category.trim() || undefined,
-      tags: sellerCreateProductForm.tags.split(',').map((tag) => tag.trim()).filter(Boolean),
-      mrp: Number(sellerCreateProductForm.mrp),
-      selling_price: Number(sellerCreateProductForm.selling_price),
-      stock: Number(sellerCreateProductForm.stock),
+      title: sanitizeText(sellerCreateProductForm.title, 140),
+      description: sanitizeText(sellerCreateProductForm.description, 1600) || undefined,
+      category: sanitizeText(sellerCreateProductForm.category, 80),
+      sub_category: sanitizeText(sellerCreateProductForm.sub_category, 80) || undefined,
+      tags: sellerCreateProductForm.tags.split(',').map((tag) => sanitizeText(tag, 40)).filter(Boolean),
+      mrp: mrpValidation.valid ? mrpValidation.price : NaN,
+      selling_price: sellingPriceValidation.valid ? sellingPriceValidation.price : NaN,
+      stock,
       images,
     }
-    if (!payload.title || !payload.category || !Number.isFinite(payload.mrp) || !Number.isFinite(payload.selling_price) || !Number.isFinite(payload.stock) || payload.stock < 0 || images.length === 0) {
+    if (!payload.title || !payload.category || !mrpValidation.valid || !sellingPriceValidation.valid || !Number.isInteger(payload.stock) || payload.stock < 0 || images.length === 0) {
       flashNotice('Complete valid product details')
       return
     }
@@ -2674,30 +2740,21 @@ function App() {
     }
   }
 
-  const createSellerDeliveryPartner = async (event) => {
-    event.preventDefault()
-    if (!authToken) {
+  const updateSellerShipmentDraft = (orderId, field, value) => {
+    const normalizedOrderId = String(orderId || '').trim()
+    if (!normalizedOrderId) {
       return
     }
-    const appPartnerId = String(sellerSelectedDeliveryAppPartnerId || '').trim()
-    if (!appPartnerId) {
-      flashNotice('Select a delivery app partner to hire')
-      return
-    }
-    setIsSavingSellerDeliveryPartner(true)
-    try {
-      await apiPost(`/api/seller/delivery-app/partners/${encodeURIComponent(appPartnerId)}/hire`, {}, { token: authToken })
-      setSellerSelectedDeliveryAppPartnerId('')
-      flashNotice('Delivery app partner hired')
-      await refreshSellerDashboard()
-    } catch (error) {
-      flashNotice(error instanceof Error ? error.message : 'Could not hire delivery app partner')
-    } finally {
-      setIsSavingSellerDeliveryPartner(false)
-    }
+    setSellerShipmentDrafts((prev) => ({
+      ...(prev || {}),
+      [normalizedOrderId]: {
+        ...(prev?.[normalizedOrderId] || {}),
+        [field]: value,
+      },
+    }))
   }
 
-  const assignSellerOrderDeliveryPartner = async (orderId, partnerIdOverride = '') => {
+  const saveSellerOrderShipment = async (orderId, partnerIdOverride = '') => {
     if (!authToken) {
       return
     }
@@ -2705,26 +2762,70 @@ function App() {
     const selectedPartnerId = String(
       partnerIdOverride
       || sellerPartnerSelections[normalizedOrderId]
-      || sellerOrders.find((row) => String(row?.id || '').trim() === normalizedOrderId)?.delivery_partner?.id
+      || sellerOrders.find((row) => String(row?.id || '').trim() === normalizedOrderId)?.shipping?.partner_id
       || '',
     ).trim()
+    const shipmentDraft = sellerShipmentDrafts[normalizedOrderId] || {}
+    const trackingNumber = sanitizeText(shipmentDraft.tracking_number || '').trim()
+    const trackingUrl = sanitizeText(shipmentDraft.tracking_url || '').trim()
     if (!normalizedOrderId || !selectedPartnerId) {
-      flashNotice('Choose a delivery partner first')
+      flashNotice('Choose a shipping partner first')
+      return
+    }
+    if (trackingNumber.length < 4) {
+      flashNotice('Enter the AWB or tracking number')
       return
     }
     setSellerAssigningPartnerOrderId(normalizedOrderId)
     try {
       await apiPost(
-        `/api/seller/orders/${encodeURIComponent(normalizedOrderId)}/assign-delivery-partner`,
-        { partner_id: selectedPartnerId },
+        `/api/seller/orders/${encodeURIComponent(normalizedOrderId)}/shipping`,
+        {
+          partner_id: selectedPartnerId,
+          tracking_number: trackingNumber,
+          tracking_url: trackingUrl || undefined,
+        },
         { token: authToken },
       )
-      flashNotice('Delivery partner assigned')
+      flashNotice('Shipment saved')
       await loadSellerOrders(sellerOrderStatusFilter)
     } catch (error) {
-      flashNotice(error instanceof Error ? error.message : 'Could not assign delivery partner')
+      flashNotice(error instanceof Error ? error.message : 'Could not save shipment')
     } finally {
       setSellerAssigningPartnerOrderId('')
+    }
+  }
+
+  const syncSellerShipmentStatus = async (orderId, status) => {
+    if (!authToken) {
+      return
+    }
+    const normalizedOrderId = String(orderId || '').trim()
+    const normalizedStatus = String(status || '').trim().toLowerCase()
+    if (!normalizedOrderId || !normalizedStatus) {
+      flashNotice('Invalid shipping status update')
+      return
+    }
+    const loadingKey = `${normalizedOrderId}:${normalizedStatus}`
+    setSellerUpdatingShipmentStatusOrderId(loadingKey)
+    try {
+      await apiPost(
+        `/api/seller/orders/${encodeURIComponent(normalizedOrderId)}/shipping-status`,
+        { status: normalizedStatus },
+        { token: authToken },
+      )
+      flashNotice(
+        normalizedStatus === 'delivered'
+          ? 'Order marked delivered'
+          : normalizedStatus === 'out_for_delivery'
+            ? 'Order marked out for delivery'
+            : 'Shipping status updated',
+      )
+      await loadSellerOrders(sellerOrderStatusFilter)
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not update shipping status')
+    } finally {
+      setSellerUpdatingShipmentStatusOrderId('')
     }
   }
 
@@ -2743,6 +2844,10 @@ function App() {
       setIsLoadingDeliveryPartnerOrders(false)
     }
   }
+
+  const loadDeliveryPartnerOrdersEffect = useEffectEvent((statusOverride = deliveryPartnerOrderStatusFilter) => {
+    loadDeliveryPartnerOrders(statusOverride)
+  })
 
   const markDeliveryPartnerOrderOutForDelivery = async (orderId) => {
     if (!authToken || userRole !== 'delivery_partner') {
@@ -2766,24 +2871,34 @@ function App() {
     }
   }
 
-  const markSellerOrderShipped = async (orderIdOverride = '') => {
-    if (!authToken) {
+  const completeDeliveryPartnerOrder = async (orderId) => {
+    if (!authToken || userRole !== 'delivery_partner') {
       return
     }
-    const orderId = String(orderIdOverride || sellerOrderOps.order_id || '').trim()
-    if (!orderId) {
-      flashNotice('Enter order ID')
+    const normalizedOrderId = String(orderId || '').trim()
+    const otp = String(deliveryPartnerOtpInputs[normalizedOrderId] || '').trim()
+    if (!normalizedOrderId) {
+      flashNotice('Invalid order id')
       return
     }
-    setIsSubmittingSellerOrderAction(true)
+    if (otp.length < 4 || otp.length > 6) {
+      flashNotice('Enter the buyer delivery OTP')
+      return
+    }
+    setDeliveryPartnerCompletingOrderId(normalizedOrderId)
     try {
-      await apiPost(`/api/orders/seller/mark-shipped/${encodeURIComponent(orderId)}`, {}, { token: authToken })
-      flashNotice('Order marked as shipped')
-      await loadSellerOrders()
+      await apiPost(`/api/orders/delivery-partner/complete-delivery/${encodeURIComponent(normalizedOrderId)}`, { otp }, { token: authToken })
+      setDeliveryPartnerOtpInputs((prev) => {
+        const next = { ...(prev || {}) }
+        delete next[normalizedOrderId]
+        return next
+      })
+      flashNotice('Order marked delivered')
+      await loadDeliveryPartnerOrders(deliveryPartnerOrderStatusFilter)
     } catch (error) {
-      flashNotice(error instanceof Error ? error.message : 'Could not mark shipped')
+      flashNotice(error instanceof Error ? error.message : 'Could not complete delivery')
     } finally {
-      setIsSubmittingSellerOrderAction(false)
+      setDeliveryPartnerCompletingOrderId('')
     }
   }
 
@@ -2839,14 +2954,18 @@ function App() {
     if (sellerActiveSection !== 'orders') {
       return
     }
-    loadSellerOrders(sellerOrderStatusFilter)
+    loadSellerOrdersEffect(sellerOrderStatusFilter)
   }, [sellerActiveSection, sellerOrderStatusFilter, isSellerPortal, hasSellerPortalAccess])
 
   useEffect(() => {
     if (!isDeliveryPortal || !hasDeliveryPortalAccess) {
+      setDeliveryPartnerOrders([])
+      setDeliveryPartnerOtpInputs({})
+      setDeliveryPartnerMarkingOrderId('')
+      setDeliveryPartnerCompletingOrderId('')
       return
     }
-    loadDeliveryPartnerOrders(deliveryPartnerOrderStatusFilter)
+    loadDeliveryPartnerOrdersEffect(deliveryPartnerOrderStatusFilter)
   }, [isDeliveryPortal, hasDeliveryPortalAccess, deliveryPartnerOrderStatusFilter])
 
   const loadAdminSellerRequests = async () => {
@@ -2967,6 +3086,14 @@ function App() {
     ])
   }
 
+  const loadAdminSnapshotEffect = useEffectEvent(() => {
+    loadAdminSnapshot()
+  })
+
+  const loadAdminPayoutRequestsEffect = useEffectEvent((statusOverride = adminPayoutStatusFilter) => {
+    loadAdminPayoutRequests(statusOverride)
+  })
+
   const decideSellerRequest = async (userId, action) => {
     if (!authToken || userRole !== 'admin' || !userId) {
       return
@@ -3035,7 +3162,7 @@ function App() {
     }
   }
 
-  const decidePayoutRequest = async (requestId, action) => {
+  const decidePayoutRequest = async (requestId, action, currentStatus = '') => {
     if (!authToken || userRole !== 'admin' || !requestId) {
       return
     }
@@ -3046,9 +3173,21 @@ function App() {
     }
     setAdminUpdatingPayoutId(requestId)
     try {
-      await apiPost(`/api/admin/payout-requests/${requestId}/decision`, { action, reason: reason || undefined }, { token: authToken })
+      const response = await apiPost(`/api/admin/payout-requests/${requestId}/decision`, { action, reason: reason || undefined }, { token: authToken })
       setAdminPayoutDecisionReasons((prev) => ({ ...prev, [requestId]: '' }))
-      flashNotice(action === 'approve' ? 'Payout approved' : 'Payout rejected')
+      if (action === 'approve') {
+        if (response?.status === 'approved') {
+          flashNotice('Payout approved')
+        } else if (response?.status === 'failed') {
+          flashNotice('Payout failed at provider')
+        } else {
+          flashNotice('Payout moved to processing')
+        }
+      } else if (currentStatus === 'failed') {
+        flashNotice('Failed payout closed and seller hold released')
+      } else {
+        flashNotice('Payout rejected and seller hold released')
+      }
       await Promise.all([loadAdminPayoutRequests(), loadAdminFinanceSummary()])
     } catch (error) {
       flashNotice(error instanceof Error ? error.message : 'Could not process payout decision')
@@ -3063,8 +3202,14 @@ function App() {
     }
     setAdminUpdatingPayoutId(requestId)
     try {
-      await apiPost(`/api/admin/payout-requests/${requestId}/retry`, {}, { token: authToken })
-      flashNotice('Payout retried')
+      const response = await apiPost(`/api/admin/payout-requests/${requestId}/retry`, {}, { token: authToken })
+      if (response?.status === 'approved') {
+        flashNotice('Payout approved after retry')
+      } else if (response?.status === 'failed') {
+        flashNotice('Payout retry failed again')
+      } else {
+        flashNotice('Payout retry moved to processing')
+      }
       await Promise.all([loadAdminPayoutRequests(), loadAdminFinanceSummary()])
     } catch (error) {
       flashNotice(error instanceof Error ? error.message : 'Could not retry payout')
@@ -3079,8 +3224,8 @@ function App() {
     }
     setAdminUpdatingPayoutId(requestId)
     try {
-      await apiPost(`/api/admin/payout-requests/${requestId}/reconcile`, {}, { token: authToken })
-      flashNotice('Payout reconciled')
+      const response = await apiPost(`/api/admin/payout-requests/${requestId}/reconcile`, {}, { token: authToken })
+      flashNotice(`Payout reconciled: ${response?.status || 'updated'}`)
       await Promise.all([loadAdminPayoutRequests(), loadAdminFinanceSummary()])
     } catch (error) {
       flashNotice(error instanceof Error ? error.message : 'Could not reconcile payout')
@@ -3146,13 +3291,13 @@ function App() {
 
   useEffect(() => {
     if (authToken && userRole === 'admin' && isAdminPortal) {
-      loadAdminSnapshot()
+      loadAdminSnapshotEffect()
     }
   }, [authToken, userRole, isAdminPortal])
 
   useEffect(() => {
     if (authToken && userRole === 'admin' && isAdminPortal) {
-      loadAdminPayoutRequests(adminPayoutStatusFilter)
+      loadAdminPayoutRequestsEffect(adminPayoutStatusFilter)
     }
   }, [adminPayoutStatusFilter, authToken, userRole, isAdminPortal])
 
@@ -3178,6 +3323,9 @@ function App() {
   }
 
   useEffect(() => {
+    if (isRestoringSession) {
+      return
+    }
     if (!portalMode) {
       return
     }
@@ -3192,7 +3340,7 @@ function App() {
     }
     exitPortalMode()
     flashNotice('Portal access unavailable. Returned to storefront.')
-  }, [portalMode, hasAdminPortalAccess, hasSellerPortalAccess, hasDeliveryPortalAccess])
+  }, [portalMode, hasAdminPortalAccess, hasSellerPortalAccess, hasDeliveryPortalAccess, isRestoringSession])
 
   const handleAccountAction = (action) => {
     if (action === 'manage_devices') {
@@ -3308,7 +3456,7 @@ function App() {
     if (!productDetail?.id) {
       return
     }
-    if (deliveryCheck.checked && deliveryCheck.deliverable === false) {
+    if (deliveryCheck.checked && deliveryCheck.deliverable === false && !deliveryCheck.requiresAddressConfirmation) {
       flashNotice('Not deliverable to this pincode')
       return
     }
@@ -3355,8 +3503,11 @@ function App() {
         codAvailable: Boolean(response?.cod_available),
         reason: response?.reason || '',
         estimatedDays: Number.isFinite(Number(response?.estimated_days)) ? Number(response.estimated_days) : null,
+        requiresAddressConfirmation: Boolean(response?.requires_address_confirmation),
       })
-      if (!response?.deliverable) {
+      if (response?.requires_address_confirmation) {
+        flashNotice(response?.reason || 'Delivery will be confirmed at checkout address')
+      } else if (!response?.deliverable) {
         flashNotice('Delivery unavailable for this pincode')
       }
     } catch (error) {
@@ -3366,6 +3517,7 @@ function App() {
         codAvailable: false,
         reason: error instanceof Error ? error.message : 'Could not check delivery',
         estimatedDays: null,
+        requiresAddressConfirmation: false,
       })
       flashNotice('Could not check delivery')
     } finally {
@@ -3533,12 +3685,24 @@ function App() {
               <p>{isLoadingAdminFinanceSummary ? '...' : (formatInr(adminFinanceSummary?.reserve_locked) || '₹0')}</p>
             </article>
             <article className="admin-metric-card">
-              <strong>Total Orders</strong>
-              <p>{isLoadingAdminOrderSummary ? '...' : Number(adminOrderSummary?.total_orders || 0)}</p>
+              <strong>Emergency Payouts Requested</strong>
+              <p>
+                {isLoadingAdminFinanceSummary
+                  ? '...'
+                  : `${formatInr(adminFinanceSummary?.emergency_payout_requested_amount) || '₹0'} / ${Number(adminFinanceSummary?.emergency_payout_requested_count || 0)}`}
+              </p>
             </article>
             <article className="admin-metric-card">
-              <strong>Delivered Orders</strong>
-              <p>{isLoadingAdminOrderSummary ? '...' : Number(adminOrderSummary?.delivered_orders || 0)}</p>
+              <strong>Emergency Payouts Processing</strong>
+              <p>
+                {isLoadingAdminFinanceSummary
+                  ? '...'
+                  : `${formatInr(adminFinanceSummary?.emergency_payout_processing_amount) || '₹0'} / ${Number(adminFinanceSummary?.emergency_payout_processing_count || 0)}`}
+              </p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Total Orders</strong>
+              <p>{isLoadingAdminOrderSummary ? '...' : Number(adminOrderSummary?.total_orders || 0)}</p>
             </article>
             <article className="admin-metric-card">
               <strong>RTO Orders</strong>
@@ -3547,6 +3711,10 @@ function App() {
             <article className="admin-metric-card">
               <strong>Refunds Completed</strong>
               <p>{isLoadingAdminOrderSummary ? '...' : Number(adminOrderSummary?.refunds_completed || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Delivered Orders</strong>
+              <p>{isLoadingAdminOrderSummary ? '...' : Number(adminOrderSummary?.delivered_orders || 0)}</p>
             </article>
             <article className="admin-metric-card">
               <strong>High Risk Sellers</strong>
@@ -3754,44 +3922,72 @@ function App() {
             {adminPayoutRequests.map((request) => {
               const requestId = request?._id || ''
               const status = request?.status || '-'
-              const canDecide = status === 'requested'
-              const canRetry = status === 'failed'
+              const sellerBrand = request?.seller?.brand_name || request?.seller?.legal_name || request?.seller_id || '-'
+              const sellerPhone = request?.seller?.phone || ''
+              const canApprove = status === 'requested'
+              const canReject = status === 'requested' || status === 'failed'
+              const canRetry = status === 'failed' && !request?.hold_released_at
               const canReconcile = Boolean(request?.provider_payout_id)
+              const isUpdating = adminUpdatingPayoutId === requestId
+              const bankSummary = [
+                request?.bank_details?.bank_name,
+                request?.bank_details?.bank_account_masked,
+                request?.bank_details?.ifsc_code,
+              ].filter(Boolean).join(' | ')
               return (
                 <article className="account-tile" key={requestId || `payout-${Math.random()}`}>
-                  <strong>Request {requestId || '-'}</strong>
+                  <strong>Emergency Payout {requestId || '-'}</strong>
                   <p>Status: {status}</p>
-                  <p>Seller: {request?.seller_id || '-'}</p>
-                  <p>Amount: {formatInr(request?.amount) || `₹${Number(request?.amount || 0)}`}</p>
-                  <p>Requested: {request?.requested_at ? new Date(request.requested_at).toLocaleString() : '-'}</p>
-                  <p>Bank: {request?.bank_details?.bank_name || '-'} ({request?.bank_details?.bank_account_masked || '-'})</p>
-                  {status === 'failed' && <p>Failure: {request?.failure_reason || '-'}</p>}
-                  {canDecide && (
+                  <p>Seller: {sellerBrand}{sellerPhone ? ` (${sellerPhone})` : ''}</p>
+                  <p>Amount: {formatInr(request?.amount) || '₹0'} | Fee: {formatInr(request?.settlement_fee) || '₹0'}</p>
+                  <p>Requested: {formatDateTime(request?.requested_at)}</p>
+                  <p>Total Debit: {formatInr(request?.total_debit) || '₹0'}</p>
+                  <p>Bank: {bankSummary || '-'}</p>
+                  {request?.provider && (
+                    <p>
+                      Provider: {request.provider}
+                      {request?.provider_payout_status ? ` (${request.provider_payout_status})` : ''}
+                    </p>
+                  )}
+                  {request?.transfer_reference && <p>Transfer Ref: {request.transfer_reference}</p>}
+                  {request?.transfer_processed_at && <p>Transferred: {formatDateTime(request.transfer_processed_at)}</p>}
+                  {request?.reviewed_at && <p>Reviewed: {formatDateTime(request.reviewed_at)}</p>}
+                  {request?.reconciled_at && <p>Last Reconciled: {formatDateTime(request.reconciled_at)}</p>}
+                  {request?.review_reason && <p>Admin Note: {request.review_reason}</p>}
+                  {request?.failure_reason && <p>Failure: {request.failure_reason}</p>}
+                  {request?.hold_released_at && (
+                    <p>Hold Released: {formatDateTime(request.hold_released_at)}{request?.hold_release_reason_code ? ` (${request.hold_release_reason_code})` : ''}</p>
+                  )}
+                  {canReject && (
                     <textarea
                       rows={2}
-                      placeholder="Reason (required for reject)"
+                      placeholder={status === 'failed' ? 'Reason for hold release' : 'Reason (required for reject)'}
                       value={adminPayoutDecisionReasons[requestId] || ''}
                       onChange={(event) => setAdminPayoutDecisionReasons((prev) => ({ ...prev, [requestId]: event.target.value }))}
                     />
                   )}
                   <div className="admin-request-actions">
-                    {canDecide && (
+                    {canApprove && (
                       <>
                         <button
                           type="button"
                           className="account-inline-btn"
-                          disabled={adminUpdatingPayoutId === requestId}
-                          onClick={() => decidePayoutRequest(requestId, 'approve')}
+                          disabled={isUpdating}
+                          onClick={() => decidePayoutRequest(requestId, 'approve', status)}
                         >
-                          {adminUpdatingPayoutId === requestId ? 'Updating...' : 'Approve'}
+                          {isUpdating ? 'Updating...' : 'Approve'}
                         </button>
+                      </>
+                    )}
+                    {canReject && (
+                      <>
                         <button
                           type="button"
                           className="account-inline-btn"
-                          disabled={adminUpdatingPayoutId === requestId}
-                          onClick={() => decidePayoutRequest(requestId, 'reject')}
+                          disabled={isUpdating}
+                          onClick={() => decidePayoutRequest(requestId, 'reject', status)}
                         >
-                          {adminUpdatingPayoutId === requestId ? 'Updating...' : 'Reject'}
+                          {isUpdating ? 'Updating...' : status === 'failed' ? 'Release Hold' : 'Reject'}
                         </button>
                       </>
                     )}
@@ -3799,20 +3995,20 @@ function App() {
                       <button
                         type="button"
                         className="account-inline-btn"
-                        disabled={adminUpdatingPayoutId === requestId}
+                        disabled={isUpdating}
                         onClick={() => retryPayoutRequest(requestId)}
                       >
-                        {adminUpdatingPayoutId === requestId ? 'Updating...' : 'Retry'}
+                        {isUpdating ? 'Updating...' : 'Retry'}
                       </button>
                     )}
                     {canReconcile && (
                       <button
                         type="button"
                         className="account-inline-btn"
-                        disabled={adminUpdatingPayoutId === requestId}
+                        disabled={isUpdating}
                         onClick={() => reconcilePayoutRequest(requestId)}
                       >
-                        {adminUpdatingPayoutId === requestId ? 'Updating...' : 'Reconcile'}
+                        {isUpdating ? 'Updating...' : 'Reconcile'}
                       </button>
                     )}
                   </div>
@@ -3930,6 +4126,7 @@ function App() {
                   const orderId = String(order?.id || '').trim()
                   const status = String(order?.status || '').toLowerCase()
                   const canMarkOut = ['shipped', 'delivery_otp_pending', 'out_for_delivery'].includes(status)
+                  const canCompleteDelivery = ['out_for_delivery', 'delivery_otp_pending'].includes(status)
                   return (
                     <article className="account-tile" key={orderId || Math.random()}>
                       <strong>{order?.product?.title || 'Order'} ({orderId || '-'})</strong>
@@ -3943,6 +4140,9 @@ function App() {
                       {order?.delivery_partner?.out_for_delivery_at && (
                         <p>Out for Delivery Since: {formatDateTime(order?.delivery_partner?.out_for_delivery_at)}</p>
                       )}
+                      {order?.delivery_otp_generated_at && (
+                        <p>OTP Sent At: {formatDateTime(order?.delivery_otp_generated_at)}</p>
+                      )}
                       <div className="product-actions">
                         <button
                           type="button"
@@ -3952,6 +4152,30 @@ function App() {
                         >
                           {deliveryPartnerMarkingOrderId === orderId ? 'Updating...' : 'Mark Out For Delivery + Generate OTP'}
                         </button>
+                        {canCompleteDelivery && (
+                          <>
+                            <input
+                              className="delivery-otp-input"
+                              type="text"
+                              inputMode="numeric"
+                              maxLength={6}
+                              value={deliveryPartnerOtpInputs[orderId] || ''}
+                              onChange={(event) => setDeliveryPartnerOtpInputs((prev) => ({
+                                ...prev,
+                                [orderId]: event.target.value.replace(/\D/g, '').slice(0, 6),
+                              }))}
+                              placeholder="Enter buyer OTP"
+                            />
+                            <button
+                              type="button"
+                              className="action-btn edit"
+                              disabled={deliveryPartnerCompletingOrderId === orderId}
+                              onClick={() => completeDeliveryPartnerOrder(orderId)}
+                            >
+                              {deliveryPartnerCompletingOrderId === orderId ? 'Completing...' : 'Verify OTP + Mark Delivered'}
+                            </button>
+                          </>
+                        )}
                       </div>
                     </article>
                   )
@@ -4240,10 +4464,12 @@ function App() {
                       </button>
                     </div>
                     {deliveryCheck.checked && (
-                      <p className={`pdp-delivery-note ${deliveryCheck.deliverable ? 'ok' : 'no'}`}>
+                      <p className={`pdp-delivery-note ${(deliveryCheck.deliverable || deliveryCheck.requiresAddressConfirmation) ? 'ok' : 'no'}`}>
                         {deliveryCheck.deliverable
                           ? `Delivery available${deliveryCheck.estimatedDays ? ` in ${deliveryCheck.estimatedDays} day(s)` : ''}. ${deliveryCheck.codAvailable ? 'COD available.' : 'COD not available.'}`
-                          : `${deliveryCheck.reason || 'Delivery unavailable'} for this pincode.`}
+                          : (deliveryCheck.requiresAddressConfirmation
+                            ? (deliveryCheck.reason || 'We will confirm delivery after you choose your checkout address.')
+                            : `${deliveryCheck.reason || 'Delivery unavailable'} for this pincode.`)}
                       </p>
                     )}
                   </form>
@@ -4835,15 +5061,6 @@ function App() {
                         </button>
                         )
                       )}
-                      {userRole === 'delivery_partner' && (
-                        accountMenuMatches('Open Delivery Dashboard New Tab') && (
-                        <button type="button" className="account-row" onClick={() => handleAccountAction('delivery_portal')}>
-                          <span className="account-row-icon"><AccountMenuIcon type="seller" /></span>
-                          <span>Open Delivery Dashboard (New Tab)</span>
-                          <em>&#8250;</em>
-                        </button>
-                        )
-                      )}
                     </div>
                   </section>
 
@@ -4878,7 +5095,6 @@ function App() {
                     'Questions & Answers',
                     'Sell on Brandcart',
                     'Open Admin Dashboard (New Tab)',
-                    'Open Delivery Dashboard (New Tab)',
                     'Terms, Policies and Licenses',
                     'Browse FAQs',
                   ].some((label) => accountMenuMatches(label)) && (
@@ -5070,15 +5286,24 @@ function App() {
                         <p>Payment: {order?.payment?.method || '-'} ({order?.payment?.status || '-'})</p>
                         <p>Amount: {formatCurrency(order?.pricing?.subtotal || 0)} | Qty: {Number(order?.quantity || 0)}</p>
                         <p>Seller: {order?.seller_snapshot?.brand_name || '-'}</p>
-                        <p>Delivery Partner: {order?.delivery_partner?.name || 'Pending assignment'}</p>
-                        {order?.delivery_otp && (
+                        <p>Shipping Partner: {order?.shipping?.partner_name || 'Seller will update shipment soon'}</p>
+                        {order?.shipping?.tracking_number && (
+                          <p>AWB / Tracking ID: {order.shipping.tracking_number}</p>
+                        )}
+                        {order?.shipping?.tracking_url && (
+                          <p>
+                            Tracking Link:{' '}
+                            <a href={order.shipping.tracking_url} target="_blank" rel="noreferrer">Open courier tracking</a>
+                          </p>
+                        )}
+                        {order?.delivery_otp && !order?.shipping?.partner_name && (
                           <p>Delivery OTP: <strong>{order.delivery_otp}</strong></p>
                         )}
-                        {!order?.delivery_otp && order?.status === 'out_for_delivery' && (
-                          <p>Delivery OTP: waiting for delivery partner update</p>
+                        {!order?.delivery_otp && order?.status === 'out_for_delivery' && !order?.shipping?.partner_name && (
+                          <p>Delivery OTP: waiting for courier update</p>
                         )}
-                        {order?.delivery_partner?.out_for_delivery_at && (
-                          <p>Out for Delivery Since: {formatDateTime(order?.delivery_partner?.out_for_delivery_at)}</p>
+                        {order?.shipping?.last_status_sync_at && (
+                          <p>Last Courier Sync: {formatDateTime(order?.shipping?.last_status_sync_at)}</p>
                         )}
                         <p>Placed: {formatDateTime(order?.created_at)}</p>
                         <button
@@ -5534,35 +5759,21 @@ function App() {
                   <div className="seller-section">
                     <h2>Orders</h2>
                     <div className="seller-info-card">
-                      <h3>Hire Delivery Partner From Delivery App</h3>
-                      <form className="delivery-partner-form" onSubmit={createSellerDeliveryPartner}>
-                        <div className="form-group">
-                          <label>Delivery App Partner</label>
-                          <select
-                            value={sellerSelectedDeliveryAppPartnerId}
-                            onChange={(event) => setSellerSelectedDeliveryAppPartnerId(event.target.value)}
-                          >
-                            <option value="">Select delivery app partner</option>
-                            {sellerDeliveryAppPartners.map((partner) => (
-                              <option key={partner?.id || Math.random()} value={partner?.id || ''}>
-                                {partner?.name || '-'} ({partner?.code || '-'}) | Rating: {partner?.rating || '-'} | {partner?.coverage || '-'}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                        <button type="submit" className="seller-button primary" disabled={isSavingSellerDeliveryPartner}>
-                          {isSavingSellerDeliveryPartner ? 'Hiring...' : 'Hire Partner'}
-                        </button>
-                      </form>
-                      {sellerDeliveryPartners.length === 0 ? (
-                        <p className="quick-panel-meta">No hired delivery partners yet.</p>
+                      <h3>Shipping Partners</h3>
+                      <p className="quick-panel-meta">
+                        Sellers manage third-party couriers from here. Choose the courier, add the AWB or tracking number, and share a tracking link so buyers can follow the shipment.
+                      </p>
+                      {sellerShippingPartners.length === 0 ? (
+                        <p className="quick-panel-meta">No shipping partners configured yet.</p>
                       ) : (
                         <div className="delivery-partner-list">
-                          {sellerDeliveryPartners.map((partner) => (
+                          {sellerShippingPartners.map((partner) => (
                             <article key={partner?.id || Math.random()} className="delivery-partner-chip">
                               <strong>{partner?.name || '-'}</strong>
-                              <span>{partner?.phone_masked || partner?.phone || '-'}</span>
-                              <small>{partner?.code ? `${partner.code.toUpperCase()} | ` : ''}{partner?.is_active ? 'Active' : 'Inactive'}</small>
+                              <span>{partner?.code ? partner.code.toUpperCase() : 'Courier partner'}</span>
+                              <p className="delivery-partner-detail">Coverage: {partner?.coverage || 'Seller managed external network'}</p>
+                              <small>Rating: {partner?.rating || '-'} | Third-party courier</small>
+                              <em className="delivery-partner-status ready">Buyers will track this shipment through the courier link you save.</em>
                             </article>
                           ))}
                         </div>
@@ -5593,15 +5804,22 @@ function App() {
                           const status = String(order?.status || '-').toLowerCase()
                           const statusLabel = order?.status || '-'
                           const returnStatus = order?.return?.status || ''
+                          const shipping = order?.shipping || {}
                           const selectedPartnerId = String(
                             sellerPartnerSelections[orderId]
-                            || order?.delivery_partner?.id
+                            || shipping?.partner_id
                             || '',
                           )
-                          const assignedPartnerName = order?.delivery_partner?.name || ''
+                          const shipmentDraft = sellerShipmentDrafts[orderId] || {
+                            tracking_number: String(shipping?.tracking_number || '').trim(),
+                            tracking_url: String(shipping?.tracking_url || '').trim(),
+                          }
+                          const assignedPartnerName = shipping?.partner_name || ''
                           const canShip = status === 'created'
                           const canReturnAction = returnStatus === 'requested'
-                          const canMarkOutForDelivery = ['shipped', 'delivery_otp_pending', 'out_for_delivery'].includes(status)
+                          const canSaveShipment = ['created', 'shipped', 'out_for_delivery'].includes(status)
+                          const canMarkOutForDelivery = status === 'shipped'
+                          const canMarkDelivered = ['shipped', 'out_for_delivery'].includes(status)
                           return (
                             <article className="account-tile" key={orderId || `seller-order-${Math.random()}`}>
                               <strong>{order?.product?.title || 'Order'} ({orderId || '-'})</strong>
@@ -5609,9 +5827,18 @@ function App() {
                               <p>Payment: {order?.payment?.method || '-'} ({order?.payment?.status || '-'})</p>
                               <p>Qty: {Number(order?.quantity || 0)} | Amount: {formatCurrency(order?.pricing?.subtotal || 0)}</p>
                               <p>Payout: {formatCurrency(order?.pricing?.seller_payout || 0)}</p>
-                              <p>Assigned Partner: {assignedPartnerName || 'Not assigned'}</p>
-                              {order?.delivery_partner?.out_for_delivery_at && (
-                                <p>Out for Delivery Since: {formatDateTime(order?.delivery_partner?.out_for_delivery_at)}</p>
+                              <p>Shipping Partner: {assignedPartnerName || 'Shipment not booked yet'}</p>
+                              {shipping?.tracking_number && (
+                                <p>AWB / Tracking ID: {shipping.tracking_number}</p>
+                              )}
+                              {shipping?.tracking_url && (
+                                <p>
+                                  Tracking Link:{' '}
+                                  <a href={shipping.tracking_url} target="_blank" rel="noreferrer">Open courier tracking</a>
+                                </p>
+                              )}
+                              {shipping?.last_status_sync_at && (
+                                <p>Last Courier Sync: {formatDateTime(shipping.last_status_sync_at)}</p>
                               )}
                               <p>
                                 Deliver to: {order?.delivery_address?.name || '-'} | {order?.delivery_address?.city || '-'},
@@ -5619,7 +5846,7 @@ function App() {
                               </p>
                               <p>Placed: {formatDateTime(order?.created_at)}</p>
                               <div className="form-group">
-                                <label>Delivery Partner</label>
+                                <label>Shipping Partner</label>
                                 <select
                                   value={selectedPartnerId}
                                   onChange={(event) => setSellerPartnerSelections((prev) => ({
@@ -5627,37 +5854,64 @@ function App() {
                                     [orderId]: event.target.value,
                                   }))}
                                 >
-                                  <option value="">Select partner</option>
-                                  {sellerDeliveryPartners.map((partner) => (
+                                  <option value="">Select shipping partner</option>
+                                  {sellerShippingPartners.map((partner) => (
                                     <option key={partner?.id || Math.random()} value={partner?.id || ''}>
-                                      {partner?.name || '-'} ({partner?.phone_masked || partner?.phone || '-'})
+                                      {partner?.name || '-'} ({partner?.code || '-'}) | {partner?.coverage || 'Coverage pending'}
                                     </option>
                                   ))}
                                 </select>
                               </div>
+                              <div className="form-group">
+                                <label>AWB / Tracking Number</label>
+                                <input
+                                  type="text"
+                                  value={shipmentDraft.tracking_number || ''}
+                                  onChange={(event) => updateSellerShipmentDraft(orderId, 'tracking_number', event.target.value)}
+                                  placeholder="Enter courier tracking number"
+                                />
+                              </div>
+                              <div className="form-group">
+                                <label>Tracking Link</label>
+                                <input
+                                  type="url"
+                                  value={shipmentDraft.tracking_url || ''}
+                                  onChange={(event) => updateSellerShipmentDraft(orderId, 'tracking_url', event.target.value)}
+                                  placeholder="https://courier.example/track/..."
+                                />
+                              </div>
                               <div className="product-actions">
-                                <button
-                                  type="button"
-                                  className="action-btn edit"
-                                  disabled={!selectedPartnerId || sellerAssigningPartnerOrderId === orderId}
-                                  onClick={() => assignSellerOrderDeliveryPartner(orderId, selectedPartnerId)}
-                                >
-                                  {sellerAssigningPartnerOrderId === orderId ? 'Assigning...' : 'Assign Partner'}
-                                </button>
-                                {canMarkOutForDelivery && <span className="quick-panel-meta">Assigned delivery partner will generate OTP from delivery app.</span>}
-                                {canShip && (
+                                {canSaveShipment && (
                                   <button
                                     type="button"
                                     className="action-btn edit"
-                                    disabled={isSubmittingSellerOrderAction}
-                                    onClick={() => {
-                                      setSellerOrderOps((prev) => ({ ...prev, order_id: orderId }))
-                                      markSellerOrderShipped(orderId)
-                                    }}
+                                    disabled={!selectedPartnerId || String(shipmentDraft.tracking_number || '').trim().length < 4 || sellerAssigningPartnerOrderId === orderId}
+                                    onClick={() => saveSellerOrderShipment(orderId, selectedPartnerId)}
                                   >
-                                    Mark Shipped
+                                    {sellerAssigningPartnerOrderId === orderId ? 'Saving...' : (canShip ? 'Save Shipment + Mark Shipped' : 'Update Shipment')}
                                   </button>
                                 )}
+                                {canMarkOutForDelivery && (
+                                  <button
+                                    type="button"
+                                    className="action-btn edit"
+                                    disabled={sellerUpdatingShipmentStatusOrderId === `${orderId}:out_for_delivery`}
+                                    onClick={() => syncSellerShipmentStatus(orderId, 'out_for_delivery')}
+                                  >
+                                    {sellerUpdatingShipmentStatusOrderId === `${orderId}:out_for_delivery` ? 'Updating...' : 'Mark Out For Delivery'}
+                                  </button>
+                                )}
+                                {canMarkDelivered && (
+                                  <button
+                                    type="button"
+                                    className="action-btn edit"
+                                    disabled={sellerUpdatingShipmentStatusOrderId === `${orderId}:delivered`}
+                                    onClick={() => syncSellerShipmentStatus(orderId, 'delivered')}
+                                  >
+                                    {sellerUpdatingShipmentStatusOrderId === `${orderId}:delivered` ? 'Updating...' : 'Mark Delivered'}
+                                  </button>
+                                )}
+                                <span className="quick-panel-meta">Use the courier app for actual delivery operations. Brandcart stores the courier and tracking details for buyers.</span>
                                 {canReturnAction && (
                                   <>
                                     <button
@@ -5813,7 +6067,10 @@ function App() {
                     )}
                   </div>
                 )
-              case 'wallet':
+              case 'wallet': {
+                const payoutRequests = Array.isArray(sellerWallet?.payout_requests) ? sellerWallet.payout_requests : []
+                const activeEmergencyPayout = sellerWallet?.emergency_payout?.active_request || payoutRequests.find((request) => ['requested', 'processing'].includes(String(request?.status || '').toLowerCase()))
+                const canRequestEmergencyPayout = Boolean(sellerWallet?.emergency_payout?.can_request ?? !activeEmergencyPayout)
                 return (
                   <div className="seller-section">
                     <h2>Wallet & Payouts</h2>
@@ -5847,12 +6104,28 @@ function App() {
                             <span className="label">Refunds</span>
                             <span className="value">{formatCurrency(sellerWallet.totals?.refunds)}</span>
                           </div>
+                          <div className="info-row">
+                            <span className="label">Emergency Holds</span>
+                            <span className="value">{formatCurrency(sellerWallet.totals?.emergency_holds)}</span>
+                          </div>
                         </div>
+                        {activeEmergencyPayout && (
+                          <article className="account-tile">
+                            <strong>Emergency payout in progress</strong>
+                            <p>Status: {activeEmergencyPayout.status || '-'}</p>
+                            <p>Requested: {formatDateTime(activeEmergencyPayout.requested_at)}</p>
+                            <p>Amount: {formatCurrency(activeEmergencyPayout.amount)} | Fee: {formatCurrency(activeEmergencyPayout.settlement_fee)}</p>
+                            <p>Total Debit: {formatCurrency(activeEmergencyPayout.total_debit)}</p>
+                            {activeEmergencyPayout.failure_reason && <p>Failure: {activeEmergencyPayout.failure_reason}</p>}
+                            {activeEmergencyPayout.review_reason && <p>Admin Note: {activeEmergencyPayout.review_reason}</p>}
+                          </article>
+                        )}
                         <form className="account-form" onSubmit={requestEmergencyPayout}>
                           <h3>Emergency Payout</h3>
+                          <p className="quick-panel-meta">Use this only for urgent liquidity needs. One emergency payout can stay open at a time until admin approval, provider completion, or hold release.</p>
                           <div className="form-group">
                             <label>Amount</label>
-                            <input type="number" value={sellerPayoutForm.amount} onChange={(event) => setSellerPayoutForm((prev) => ({ ...prev, amount: event.target.value }))} />
+                            <input type="number" value={sellerPayoutForm.amount} onChange={(event) => setSellerPayoutForm((prev) => ({ ...prev, amount: event.target.value }))} disabled={!canRequestEmergencyPayout} />
                           </div>
                           <div className="form-group">
                             <label className="address-default">
@@ -5860,31 +6133,55 @@ function App() {
                                 type="checkbox"
                                 checked={useSavedBankForPayout}
                                 onChange={(event) => setUseSavedBankForPayout(event.target.checked)}
-                                disabled={!sellerSavedBankAccount}
+                                disabled={!sellerSavedBankAccount || !canRequestEmergencyPayout}
                               />
                               <span>Use saved bank account {sellerSavedBankAccount?.bank_account_masked ? `(${sellerSavedBankAccount.bank_account_masked})` : ''}</span>
                             </label>
                           </div>
                           <div className="form-group">
                             <label>Account Holder Name</label>
-                            <input type="text" value={sellerPayoutForm.account_holder_name} onChange={(event) => setSellerPayoutForm((prev) => ({ ...prev, account_holder_name: event.target.value }))} disabled={useSavedBankForPayout} />
+                            <input type="text" value={sellerPayoutForm.account_holder_name} onChange={(event) => setSellerPayoutForm((prev) => ({ ...prev, account_holder_name: event.target.value }))} disabled={useSavedBankForPayout || !canRequestEmergencyPayout} />
                           </div>
                           <div className="form-group">
                             <label>Bank Account Number</label>
-                            <input type="text" value={sellerPayoutForm.bank_account_number} onChange={(event) => setSellerPayoutForm((prev) => ({ ...prev, bank_account_number: event.target.value }))} disabled={useSavedBankForPayout} />
+                            <input type="text" value={sellerPayoutForm.bank_account_number} onChange={(event) => setSellerPayoutForm((prev) => ({ ...prev, bank_account_number: event.target.value }))} disabled={useSavedBankForPayout || !canRequestEmergencyPayout} />
                           </div>
                           <div className="form-group">
                             <label>IFSC Code</label>
-                            <input type="text" value={sellerPayoutForm.ifsc_code} onChange={(event) => setSellerPayoutForm((prev) => ({ ...prev, ifsc_code: event.target.value.toUpperCase() }))} disabled={useSavedBankForPayout} />
+                            <input type="text" value={sellerPayoutForm.ifsc_code} onChange={(event) => setSellerPayoutForm((prev) => ({ ...prev, ifsc_code: event.target.value.toUpperCase() }))} disabled={useSavedBankForPayout || !canRequestEmergencyPayout} />
                           </div>
                           <div className="form-group">
                             <label>Bank Name (optional)</label>
-                            <input type="text" value={sellerPayoutForm.bank_name} onChange={(event) => setSellerPayoutForm((prev) => ({ ...prev, bank_name: event.target.value }))} disabled={useSavedBankForPayout} />
+                            <input type="text" value={sellerPayoutForm.bank_name} onChange={(event) => setSellerPayoutForm((prev) => ({ ...prev, bank_name: event.target.value }))} disabled={useSavedBankForPayout || !canRequestEmergencyPayout} />
                           </div>
-                          <button type="submit" className="seller-button primary" disabled={isRequestingEmergencyPayout}>
-                            {isRequestingEmergencyPayout ? 'Requesting...' : 'Request Emergency Payout'}
+                          <button type="submit" className="seller-button primary" disabled={isRequestingEmergencyPayout || !canRequestEmergencyPayout}>
+                            {isRequestingEmergencyPayout ? 'Requesting...' : canRequestEmergencyPayout ? 'Request Emergency Payout' : 'Payout Under Review'}
                           </button>
                         </form>
+                        {payoutRequests.length > 0 && (
+                          <div className="wallet-ledger">
+                            <h3>Emergency Payout History</h3>
+                            <div className="ledger-list">
+                              {payoutRequests.map((request) => (
+                                <article key={request.id || Math.random()} className="account-tile">
+                                  <strong>{formatCurrency(request.amount)} requested</strong>
+                                  <p>Status: {request.status || '-'}</p>
+                                  <p>Fee: {formatCurrency(request.settlement_fee)} | Total Debit: {formatCurrency(request.total_debit)}</p>
+                                  <p>Requested: {formatDateTime(request.requested_at)}</p>
+                                  {request?.bank_details?.bank_account_masked && (
+                                    <p>Bank: {request.bank_details.bank_name || 'Saved bank'} ({request.bank_details.bank_account_masked})</p>
+                                  )}
+                                  {request.review_reason && <p>Admin Note: {request.review_reason}</p>}
+                                  {request.failure_reason && <p>Failure: {request.failure_reason}</p>}
+                                  {request.provider_payout_status && <p>Provider Status: {request.provider_payout_status}</p>}
+                                  {request.transfer_reference && <p>Transfer Ref: {request.transfer_reference}</p>}
+                                  {request.transfer_processed_at && <p>Transferred: {formatDateTime(request.transfer_processed_at)}</p>}
+                                  {request.hold_released_at && <p>Hold Released: {formatDateTime(request.hold_released_at)}</p>}
+                                </article>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                         {sellerWallet.ledger && (
                           <div className="wallet-ledger">
                             <h3>Recent Transactions</h3>
@@ -5904,6 +6201,7 @@ function App() {
                     )}
                   </div>
                 )
+              }
               case 'account':
                 return (
                   <div className="seller-section">
@@ -6203,23 +6501,7 @@ function App() {
     );
   }
 
-  // Buyers see a simple shell with header/navigation
-  return (
-    <main className="buyer-shell">
-      <header className="buyer-header">
-        <h1>Brandcart</h1>
-        <nav className="buyer-nav">
-          <button onClick={() => window.location.reload()}>Home</button>
-          <button onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}>Top</button>
-          <button onClick={openAccountPanel}>Account</button>
-        </nav>
-        <p className="buyer-meta">Logged in as {userPhone || 'buyer'}</p>
-      </header>
-      <section className="buyer-content">
-        {pageShell}
-      </section>
-    </main>
-  )
+  return null
 }
 
 export default App

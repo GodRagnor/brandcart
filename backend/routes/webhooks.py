@@ -42,6 +42,30 @@ def verify_signature(raw_body: bytes, received_signature: str):
 # DELIVERY WEBHOOK (IDEMPOTENT, SAFE)
 # =========================================================
 
+@router.get("/razorpay")
+async def razorpay_webhook_status():
+    return {
+        "ok": True,
+        "message": "Razorpay webhook endpoint is reachable. Send POST requests with X-Razorpay-Signature.",
+    }
+
+
+@router.get("/razorpayx/payouts")
+async def razorpayx_payout_webhook_status():
+    return {
+        "ok": True,
+        "message": "RazorpayX payout webhook endpoint is reachable. Send POST requests with X-Razorpay-Signature.",
+    }
+
+
+@router.get("/delivery")
+async def delivery_webhook_status():
+    return {
+        "ok": True,
+        "message": "Delivery webhook endpoint is reachable. Send POST requests with X-Delivery-Signature.",
+    }
+
+
 @router.post("/delivery")
 async def delivery_webhook(request: Request):
     """
@@ -174,6 +198,8 @@ async def razorpay_webhook(request: Request):
     razorpay_payment_id = payment_entity.get("id")
     razorpay_order_id = payment_entity.get("order_id")
     payment_status = payment_entity.get("status")
+    payment_amount = payment_entity.get("amount")
+    payment_currency = payment_entity.get("currency")
 
     if not razorpay_payment_id or not razorpay_order_id:
         return {"ok": True, "ignored": True}
@@ -214,7 +240,27 @@ async def razorpay_webhook(request: Request):
         )
         return response
 
-    if order.get("payment", {}).get("status") == "paid":
+    order_payment = order.get("payment") or {}
+    if int(payment_amount or 0) != int(order_payment.get("amount_paise") or 0):
+        response = {"ok": True, "ignored": True, "reason": "amount_mismatch"}
+        await complete_idempotency_key(
+            db=db,
+            key=idempotency_key,
+            scope="razorpay_webhook",
+            response=response,
+        )
+        return response
+    if (payment_currency or "").upper() != str(order_payment.get("currency") or "INR").upper():
+        response = {"ok": True, "ignored": True, "reason": "currency_mismatch"}
+        await complete_idempotency_key(
+            db=db,
+            key=idempotency_key,
+            scope="razorpay_webhook",
+            response=response,
+        )
+        return response
+
+    if order_payment.get("status") == "paid":
         response = {"ok": True, "order": "already_paid"}
         await complete_idempotency_key(
             db=db,
@@ -231,6 +277,7 @@ async def razorpay_webhook(request: Request):
             "$set": {
                 "payment.status": "paid",
                 "payment.gateway_payment_id": razorpay_payment_id,
+                "payment.gateway_verified_via": "webhook",
                 "payment.paid_at": now,
                 "updated_at": now,
             }
@@ -248,6 +295,8 @@ async def razorpay_webhook(request: Request):
                 "gateway": "razorpay",
                 "razorpay_order_id": razorpay_order_id,
                 "razorpay_payment_id": razorpay_payment_id,
+                "payment_amount": payment_amount,
+                "payment_currency": payment_currency,
             },
         )
 
@@ -287,6 +336,7 @@ async def razorpayx_payout_webhook(request: Request):
     provider_status = payout_entity.get("status")
     reference_id = payout_entity.get("reference_id")
     failure_reason = payout_entity.get("status_details", {}).get("description") or payout_entity.get("narration")
+    transfer_reference = payout_entity.get("utr") or provider_payout_id
 
     if not provider_payout_id:
         return {"ok": True, "ignored": True}
@@ -330,6 +380,9 @@ async def razorpayx_payout_webhook(request: Request):
     if normalized_status in {"processed"}:
         update_fields["status"] = "approved"
         update_fields["transfer_processed_at"] = datetime.utcnow()
+        update_fields["transfer_reference"] = transfer_reference
+        update_fields["failure_reason"] = None
+        update_fields["failed_at"] = None
     elif normalized_status in {"rejected", "failed", "reversed", "cancelled"}:
         update_fields["status"] = "failed"
         update_fields["failure_reason"] = failure_reason or "Provider marked payout failed"

@@ -83,6 +83,16 @@ app.include_router(questions_router)
 # HEALTH CHECKS
 # -----------------------------
 
+@app.get("/")
+async def root():
+    return {
+        "service": "Brandcart API",
+        "status": "ok",
+        "health": "/api/health",
+        "docs": "/docs" if ENV != "production" else None,
+    }
+
+
 @app.get("/api/health")
 async def health():
 

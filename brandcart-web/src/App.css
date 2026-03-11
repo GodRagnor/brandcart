@@ -2765,9 +2765,36 @@
   font-size: 0.82rem;
 }
 
+.delivery-partner-chip p {
+  margin: 0;
+  color: #445979;
+  font-size: 0.8rem;
+}
+
 .delivery-partner-chip small {
   color: #687da0;
   font-size: 0.75rem;
+}
+
+.delivery-partner-status {
+  font-size: 0.76rem;
+  font-style: normal;
+}
+
+.delivery-partner-status.ready {
+  color: #1f7a45;
+}
+
+.delivery-partner-status.action {
+  color: #9a5b12;
+}
+
+.delivery-otp-input {
+  min-width: 150px;
+  border: 1px solid #d4e0f2;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font: inherit;
 }
 
 .delivery-notification-list {

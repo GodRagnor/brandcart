@@ -71,10 +71,24 @@ class DeliveryPartnerCreatePayload(BaseModel):
     name: str = Field(..., min_length=2, max_length=120)
     phone: str = Field(..., min_length=10, max_length=20)
     email: Optional[str] = Field(default=None, max_length=120)
+    vehicle_type: Optional[str] = Field(default=None, max_length=40)
+    service_area: Optional[str] = Field(default=None, max_length=160)
+    notes: Optional[str] = Field(default=None, max_length=240)
 
 
 class DeliveryPartnerAssignPayload(BaseModel):
     partner_id: str = Field(..., min_length=8, max_length=64)
+
+
+class ExternalShipmentPayload(BaseModel):
+    partner_id: str = Field(..., min_length=8, max_length=64)
+    tracking_number: str = Field(..., min_length=4, max_length=80)
+    tracking_url: Optional[str] = Field(default=None, max_length=400)
+
+
+class ShipmentStatusPayload(BaseModel):
+    status: str = Field(..., min_length=3, max_length=32)
+    message: Optional[str] = Field(default=None, max_length=200)
 
 
 def mask_phone(value: str) -> str:
@@ -82,6 +96,168 @@ def mask_phone(value: str) -> str:
     if len(digits) >= 4:
         return f"******{digits[-4:]}"
     return "******"
+
+
+def clean_optional_text(value: Optional[str], *, lower: bool = False) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text.lower() if lower else text
+
+
+def serialize_delivery_partner(row: dict) -> dict:
+    partner_user_id = row.get("partner_user_id")
+    partner_user_id_str = None
+    if isinstance(partner_user_id, ObjectId):
+        partner_user_id_str = str(partner_user_id)
+    elif partner_user_id:
+        partner_user_id_str = str(partner_user_id).strip() or None
+
+    portal_access_status = row.get("portal_access_status") or ("ready" if partner_user_id_str else "action_required")
+    portal_access_message = row.get("portal_access_message") or (
+        "Partner can log in with OTP using this phone."
+        if partner_user_id_str
+        else "Use a dedicated delivery partner phone to enable portal login."
+    )
+
+    return {
+        "id": str(row["_id"]),
+        "name": row.get("name"),
+        "phone": row.get("phone"),
+        "phone_masked": row.get("phone_masked"),
+        "email": row.get("email"),
+        "source": row.get("source") or "seller_custom",
+        "code": row.get("code"),
+        "partner_user_id": partner_user_id_str,
+        "vehicle_type": row.get("vehicle_type"),
+        "service_area": row.get("service_area"),
+        "notes": row.get("notes"),
+        "portal_access_status": portal_access_status,
+        "portal_access_message": portal_access_message,
+        "is_active": bool(row.get("is_active", True)),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def serialize_shipping_catalog_partner(row: dict) -> dict:
+    return {
+        "id": str(row["_id"]),
+        "code": row.get("code"),
+        "name": row.get("name"),
+        "email": row.get("email"),
+        "phone_masked": row.get("phone_masked"),
+        "rating": row.get("rating"),
+        "coverage": row.get("coverage"),
+        "provider_type": "third_party_courier",
+    }
+
+
+def serialize_order_shipping(order: dict) -> dict:
+    shipping_partner = order.get("shipping_partner") or {}
+    shipment = order.get("shipment") or {}
+
+    partner_id = shipping_partner.get("id") or shipping_partner.get("_id")
+    if isinstance(partner_id, ObjectId):
+        partner_id = str(partner_id)
+    elif partner_id:
+        partner_id = str(partner_id)
+    else:
+        partner_id = None
+
+    return {
+        "partner_id": partner_id,
+        "partner_name": shipping_partner.get("name"),
+        "partner_code": shipping_partner.get("code"),
+        "provider_type": shipping_partner.get("provider_type") or "third_party_courier",
+        "tracking_number": shipment.get("tracking_number"),
+        "tracking_url": shipment.get("tracking_url"),
+        "booked_at": shipment.get("booked_at"),
+        "last_status_sync_at": shipment.get("last_status_sync_at"),
+    }
+
+
+def serialize_wallet_payout_request(row: dict) -> dict:
+    bank_details = row.get("bank_details") or {}
+    request_id = row.get("_id")
+    return {
+        "id": str(request_id) if request_id else None,
+        "type": row.get("type") or "emergency",
+        "method": row.get("method"),
+        "status": row.get("status"),
+        "amount": row.get("amount", 0),
+        "settlement_fee": row.get("settlement_fee", 0),
+        "total_debit": row.get("total_debit", row.get("amount", 0)),
+        "requested_at": row.get("requested_at"),
+        "reviewed_at": row.get("reviewed_at"),
+        "review_reason": row.get("review_reason"),
+        "failure_reason": row.get("failure_reason"),
+        "rejected_at": row.get("rejected_at"),
+        "retried_at": row.get("retried_at"),
+        "reconciled_at": row.get("reconciled_at"),
+        "transfer_processed_at": row.get("transfer_processed_at"),
+        "transfer_reference": row.get("transfer_reference"),
+        "provider": row.get("provider"),
+        "provider_payout_id": row.get("provider_payout_id"),
+        "provider_payout_status": row.get("provider_payout_status"),
+        "hold_released_at": row.get("hold_released_at"),
+        "bank_details": {
+            "account_holder_name": bank_details.get("account_holder_name"),
+            "bank_account_masked": bank_details.get("bank_account_masked"),
+            "ifsc_code": bank_details.get("ifsc_code"),
+            "bank_name": bank_details.get("bank_name"),
+        } if bank_details else None,
+    }
+
+
+async def ensure_delivery_partner_account(
+    db,
+    *,
+    phone: str,
+    name: str,
+    email: Optional[str],
+    vehicle_type: Optional[str],
+    service_area: Optional[str],
+    notes: Optional[str],
+):
+    now = datetime.utcnow()
+    profile = {
+        "name": name,
+        "vehicle_type": vehicle_type,
+        "service_area": service_area,
+        "notes": notes,
+    }
+    if email:
+        profile["email"] = email
+
+    user = await db.users.find_one({"phone": phone})
+    if not user:
+        result = await db.users.insert_one({
+            "phone": phone,
+            "role": "delivery_partner",
+            "delivery_partner_profile": profile,
+            "is_frozen": False,
+            "created_at": now,
+            "last_active_at": now,
+        })
+        return result.inserted_id, "ready", "Partner can log in with OTP using this phone."
+
+    if user.get("role") == "delivery_partner":
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {
+                "delivery_partner_profile": profile,
+                "updated_at": now,
+            }},
+        )
+        if user.get("is_frozen"):
+            return user["_id"], "restricted", "Partner account is frozen and cannot log in right now."
+        return user["_id"], "ready", "Partner can log in with OTP using this phone."
+
+    existing_role = str(user.get("role") or "buyer").strip().lower() or "buyer"
+    return None, "action_required", f"Phone is already linked to a {existing_role} account. Use a dedicated delivery partner number."
 
 
 DEFAULT_DELIVERY_APP_PARTNERS = [
@@ -112,7 +288,7 @@ DEFAULT_DELIVERY_APP_PARTNERS = [
 ]
 
 
-async def ensure_delivery_app_partner_catalog(db):
+async def ensure_delivery_app_partner_catalog(db, create_partner_accounts: bool = True):
     total = await db.delivery_app_partners.count_documents({})
     now = datetime.utcnow()
 
@@ -137,6 +313,9 @@ async def ensure_delivery_app_partner_catalog(db):
             })
         if seed_docs:
             await db.delivery_app_partners.insert_many(seed_docs)
+
+    if not create_partner_accounts:
+        return
 
     # Ensure each catalog partner has a delivery_partner login account.
     catalog_rows = await db.delivery_app_partners.find({}, {"_id": 1, "name": 1, "phone": 1, "code": 1}).to_list(300)
@@ -171,6 +350,80 @@ async def ensure_delivery_app_partner_catalog(db):
                     "updated_at": datetime.utcnow(),
                 }},
             )
+
+
+async def finalize_external_delivery(db, *, order: dict, seller_id, message: Optional[str] = None):
+    if order.get("delivered_at"):
+        raise HTTPException(400, "Order already delivered")
+
+    product = await db.products.find_one({"_id": order["product_id"]})
+    if not product:
+        raise HTTPException(404, "Product not found")
+
+    qty = order.get("quantity", 0)
+    if product.get("reserved_stock", 0) < qty:
+        raise HTTPException(409, "Reserved stock corrupted")
+
+    now = datetime.utcnow()
+    payment = order.get("payment") or {}
+    delivered_message = message or "Courier updated order as delivered"
+
+    await db.products.update_one(
+        {"_id": product["_id"]},
+        {"$inc": {"reserved_stock": -qty}}
+    )
+
+    await db.orders.update_one(
+        {"_id": order["_id"]},
+        {
+            "$set": {
+                "status": "delivered",
+                "delivered_at": now,
+                "payment.status": "cod_pending" if payment.get("method") == "COD" else "paid",
+                "settlement.status": "pending",
+                "settlement.settled_at": None,
+                "shipment.last_status_sync_at": now,
+                "updated_at": now,
+            },
+            "$unset": {
+                "delivery_partner": "",
+                "delivery_otp_hash": "",
+                "delivery_otp_encrypted": "",
+                "delivery_otp_generated_at": "",
+            },
+            "$push": {
+                "tracking": {
+                    "status": "DELIVERED",
+                    "message": delivered_message,
+                    "at": now,
+                }
+            }
+        }
+    )
+
+    await record_order_event(
+        db=db,
+        order_id=order["_id"],
+        event="ORDER_DELIVERED",
+        actor_role="seller",
+        actor_id=seller_id,
+        metadata={"mode": "third_party_courier"},
+    )
+
+    buyer_notice = {
+        "type": "delivery_update",
+        "title": "Order delivered",
+        "message": "Your order was marked delivered by the courier",
+        "order_id": str(order["_id"]),
+        "created_at": now,
+        "read": False,
+    }
+    await db.users.update_one(
+        {"_id": order["buyer_id"]},
+        {"$push": {"buyer_notifications": {"$each": [buyer_notice], "$slice": -100}}},
+    )
+
+    return now
 
 # ----------------------------------------
 # SELLER PROFILE
@@ -655,6 +908,7 @@ async def seller_orders(
                 "assigned_at": delivery_partner.get("assigned_at"),
                 "out_for_delivery_at": delivery_partner.get("out_for_delivery_at"),
             },
+            "shipping": serialize_order_shipping(order),
             "tracking": tracking_rows[-20:],
         })
 
@@ -681,13 +935,25 @@ async def create_delivery_partner(
         raise HTTPException(403, "Seller account frozen")
 
     name = data.name.strip()
-    email = data.email.strip().lower() if data.email else None
+    email = clean_optional_text(data.email, lower=True)
+    vehicle_type = clean_optional_text(data.vehicle_type)
+    service_area = clean_optional_text(data.service_area)
+    notes = clean_optional_text(data.notes)
     try:
         phone = normalize_phone(data.phone)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
 
     now = datetime.utcnow()
+    partner_user_id, portal_access_status, portal_access_message = await ensure_delivery_partner_account(
+        db,
+        phone=phone,
+        name=name,
+        email=email,
+        vehicle_type=vehicle_type,
+        service_area=service_area,
+        notes=notes,
+    )
     existing = await db.seller_delivery_partners.find_one({
         "seller_id": seller["_id"],
         "phone": phone,
@@ -700,6 +966,12 @@ async def create_delivery_partner(
                 "name": name,
                 "email": email,
                 "phone_masked": mask_phone(phone),
+                "vehicle_type": vehicle_type,
+                "service_area": service_area,
+                "notes": notes,
+                "partner_user_id": partner_user_id,
+                "portal_access_status": portal_access_status,
+                "portal_access_message": portal_access_message,
                 "is_active": True,
                 "updated_at": now,
             }},
@@ -713,6 +985,12 @@ async def create_delivery_partner(
             "phone_masked": mask_phone(phone),
             "email": email,
             "source": "seller_custom",
+            "vehicle_type": vehicle_type,
+            "service_area": service_area,
+            "notes": notes,
+            "partner_user_id": partner_user_id,
+            "portal_access_status": portal_access_status,
+            "portal_access_message": portal_access_message,
             "is_active": True,
             "created_at": now,
             "updated_at": now,
@@ -726,21 +1004,16 @@ async def create_delivery_partner(
         actor_id=str(seller["_id"]),
         actor_role="seller",
         action="SELLER_DELIVERY_PARTNER_SAVED",
-        metadata={"partner_id": str(partner["_id"]), "partner_phone": partner.get("phone")},
+        metadata={
+            "partner_id": str(partner["_id"]),
+            "partner_phone": partner.get("phone"),
+            "portal_access_status": portal_access_status,
+        },
     )
 
     return {
         "message": "Delivery partner saved",
-        "partner": {
-            "id": str(partner["_id"]),
-            "name": partner.get("name"),
-            "phone": partner.get("phone"),
-            "phone_masked": partner.get("phone_masked"),
-            "email": partner.get("email"),
-            "is_active": bool(partner.get("is_active", True)),
-            "created_at": partner.get("created_at"),
-            "updated_at": partner.get("updated_at"),
-        }
+        "partner": serialize_delivery_partner(partner),
     }
 
 
@@ -753,25 +1026,27 @@ async def get_delivery_partners(
         {"seller_id": seller["_id"]}
     ).sort("created_at", -1).to_list(200)
 
-    partners = []
-    for row in rows:
-        partner_user_id = row.get("partner_user_id")
-        if isinstance(partner_user_id, ObjectId):
-            partner_user_id = str(partner_user_id)
-        partners.append({
-            "id": str(row["_id"]),
-            "name": row.get("name"),
-            "phone": row.get("phone"),
-            "phone_masked": row.get("phone_masked"),
-            "email": row.get("email"),
-            "source": row.get("source") or "seller_custom",
-            "code": row.get("code"),
-            "partner_user_id": partner_user_id,
-            "is_active": bool(row.get("is_active", True)),
-            "created_at": row.get("created_at"),
-            "updated_at": row.get("updated_at"),
-        })
+    partners = [serialize_delivery_partner(row) for row in rows]
 
+    return {
+        "count": len(partners),
+        "partners": partners,
+    }
+
+
+@router.get("/shipping-partners/catalog")
+async def list_shipping_partners_catalog(
+    limit: int = Query(default=100, ge=1, le=300),
+    seller=Depends(require_role("seller")),
+):
+    db = get_db()
+    await ensure_delivery_app_partner_catalog(db, create_partner_accounts=False)
+
+    rows = await db.delivery_app_partners.find(
+        {"is_active": True}
+    ).sort("name", 1).limit(limit).to_list(limit)
+
+    partners = [serialize_shipping_catalog_partner(row) for row in rows]
     return {
         "count": len(partners),
         "partners": partners,
@@ -784,7 +1059,7 @@ async def list_delivery_app_partners(
     seller=Depends(require_role("seller")),
 ):
     db = get_db()
-    await ensure_delivery_app_partner_catalog(db)
+    await ensure_delivery_app_partner_catalog(db, create_partner_accounts=False)
 
     rows = await db.delivery_app_partners.find(
         {"is_active": True}
@@ -829,7 +1104,7 @@ async def hire_delivery_app_partner(
     if seller.get("is_frozen"):
         raise HTTPException(403, "Seller account frozen")
 
-    await ensure_delivery_app_partner_catalog(db)
+    await ensure_delivery_app_partner_catalog(db, create_partner_accounts=False)
     app_partner = await db.delivery_app_partners.find_one({
         "_id": parse_object_id(partner_id, "partner_id"),
         "is_active": True,
@@ -919,6 +1194,226 @@ async def hire_delivery_app_partner(
     }
 
 
+@router.post("/orders/{order_id}/shipping")
+async def save_order_shipping(
+    order_id: str,
+    data: ExternalShipmentPayload,
+    seller=Depends(require_role("seller"))
+):
+    db = get_db()
+    now = datetime.utcnow()
+
+    if seller.get("seller_status") != "verified":
+        raise HTTPException(403, "Seller not verified")
+    if seller.get("is_frozen"):
+        raise HTTPException(403, "Seller account frozen")
+
+    order_oid = parse_object_id(order_id, "order_id")
+    partner_oid = parse_object_id(data.partner_id, "partner_id")
+    order = await db.orders.find_one({
+        "_id": order_oid,
+        "seller_id": seller["_id"],
+    })
+    if not order:
+        raise HTTPException(404, "Order not found")
+    if order.get("status") in {"delivered", "cancelled", "rto"}:
+        raise HTTPException(400, "Order is not eligible for shipping updates")
+
+    await ensure_delivery_app_partner_catalog(db)
+    partner = await db.delivery_app_partners.find_one({
+        "_id": partner_oid,
+        "is_active": True,
+    })
+    if not partner:
+        raise HTTPException(404, "Shipping partner not found")
+
+    tracking_number = str(data.tracking_number or "").strip()
+    if len(tracking_number) < 4:
+        raise HTTPException(400, "Tracking number is too short")
+
+    tracking_url = clean_optional_text(data.tracking_url)
+    if tracking_url and not tracking_url.lower().startswith(("http://", "https://")):
+        raise HTTPException(400, "Tracking URL must start with http:// or https://")
+
+    shipping_partner_payload = {
+        "id": str(partner["_id"]),
+        "name": partner.get("name"),
+        "code": partner.get("code"),
+        "coverage": partner.get("coverage"),
+        "rating": partner.get("rating"),
+        "provider_type": "third_party_courier",
+        "booked_by": str(seller["_id"]),
+    }
+    shipment_payload = {
+        "tracking_number": tracking_number,
+        "tracking_url": tracking_url,
+        "booked_at": now,
+        "last_status_sync_at": now,
+    }
+
+    next_status = "shipped" if order.get("status") == "created" else order.get("status")
+    tracking_message = f"Shipment booked with {partner.get('name') or 'shipping partner'} ({tracking_number})"
+
+    await db.orders.update_one(
+        {"_id": order_oid},
+        {
+            "$set": {
+                "status": next_status,
+                "shipping_partner": shipping_partner_payload,
+                "shipment": shipment_payload,
+                "updated_at": now,
+            },
+            "$unset": {
+                "delivery_partner": "",
+                "delivery_otp_hash": "",
+                "delivery_otp_encrypted": "",
+                "delivery_otp_generated_at": "",
+            },
+            "$push": {
+                "tracking": {
+                    "status": "SHIPPED",
+                    "message": tracking_message,
+                    "at": now,
+                }
+            }
+        }
+    )
+
+    await record_order_event(
+        db=db,
+        order_id=order_oid,
+        event="ORDER_SHIPPED",
+        actor_role="seller",
+        actor_id=seller["_id"],
+        metadata={
+            "shipping_partner": shipping_partner_payload.get("name"),
+            "tracking_number": tracking_number,
+            "mode": "third_party_courier",
+        },
+    )
+
+    buyer_notice = {
+        "type": "delivery_update",
+        "title": "Shipment booked",
+        "message": f"Your order has been shipped with {partner.get('name') or 'the courier partner'}",
+        "order_id": order_id,
+        "created_at": now,
+        "read": False,
+    }
+    await db.users.update_one(
+        {"_id": order["buyer_id"]},
+        {"$push": {"buyer_notifications": {"$each": [buyer_notice], "$slice": -100}}},
+    )
+
+    await log_audit(
+        db=db,
+        actor_id=str(seller["_id"]),
+        actor_role="seller",
+        action="SELLER_ORDER_SHIPPING_SAVED",
+        metadata={
+            "order_id": order_id,
+            "shipping_partner": shipping_partner_payload.get("name"),
+            "tracking_number": tracking_number,
+        },
+    )
+
+    return {
+        "message": "Shipment saved",
+        "order_id": order_id,
+        "status": next_status,
+        "shipping": {
+            "partner_id": shipping_partner_payload.get("id"),
+            "partner_name": shipping_partner_payload.get("name"),
+            "partner_code": shipping_partner_payload.get("code"),
+            "provider_type": shipping_partner_payload.get("provider_type"),
+            "tracking_number": tracking_number,
+            "tracking_url": tracking_url,
+            "booked_at": now,
+            "last_status_sync_at": now,
+        },
+    }
+
+
+@router.post("/orders/{order_id}/shipping-status")
+async def update_order_shipping_status(
+    order_id: str,
+    data: ShipmentStatusPayload,
+    seller=Depends(require_role("seller"))
+):
+    db = get_db()
+    now = datetime.utcnow()
+    normalized_status = str(data.status or "").strip().lower()
+    allowed_statuses = {"shipped", "out_for_delivery", "delivered"}
+    if normalized_status not in allowed_statuses:
+        raise HTTPException(400, f"Invalid shipping status. Allowed: {', '.join(sorted(allowed_statuses))}")
+
+    order = await db.orders.find_one({
+        "_id": parse_object_id(order_id, "order_id"),
+        "seller_id": seller["_id"],
+    })
+    if not order:
+        raise HTTPException(404, "Order not found")
+    if order.get("status") in {"cancelled", "rto"}:
+        raise HTTPException(400, "Order is not eligible for shipping updates")
+
+    if normalized_status == "delivered":
+        await finalize_external_delivery(
+            db,
+            order=order,
+            seller_id=seller["_id"],
+            message=clean_optional_text(data.message) or "Courier updated order as delivered",
+        )
+        return {"message": "Order marked delivered", "order_id": order_id, "status": "delivered"}
+
+    tracking_status = "OUT_FOR_DELIVERY" if normalized_status == "out_for_delivery" else "SHIPPED"
+    default_message = (
+        "Courier marked order as out for delivery"
+        if normalized_status == "out_for_delivery"
+        else "Courier shipment is in transit"
+    )
+    message = clean_optional_text(data.message) or default_message
+
+    await db.orders.update_one(
+        {"_id": order["_id"]},
+        {
+            "$set": {
+                "status": normalized_status,
+                "shipment.last_status_sync_at": now,
+                "updated_at": now,
+            },
+            "$push": {
+                "tracking": {
+                    "status": tracking_status,
+                    "message": message,
+                    "at": now,
+                }
+            }
+        }
+    )
+
+    await record_order_event(
+        db=db,
+        order_id=order["_id"],
+        event=tracking_status,
+        actor_role="seller",
+        actor_id=seller["_id"],
+        metadata={"mode": "third_party_courier"},
+    )
+
+    await log_audit(
+        db=db,
+        actor_id=str(seller["_id"]),
+        actor_role="seller",
+        action="SELLER_ORDER_SHIPPING_STATUS_UPDATED",
+        metadata={
+            "order_id": order_id,
+            "status": normalized_status,
+        },
+    )
+
+    return {"message": "Shipping status updated", "order_id": order_id, "status": normalized_status}
+
+
 @router.post("/orders/{order_id}/assign-delivery-partner")
 async def assign_delivery_partner_to_order(
     order_id: str,
@@ -950,6 +1445,8 @@ async def assign_delivery_partner_to_order(
     partner_user_id = partner.get("partner_user_id")
     if isinstance(partner_user_id, ObjectId):
         partner_user_id = str(partner_user_id)
+    if not str(partner_user_id or "").strip():
+        raise HTTPException(400, partner.get("portal_access_message") or "Delivery partner needs a delivery login before assignment")
 
     partner_payload = {
         "id": str(partner["_id"]),
@@ -1114,6 +1611,21 @@ async def get_seller_wallet(
         .limit(50)
         .to_list(50)
     )
+    payout_rows = (
+        await db.payout_requests
+        .find({"seller_id": seller_id, "type": "emergency"})
+        .sort("requested_at", -1)
+        .limit(20)
+        .to_list(20)
+    )
+    payout_requests = [serialize_wallet_payout_request(row) for row in payout_rows]
+    active_payout_request = next(
+        (
+            row for row in payout_requests
+            if str(row.get("status") or "").strip().lower() in {"requested", "processing"}
+        ),
+        None,
+    )
 
     seller_tier = seller.get("seller_tier", "standard")
     tier_config = SELLER_TIER_CONFIG.get(seller_tier, SELLER_TIER_CONFIG["standard"])
@@ -1147,6 +1659,11 @@ async def get_seller_wallet(
             "policy_release_note": tier_config.get("release_note"),
         },
         "ledger": ledger,
+        "payout_requests": payout_requests,
+        "emergency_payout": {
+            "can_request": active_payout_request is None,
+            "active_request": active_payout_request,
+        },
     }
 
 
@@ -1158,6 +1675,16 @@ async def request_emergency_payout(
 ):
     if seller.get("seller_status") != "verified":
         raise HTTPException(403, "Only verified sellers can request emergency payout")
+    if seller.get("is_frozen") or seller.get("seller_status") == "frozen":
+        raise HTTPException(403, "Seller account frozen")
+
+    existing_active_request = await db.payout_requests.find_one({
+        "seller_id": seller["_id"],
+        "type": "emergency",
+        "status": {"$in": ["requested", "processing"]},
+    })
+    if existing_active_request:
+        raise HTTPException(400, "You already have an emergency payout under review")
 
     saved_bank = seller.get("seller_bank_account") or {}
 
@@ -1214,6 +1741,7 @@ async def request_emergency_payout(
     }
 
     res = await db.payout_requests.insert_one(payout_doc)
+    requested_at = payout_doc["requested_at"]
 
     await db.wallet_ledger.insert_one({
         "seller_id": seller["_id"],
@@ -1223,8 +1751,21 @@ async def request_emergency_payout(
         "debit": total_debit,
         "reason_code": "EMERGENCY_PAYOUT_REQUESTED",
         "reference_id": res.inserted_id,
-        "created_at": datetime.utcnow(),
+        "created_at": requested_at,
     })
+    await log_audit(
+        db=db,
+        actor_id=str(seller["_id"]),
+        actor_role="seller",
+        action="EMERGENCY_PAYOUT_REQUESTED",
+        metadata={
+            "request_id": str(res.inserted_id),
+            "amount": amount,
+            "settlement_fee": settlement_fee,
+            "total_debit": total_debit,
+            "bank_account": masked_account_number,
+        },
+    )
 
     return {
         "message": "Emergency payout requested",
@@ -1234,6 +1775,7 @@ async def request_emergency_payout(
         "settlement_fee": settlement_fee,
         "total_debit": total_debit,
         "bank_account": masked_account_number,
+        "status": "requested",
     }
 
 # ======================================================

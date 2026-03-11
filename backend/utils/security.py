@@ -1,26 +1,75 @@
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from datetime import datetime
 
-from utils.jwt import decode_token
-from database import get_db
+from fastapi import Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose.exceptions import ExpiredSignatureError, JWTError
 
-security = HTTPBearer()
+from database import get_db
+from utils.jwt import ACCESS_TOKEN_TYPE, decode_token
+
+security = HTTPBearer(auto_error=False)
+
+ACCESS_COOKIE_NAME = "brandcart_access_token"
+REFRESH_COOKIE_NAME = "brandcart_refresh_token"
+
+
+def _extract_access_token(request: Request, credentials: HTTPAuthorizationCredentials | None) -> str:
+    if credentials and credentials.credentials:
+        return credentials.credentials
+    return request.cookies.get(ACCESS_COOKIE_NAME) or ""
 
 
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db=Depends(get_db),
 ):
-    token = credentials.credentials
-    payload = decode_token(token)
+    token = _extract_access_token(request, credentials)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+        )
+
+    try:
+        payload = decode_token(token, expected_type=ACCESS_TOKEN_TYPE)
+    except ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Access token expired",
+        )
+    except (JWTError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid access token",
+        )
 
     phone = payload.get("sub")
+    session_id = str(payload.get("sid") or "").strip()
 
     if not phone:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token payload",
+        )
+
+    now = datetime.utcnow()
+    if session_id:
+        session = await db.auth_sessions.find_one({
+            "session_id": session_id,
+            "user_phone": phone,
+            "revoked_at": None,
+            "expires_at": {"$gt": now},
+        })
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session expired",
+            )
+
+        await db.auth_sessions.update_one(
+            {"_id": session["_id"]},
+            {"$set": {"last_seen_at": now}},
         )
 
     user = await db.users.find_one({"phone": phone})
@@ -30,10 +79,9 @@ async def get_current_user(
             detail="User not found",
         )
 
-    # Update last activity
     await db.users.update_one(
         {"_id": user["_id"]},
-        {"$set": {"last_active_at": datetime.utcnow()}}
+        {"$set": {"last_active_at": now}},
     )
 
     return user
@@ -63,6 +111,7 @@ def require_roles(*allowed_roles: str):
         return user
 
     return checker
+
 
 async def get_current_seller(
     user=Depends(get_current_user),

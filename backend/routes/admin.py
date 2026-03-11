@@ -31,6 +31,113 @@ class PayoutDecision(BaseModel):
     reason: Optional[str] = None
 
 
+APPROVED_PAYOUT_PROVIDER_STATUSES = {"processed"}
+FAILED_PAYOUT_PROVIDER_STATUSES = {"failed", "reversed", "rejected", "cancelled"}
+PROCESSING_PAYOUT_PROVIDER_STATUSES = {"queued", "pending", "processing", "initiated"}
+
+
+def derive_payout_status(provider_status: Optional[str]) -> str:
+    normalized = (provider_status or "").strip().lower()
+    if normalized in APPROVED_PAYOUT_PROVIDER_STATUSES:
+        return "approved"
+    if normalized in FAILED_PAYOUT_PROVIDER_STATUSES:
+        return "failed"
+    return "processing"
+
+
+def extract_provider_failure_reason(provider_meta: dict) -> Optional[str]:
+    reason = provider_meta.get("provider_failure_reason")
+    if reason:
+        return reason
+    raw = provider_meta.get("provider_raw") or {}
+    status_details = raw.get("status_details") or {}
+    return status_details.get("description") or raw.get("status_description") or raw.get("narration")
+
+
+def extract_transfer_reference(provider_meta: dict) -> Optional[str]:
+    return provider_meta.get("provider_transfer_reference") or provider_meta.get("provider_payout_id")
+
+
+async def release_emergency_payout_hold(
+    db,
+    *,
+    payout: dict,
+    admin_id: str,
+    reason_code: str,
+    note: Optional[str] = None,
+) -> bool:
+    existing_release = await db.wallet_ledger.find_one({
+        "reference_id": payout["_id"],
+        "entry_type": "EMERGENCY_PAYOUT_RELEASE",
+    })
+    if existing_release:
+        return False
+
+    now = datetime.utcnow()
+    await db.wallet_ledger.insert_one({
+        "seller_id": payout["seller_id"],
+        "order_id": None,
+        "entry_type": "EMERGENCY_PAYOUT_RELEASE",
+        "credit": payout.get("total_debit", payout.get("amount", 0)),
+        "debit": 0,
+        "reason_code": reason_code,
+        "reference_id": payout["_id"],
+        "note": note,
+        "created_at": now,
+    })
+    await db.payout_requests.update_one(
+        {"_id": payout["_id"]},
+        {"$set": {
+            "hold_released_at": now,
+            "hold_released_by": admin_id,
+            "hold_release_reason_code": reason_code,
+        }},
+    )
+    return True
+
+
+def serialize_payout_request(row: dict, seller: Optional[dict]) -> dict:
+    bank_details = row.get("bank_details") or {}
+    seller_profile = (seller or {}).get("seller_profile") or {}
+    return {
+        "_id": str(row["_id"]),
+        "seller_id": str(row["seller_id"]),
+        "type": row.get("type"),
+        "method": row.get("method"),
+        "status": row.get("status"),
+        "amount": row.get("amount"),
+        "settlement_fee": row.get("settlement_fee"),
+        "total_debit": row.get("total_debit"),
+        "requested_at": row.get("requested_at"),
+        "reviewed_at": row.get("reviewed_at"),
+        "review_reason": row.get("review_reason"),
+        "failure_reason": row.get("failure_reason"),
+        "rejected_at": row.get("rejected_at"),
+        "retried_at": row.get("retried_at"),
+        "reconciled_at": row.get("reconciled_at"),
+        "transfer_processed_at": row.get("transfer_processed_at"),
+        "transfer_reference": row.get("transfer_reference"),
+        "provider": row.get("provider"),
+        "provider_payout_id": row.get("provider_payout_id"),
+        "provider_payout_status": row.get("provider_payout_status"),
+        "hold_released_at": row.get("hold_released_at"),
+        "hold_release_reason_code": row.get("hold_release_reason_code"),
+        "seller": {
+            "id": str(seller["_id"]) if seller and seller.get("_id") else str(row["seller_id"]),
+            "phone": seller.get("phone") if seller else None,
+            "brand_name": seller_profile.get("brand_name") if seller_profile else None,
+            "legal_name": seller_profile.get("legal_name") if seller_profile else None,
+            "seller_status": seller.get("seller_status") if seller else None,
+        },
+        "bank_details": {
+            "account_holder_name": bank_details.get("account_holder_name"),
+            "bank_account_masked": bank_details.get("bank_account_masked"),
+            "ifsc_code": bank_details.get("ifsc_code"),
+            "bank_name": bank_details.get("bank_name"),
+        } if bank_details else None,
+    }
+
+
 # =====================================================
 # VIEW SELLER REQUESTS
 # =====================================================
@@ -519,10 +626,23 @@ async def finance_summary(
         {"$group": {"_id": None, "amount": {"$sum": "$credit"}}}
     ]).to_list(1)
 
+    payout_requested = await db.payout_requests.aggregate([
+        {"$match": {"status": "requested"}},
+        {"$group": {"_id": None, "amount": {"$sum": "$amount"}, "count": {"$sum": 1}}}
+    ]).to_list(1)
+    payout_processing = await db.payout_requests.aggregate([
+        {"$match": {"status": "processing"}},
+        {"$group": {"_id": None, "amount": {"$sum": "$amount"}, "count": {"$sum": 1}}}
+    ]).to_list(1)
+
     return {
         "pending_cod_amount": pending_cod[0]["amount"] if pending_cod else 0,
         "unsettled_payouts": unsettled[0]["amount"] if unsettled else 0,
         "reserve_locked": reserve[0]["amount"] if reserve else 0,
+        "emergency_payout_requested_amount": payout_requested[0]["amount"] if payout_requested else 0,
+        "emergency_payout_requested_count": payout_requested[0]["count"] if payout_requested else 0,
+        "emergency_payout_processing_amount": payout_processing[0]["amount"] if payout_processing else 0,
+        "emergency_payout_processing_count": payout_processing[0]["count"] if payout_processing else 0,
     }
 
 # =========================================================
@@ -557,20 +677,14 @@ async def list_payout_requests(
     if status:
         query["status"] = status
 
-    cursor = db.payout_requests.find(query).sort("requested_at", -1).limit(100)
-    rows = []
-    async for row in cursor:
-        row["_id"] = str(row["_id"])
-        row["seller_id"] = str(row["seller_id"])
-        bank_details = row.get("bank_details")
-        if bank_details:
-            row["bank_details"] = {
-                "account_holder_name": bank_details.get("account_holder_name"),
-                "bank_account_masked": bank_details.get("bank_account_masked"),
-                "ifsc_code": bank_details.get("ifsc_code"),
-                "bank_name": bank_details.get("bank_name"),
-            }
-        rows.append(row)
+    raw_rows = await db.payout_requests.find(query).sort("requested_at", -1).limit(100).to_list(100)
+    seller_ids = [row.get("seller_id") for row in raw_rows if row.get("seller_id")]
+    sellers = await db.users.find(
+        {"_id": {"$in": seller_ids}},
+        {"phone": 1, "seller_profile.brand_name": 1, "seller_profile.legal_name": 1, "seller_status": 1},
+    ).to_list(len(seller_ids) or 1)
+    sellers_by_id = {seller["_id"]: seller for seller in sellers}
+    rows = [serialize_payout_request(row, sellers_by_id.get(row.get("seller_id"))) for row in raw_rows]
 
     return {"count": len(rows), "requests": rows}
 
@@ -591,28 +705,31 @@ async def payout_request_decision(
     if not payout:
         raise HTTPException(404, "Payout request not found")
 
-    if payout.get("status") != "requested":
-        raise HTTPException(400, "Payout request already processed")
-
     now = datetime.utcnow()
-
-    update_doc = {
-        "status": "processing" if data.action == "approve" else "rejected",
-        "reviewed_at": now,
-        "reviewed_by": str(admin["_id"]),
-        "review_reason": data.reason,
-        "transfer_processed_at": None,
-    }
-
-    await db.payout_requests.update_one({"_id": payout["_id"]}, {"$set": update_doc})
+    current_status = payout.get("status")
+    final_status = current_status
 
     if data.action == "approve":
+        if current_status != "requested":
+            raise HTTPException(400, "Only requested payouts can be approved")
+
+        await db.payout_requests.update_one(
+            {"_id": payout["_id"]},
+            {"$set": {
+                "status": "processing",
+                "reviewed_at": now,
+                "reviewed_by": str(admin["_id"]),
+                "review_reason": data.reason,
+                "transfer_processed_at": None,
+            }},
+        )
         seller = await db.users.find_one({"_id": payout["seller_id"]})
         if not seller:
             await db.payout_requests.update_one(
                 {"_id": payout["_id"]},
                 {"$set": {"status": "failed", "failure_reason": "Seller not found", "failed_at": datetime.utcnow()}},
             )
+            final_status = "failed"
             raise HTTPException(404, "Seller not found")
 
         try:
@@ -621,34 +738,49 @@ async def payout_request_decision(
                 payout_request=payout,
                 seller=seller,
             )
+            next_status = derive_payout_status(provider_meta.get("provider_payout_status"))
+            provider_failure_reason = extract_provider_failure_reason(provider_meta)
+            update_fields = {
+                "status": next_status,
+                "transfer_reference": extract_transfer_reference(provider_meta),
+                "provider": provider_meta["provider"],
+                "provider_contact_id": provider_meta["provider_contact_id"],
+                "provider_fund_account_id": provider_meta["provider_fund_account_id"],
+                "provider_payout_id": provider_meta["provider_payout_id"],
+                "provider_payout_status": provider_meta["provider_payout_status"],
+                "failure_reason": provider_failure_reason if next_status == "failed" else None,
+                "failed_at": datetime.utcnow() if next_status == "failed" else None,
+            }
+            if next_status == "approved":
+                update_fields["transfer_processed_at"] = datetime.utcnow()
             await db.payout_requests.update_one(
                 {"_id": payout["_id"]},
                 {
-                    "$set": {
-                        "status": "approved",
-                        "transfer_reference": provider_meta["provider_payout_id"],
-                        "transfer_processed_at": datetime.utcnow(),
-                        "provider": provider_meta["provider"],
-                        "provider_contact_id": provider_meta["provider_contact_id"],
-                        "provider_fund_account_id": provider_meta["provider_fund_account_id"],
-                        "provider_payout_id": provider_meta["provider_payout_id"],
-                        "provider_payout_status": provider_meta["provider_payout_status"],
-                    }
+                    "$set": update_fields
                 },
             )
             await log_audit(
                 db=db,
                 actor_id=str(admin["_id"]),
                 actor_role="admin",
-                action="EMERGENCY_PAYOUT_APPROVED",
+                action=(
+                    "EMERGENCY_PAYOUT_APPROVED"
+                    if next_status == "approved"
+                    else "EMERGENCY_PAYOUT_FAILED"
+                    if next_status == "failed"
+                    else "EMERGENCY_PAYOUT_PROCESSING"
+                ),
                 metadata={
                     "request_id": request_id,
                     "seller_id": str(seller["_id"]),
                     "provider": provider_meta["provider"],
                     "provider_payout_id": provider_meta["provider_payout_id"],
                     "amount": payout.get("amount"),
+                    "provider_status": provider_meta["provider_payout_status"],
+                    "failure_reason": provider_failure_reason,
                 },
             )
+            final_status = next_status
         except Exception as e:
             await db.payout_requests.update_one(
                 {"_id": payout["_id"]},
@@ -671,20 +803,32 @@ async def payout_request_decision(
                     "error": str(e),
                 },
             )
+            final_status = "failed"
             raise
 
     if data.action == "reject":
-        # Re-credit held emergency payout amount on rejection
-        await db.wallet_ledger.insert_one({
-            "seller_id": payout["seller_id"],
-            "order_id": None,
-            "entry_type": "EMERGENCY_PAYOUT_RELEASE",
-            "credit": payout.get("total_debit", payout["amount"]),
-            "debit": 0,
-            "reason_code": "EMERGENCY_PAYOUT_REJECTED",
-            "reference_id": payout["_id"],
-            "created_at": now,
-        })
+        if current_status not in {"requested", "failed"}:
+            raise HTTPException(400, "Only requested or failed payouts can be rejected")
+        if not data.reason:
+            raise HTTPException(400, "Reason required for rejection")
+
+        await db.payout_requests.update_one(
+            {"_id": payout["_id"]},
+            {"$set": {
+                "status": "rejected",
+                "reviewed_at": now,
+                "reviewed_by": str(admin["_id"]),
+                "review_reason": data.reason,
+                "rejected_at": now,
+            }},
+        )
+        released_hold = await release_emergency_payout_hold(
+            db,
+            payout=payout,
+            admin_id=str(admin["_id"]),
+            reason_code="EMERGENCY_PAYOUT_REJECTED",
+            note=data.reason,
+        )
         await log_audit(
             db=db,
             actor_id=str(admin["_id"]),
@@ -694,13 +838,16 @@ async def payout_request_decision(
                 "request_id": request_id,
                 "seller_id": str(payout["seller_id"]),
                 "amount": payout.get("amount"),
+                "released_hold": released_hold,
+                "reason": data.reason,
             },
         )
+        final_status = "rejected"
 
     return {
         "message": "Payout request updated",
         "request_id": request_id,
-        "status": "approved" if data.action == "approve" else "rejected",
+        "status": final_status,
     }
 
 
@@ -720,6 +867,8 @@ async def retry_failed_payout(
         raise HTTPException(404, "Payout request not found")
     if payout.get("status") != "failed":
         raise HTTPException(400, "Only failed payouts can be retried")
+    if payout.get("hold_released_at"):
+        raise HTTPException(400, "Cannot retry a payout after the seller hold has been released")
 
     seller = await db.users.find_one({"_id": payout["seller_id"]})
     if not seller:
@@ -736,32 +885,45 @@ async def retry_failed_payout(
             payout_request=payout,
             seller=seller,
         )
+        next_status = derive_payout_status(provider_meta.get("provider_payout_status"))
+        provider_failure_reason = extract_provider_failure_reason(provider_meta)
+        update_fields = {
+            "status": next_status,
+            "transfer_reference": extract_transfer_reference(provider_meta),
+            "provider": provider_meta["provider"],
+            "provider_contact_id": provider_meta["provider_contact_id"],
+            "provider_fund_account_id": provider_meta["provider_fund_account_id"],
+            "provider_payout_id": provider_meta["provider_payout_id"],
+            "provider_payout_status": provider_meta["provider_payout_status"],
+            "failure_reason": provider_failure_reason if next_status == "failed" else None,
+            "failed_at": datetime.utcnow() if next_status == "failed" else None,
+        }
+        if next_status == "approved":
+            update_fields["transfer_processed_at"] = datetime.utcnow()
         await db.payout_requests.update_one(
             {"_id": payout["_id"]},
             {
-                "$set": {
-                    "status": "approved",
-                    "transfer_reference": provider_meta["provider_payout_id"],
-                    "transfer_processed_at": datetime.utcnow(),
-                    "provider": provider_meta["provider"],
-                    "provider_contact_id": provider_meta["provider_contact_id"],
-                    "provider_fund_account_id": provider_meta["provider_fund_account_id"],
-                    "provider_payout_id": provider_meta["provider_payout_id"],
-                    "provider_payout_status": provider_meta["provider_payout_status"],
-                    "failure_reason": None,
-                }
+                "$set": update_fields
             },
         )
         await log_audit(
             db=db,
             actor_id=str(admin["_id"]),
             actor_role="admin",
-            action="EMERGENCY_PAYOUT_RETRIED_APPROVED",
+            action=(
+                "EMERGENCY_PAYOUT_RETRIED_APPROVED"
+                if next_status == "approved"
+                else "EMERGENCY_PAYOUT_RETRY_FAILED"
+                if next_status == "failed"
+                else "EMERGENCY_PAYOUT_RETRY_PROCESSING"
+            ),
             metadata={
                 "request_id": request_id,
                 "seller_id": str(seller["_id"]),
                 "provider": provider_meta["provider"],
                 "provider_payout_id": provider_meta["provider_payout_id"],
+                "provider_status": provider_meta["provider_payout_status"],
+                "failure_reason": provider_failure_reason,
             },
         )
     except Exception as e:
@@ -782,7 +944,12 @@ async def retry_failed_payout(
         )
         raise
 
-    return {"message": "Payout retried successfully", "request_id": request_id, "status": "approved"}
+    return {
+        "message": "Payout retry submitted",
+        "request_id": request_id,
+        "status": next_status,
+        "provider_status": provider_meta["provider_payout_status"],
+    }
 
 
 @router.post("/payout-requests/{request_id}/reconcile")
@@ -808,22 +975,30 @@ async def reconcile_payout_status(
         fetch_payout_status,
         provider_payout_id=provider_payout_id,
     )
-    provider_status = (provider_meta.get("provider_payout_status") or "").lower()
+    provider_status = provider_meta.get("provider_payout_status")
+    next_status = derive_payout_status(provider_status)
+    provider_failure_reason = extract_provider_failure_reason(provider_meta)
 
     update_fields = {
         "provider": provider_meta["provider"],
         "provider_payout_id": provider_meta["provider_payout_id"],
         "provider_payout_status": provider_meta["provider_payout_status"],
+        "transfer_reference": extract_transfer_reference(provider_meta),
         "reconciled_at": datetime.utcnow(),
         "reconciled_by": str(admin["_id"]),
+        "status": next_status,
     }
 
-    if provider_status == "processed":
-        update_fields["status"] = "approved"
+    if next_status == "approved":
         update_fields["transfer_processed_at"] = datetime.utcnow()
-    elif provider_status in {"failed", "reversed", "rejected", "cancelled"}:
-        update_fields["status"] = "failed"
+        update_fields["failure_reason"] = None
+        update_fields["failed_at"] = None
+    elif next_status == "failed":
         update_fields["failed_at"] = datetime.utcnow()
+        update_fields["failure_reason"] = provider_failure_reason or "Provider marked payout failed"
+    else:
+        update_fields["failure_reason"] = None
+        update_fields["failed_at"] = None
 
     await db.payout_requests.update_one(
         {"_id": payout["_id"]},
@@ -840,12 +1015,13 @@ async def reconcile_payout_status(
             "provider": provider_meta["provider"],
             "provider_payout_id": provider_meta["provider_payout_id"],
             "provider_status": provider_meta["provider_payout_status"],
+            "failure_reason": provider_failure_reason,
         },
     )
 
     return {
         "message": "Payout reconciled",
         "request_id": request_id,
-        "status": update_fields.get("status", payout.get("status")),
+        "status": next_status,
         "provider_status": provider_meta["provider_payout_status"],
     }
