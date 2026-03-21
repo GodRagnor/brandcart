@@ -1,13 +1,16 @@
 # ===== Python =====
 backend/venv/
+backend/.venv/
 backend/__pycache__/
 backend/**/*.pyc
 backend/.env
+backend/.env.local
 
 # ===== Node / React =====
-frontend/node_modules/
-frontend/build/
-frontend/.env
+brandcart-web/node_modules/
+brandcart-web/dist/
+brandcart-web/.env
+brandcart-web/.env.local
 
 # ===== OS / Editor =====
 .DS_Store

@@ -29,6 +29,13 @@ from utils.razorpay import (
     fetch_razorpay_payment,
     verify_checkout_signature,
 )
+from utils.products import (
+    find_product_variant,
+    get_default_product_variant,
+    release_product_inventory,
+    reserve_product_inventory,
+    serialize_product_variant,
+)
 from config.env import RAZORPAY_KEY_ID, OTP_DEV_MODE
 from pydantic import BaseModel
 from utils.guards import parse_object_id
@@ -102,6 +109,61 @@ def serialize_order_shipping(row: dict) -> dict:
         "last_status_sync_at": shipment.get("last_status_sync_at"),
     }
 
+
+def serialize_order_cancellation(row: dict) -> Optional[dict]:
+    cancellation = row.get("cancellation") or {}
+    cancel_reason = cancellation.get("reason") or row.get("cancel_reason")
+
+    if row.get("status") != "cancelled" and not cancel_reason and not cancellation:
+        return None
+
+    return {
+        "status": "cancelled" if row.get("status") == "cancelled" else cancellation.get("status"),
+        "reason": cancel_reason,
+        "requested_at": cancellation.get("requested_at"),
+        "refund_status": cancellation.get("refund_status"),
+        "refund_amount": cancellation.get("refund_amount"),
+        "refunded_at": cancellation.get("refunded_at"),
+        "refund_note": cancellation.get("refund_note"),
+    }
+
+
+def get_return_window_ends_at(order: dict) -> Optional[datetime]:
+    delivered_at = order.get("delivered_at")
+    if not isinstance(delivered_at, datetime):
+        return None
+    return delivered_at + timedelta(days=RETURN_WINDOW_DAYS)
+
+
+def can_buyer_cancel_order(order: dict) -> bool:
+    return str(order.get("status") or "").strip().lower() == "created"
+
+
+def can_buyer_request_return(order: dict, *, now: Optional[datetime] = None) -> bool:
+    if str(order.get("status") or "").strip().lower() != "delivered":
+        return False
+    if (order.get("return") or {}).get("status") is not None:
+        return False
+    window_ends_at = get_return_window_ends_at(order)
+    if not window_ends_at:
+        return False
+    return (now or datetime.utcnow()) <= window_ends_at
+
+
+def serialize_order_variant(order: dict):
+    variant = order.get("variant") or {}
+    if not variant:
+        return None
+    return {
+        "id": str(variant.get("id")) if variant.get("id") else None,
+        "label": variant.get("label"),
+        "value": variant.get("value"),
+        "name": variant.get("name"),
+        "image": variant.get("image"),
+        "mrp": variant.get("mrp"),
+        "selling_price": variant.get("selling_price"),
+    }
+
 class ReturnRequest(BaseModel):
     reason: str
 
@@ -156,10 +218,15 @@ async def finalize_delivery_confirmation(
     if product.get("reserved_stock", 0) < qty:
         raise HTTPException(409, "Reserved stock corrupted")
 
-    await db.products.update_one(
-        {"_id": product["_id"]},
-        {"$inc": {"reserved_stock": -qty}}
+    released = await release_product_inventory(
+        db,
+        product_id=product["_id"],
+        quantity=qty,
+        variant_id=(order.get("variant") or {}).get("id"),
+        restock=False,
     )
+    if not released:
+        raise HTTPException(409, "Reserved stock corrupted")
 
     await db.orders.update_one(
         {"_id": order["_id"]},
@@ -236,6 +303,7 @@ async def create_order(
     payment_method: str = Query(...),
     address_id: str | None = Query(None),
     offer_id: str | None = Query(None),
+    variant_id: str | None = Query(None),
     idempotency_key: str = Query(...),
     buyer=Depends(require_roles("buyer", "seller")),
     db=Depends(get_db),
@@ -243,6 +311,7 @@ async def create_order(
     now = datetime.utcnow()
     payment_method = normalize_payment_method(payment_method)
     product = None
+    selected_variant = None
     stock_reserved = False
     order_inserted = False
 
@@ -268,12 +337,23 @@ async def create_order(
     try:
         product_oid = parse_object_id(product_id, "product_id")
         offer_oid = parse_object_id(offer_id, "offer_id") if offer_id else None
-
         product = await db.products.find_one({"_id": product_oid})
         if not product:
             raise HTTPException(404, "Product not found")
 
-        base_price = product.get("selling_price")
+        selected_variant = None
+        if product.get("variants"):
+            selected_variant = (
+                find_product_variant(product, variant_id)
+                if variant_id
+                else get_default_product_variant(product)
+            )
+            if not selected_variant:
+                raise HTTPException(400, "Selected variant is unavailable")
+        elif variant_id:
+            raise HTTPException(400, "This product does not support variants")
+
+        base_price = (selected_variant or {}).get("selling_price", product.get("selling_price"))
         if base_price is None:
             raise HTTPException(400, "Product price not configured")
 
@@ -331,6 +411,8 @@ async def create_order(
                 "offer_price": final_price,
             }
 
+        if selected_variant and selected_variant.get("stock", 0) < quantity:
+            raise HTTPException(400, "Selected variant is out of stock")
         if product.get("stock", 0) < quantity:
             raise HTTPException(400, "Insufficient stock")
 
@@ -387,11 +469,13 @@ async def create_order(
             if seller.get("cod_orders_today", 0) >= MAX_DAILY_COD_ORDERS:
                 raise HTTPException(403, "Seller COD daily limit reached")
 
-        result = await db.products.update_one(
-            {"_id": product["_id"], "stock": {"$gte": quantity}},
-            {"$inc": {"stock": -quantity, "reserved_stock": quantity}},
+        reserved_ok = await reserve_product_inventory(
+            db,
+            product=product,
+            quantity=quantity,
+            variant=selected_variant,
         )
-        if result.modified_count == 0:
+        if not reserved_ok:
             raise HTTPException(400, "Stock reservation failed")
         stock_reserved = True
 
@@ -406,6 +490,7 @@ async def create_order(
                     "buyer_id": str(buyer["_id"]),
                     "seller_id": str(seller["_id"]),
                     "product_id": str(product["_id"]),
+                    "variant_id": str(selected_variant["_id"]) if selected_variant else "",
                 },
             )
 
@@ -414,6 +499,7 @@ async def create_order(
             "seller_id": seller["_id"],
             "product_id": product["_id"],
             "quantity": quantity,
+            "variant": serialize_product_variant(selected_variant, include_inventory=False),
             "pricing": {
                 "unit_price": final_price,
                 "subtotal": subtotal,
@@ -501,17 +587,23 @@ async def create_order(
         return response
     except HTTPException:
         if stock_reserved and not order_inserted and product:
-            await db.products.update_one(
-                {"_id": product["_id"]},
-                {"$inc": {"stock": quantity, "reserved_stock": -quantity}},
+            await release_product_inventory(
+                db,
+                product_id=product["_id"],
+                quantity=quantity,
+                variant_id=(selected_variant or {}).get("_id"),
+                restock=True,
             )
         await clear_idempotency_key(db=db, key=idempotency_key, scope="create_order")
         raise
     except Exception as e:
         if stock_reserved and not order_inserted and product:
-            await db.products.update_one(
-                {"_id": product["_id"]},
-                {"$inc": {"stock": quantity, "reserved_stock": -quantity}},
+            await release_product_inventory(
+                db,
+                product_id=product["_id"],
+                quantity=quantity,
+                variant_id=(selected_variant or {}).get("_id"),
+                restock=True,
             )
         await fail_idempotency_key(
             db=db,
@@ -657,10 +749,20 @@ async def buyer_my_orders(
     buyer=Depends(require_roles("buyer", "seller")),
     db=Depends(get_db),
 ):
+    now = datetime.utcnow()
     query = {"buyer_id": buyer["_id"]}
     normalized_status = (status or "all").strip().lower()
     if normalized_status and normalized_status != "all":
-        query["status"] = normalized_status
+        if normalized_status == "return_requested":
+            query["return.status"] = "requested"
+        elif normalized_status == "return_approved":
+            query["return.status"] = "approved"
+        elif normalized_status == "refund_completed":
+            query["return.refund_status"] = "completed"
+        elif normalized_status == "cancellation_refund_pending":
+            query["cancellation.refund_status"] = {"$in": ["pending_manual_review", "processing"]}
+        else:
+            query["status"] = normalized_status
 
     skip = (page - 1) * limit
     total = await db.orders.count_documents(query)
@@ -684,6 +786,8 @@ async def buyer_my_orders(
         snapshot = row.get("seller_snapshot") or {}
         product = products_map.get(row.get("product_id")) or {}
         delivery_partner = row.get("delivery_partner") or {}
+        cancellation = serialize_order_cancellation(row)
+        return_window_ends_at = get_return_window_ends_at(row)
         partner_id_value = delivery_partner.get("id") or delivery_partner.get("_id")
         if partner_id_value is not None:
             partner_id_value = str(partner_id_value)
@@ -709,6 +813,7 @@ async def buyer_my_orders(
                 "id": str(row.get("product_id")) if row.get("product_id") else None,
                 "title": product.get("title"),
                 "image": (product.get("images") or [None])[0],
+                "variant": serialize_order_variant(row),
             },
             "pricing": {
                 "subtotal": pricing.get("subtotal", 0),
@@ -721,9 +826,15 @@ async def buyer_my_orders(
             "return": {
                 "status": ret.get("status"),
                 "reason": ret.get("reason"),
+                "requested_at": ret.get("requested_at"),
+                "seller_action_deadline": ret.get("seller_action_deadline"),
                 "pickup_status": ret.get("pickup_status"),
+                "pickup_completed_at": ret.get("pickup_completed_at"),
                 "refund_status": ret.get("refund_status"),
+                "refund_amount": ret.get("refund_amount"),
+                "refunded_at": ret.get("refunded_at"),
             },
+            "cancellation": cancellation,
             "seller_snapshot": {
                 "brand_name": snapshot.get("brand_name"),
                 "brand_logo": snapshot.get("brand_logo"),
@@ -747,6 +858,11 @@ async def buyer_my_orders(
                 "pincode": delivery.get("pincode"),
             },
             "tracking": tracking_rows[-20:],
+            "actions": {
+                "can_cancel": can_buyer_cancel_order(row),
+                "can_return": can_buyer_request_return(row, now=now),
+            },
+            "return_window_ends_at": return_window_ends_at,
         })
 
     return {
@@ -756,6 +872,139 @@ async def buyer_my_orders(
         "limit": limit,
         "has_more": (skip + len(items)) < total,
         "orders": items,
+    }
+
+
+@router.post("/{order_id}/cancel")
+async def cancel_buyer_order(
+    order_id: str,
+    data: Optional[dict] = None,
+    buyer=Depends(require_roles("buyer", "seller")),
+    db=Depends(get_db),
+):
+    now = datetime.utcnow()
+    order = await db.orders.find_one({
+        "_id": parse_object_id(order_id, "order_id"),
+        "buyer_id": buyer["_id"],
+    })
+    if not order:
+        raise HTTPException(404, "Order not found")
+
+    if not can_buyer_cancel_order(order):
+        raise HTTPException(400, "Order can only be cancelled before shipment")
+
+    if (order.get("return") or {}).get("status") is not None:
+        raise HTTPException(400, "Return already requested for this order")
+
+    reason = str((data or {}).get("reason") or "buyer_requested").strip() or "buyer_requested"
+    payment = order.get("payment") or {}
+    is_prepaid = payment.get("method") == "RAZORPAY" and payment.get("status") == "paid"
+    refund_status = "pending_manual_review" if is_prepaid else None
+    refund_amount = (order.get("pricing") or {}).get("subtotal") if is_prepaid else None
+    payment_status = payment.get("status")
+    if payment.get("method") == "COD":
+        payment_status = "cancelled"
+    elif payment.get("method") == "RAZORPAY" and payment.get("status") == "pending":
+        payment_status = "cancelled"
+
+    update_res = await db.orders.update_one(
+        {
+            "_id": order["_id"],
+            "buyer_id": buyer["_id"],
+            "status": "created",
+        },
+        {
+            "$set": {
+                "status": "cancelled",
+                "cancel_reason": "BUYER_REQUESTED",
+                "payment.status": payment_status,
+                "settlement.status": "cancelled",
+                "settlement.cancelled_at": now,
+                "cancellation": {
+                    "status": "cancelled",
+                    "reason": reason,
+                    "requested_at": now,
+                    "refund_status": refund_status,
+                    "refund_amount": refund_amount,
+                    "refunded_at": None,
+                    "refund_note": (
+                        "Manual refund review is still required for this prepaid order."
+                        if refund_status else None
+                    ),
+                },
+                "updated_at": now,
+            }
+        },
+    )
+    if update_res.modified_count != 1:
+        raise HTTPException(409, "Order is no longer eligible for cancellation")
+
+    released = await release_product_inventory(
+        db,
+        product_id=order["product_id"],
+        quantity=order.get("quantity", 0),
+        variant_id=(order.get("variant") or {}).get("id"),
+        restock=True,
+    )
+    if not released:
+        raise HTTPException(409, "Reserved stock corrupted")
+
+    await log_audit(
+        db=db,
+        actor_id=str(buyer["_id"]),
+        actor_role="buyer",
+        action="ORDER_CANCELLED_BY_BUYER",
+        metadata={
+            "order_id": str(order["_id"]),
+            "seller_id": str(order["seller_id"]),
+            "reason": reason,
+            "refund_status": refund_status,
+        },
+    )
+    await record_order_event(
+        db=db,
+        order_id=order["_id"],
+        event="ORDER_CANCELLED_BY_BUYER",
+        actor_role="buyer",
+        actor_id=buyer["_id"],
+        metadata={
+            "reason": reason,
+            "refund_status": refund_status,
+        },
+    )
+
+    seller_notice = {
+        "type": "order_update",
+        "title": "Order cancelled by buyer",
+        "message": f"Order {str(order['_id'])} was cancelled before shipment.",
+        "order_id": str(order["_id"]),
+        "created_at": now,
+        "read": False,
+    }
+    buyer_notice = {
+        "type": "order_update",
+        "title": "Order cancelled",
+        "message": (
+            "Your order has been cancelled. Refund review is pending for the prepaid amount."
+            if refund_status else "Your order has been cancelled successfully."
+        ),
+        "order_id": str(order["_id"]),
+        "created_at": now,
+        "read": False,
+    }
+    await db.users.update_one(
+        {"_id": order["seller_id"]},
+        {"$push": {"seller_notifications": {"$each": [seller_notice], "$slice": -100}}},
+    )
+    await db.users.update_one(
+        {"_id": order["buyer_id"]},
+        {"$push": {"buyer_notifications": {"$each": [buyer_notice], "$slice": -100}}},
+    )
+
+    return {
+        "message": "Order cancelled successfully",
+        "order_id": str(order["_id"]),
+        "refund_status": refund_status,
     }
 
 # ======================================================
@@ -1246,15 +1495,15 @@ async def cod_rto(
     # --------------------------------------------------
     # 4. RELEASE RESERVED STOCK (SAFE)
     # --------------------------------------------------
-    await db.products.update_one(
-        {"_id": order["product_id"]},
-        {
-            "$inc": {
-                "reserved_stock": -order["quantity"],
-                "stock": order["quantity"],
-            }
-        }
+    released = await release_product_inventory(
+        db,
+        product_id=order["product_id"],
+        quantity=order["quantity"],
+        variant_id=(order.get("variant") or {}).get("id"),
+        restock=True,
     )
+    if not released:
+        raise HTTPException(409, "Reserved stock corrupted")
 
     # --------------------------------------------------
     # 5. UPDATE ORDER
@@ -1815,6 +2064,84 @@ async def system_refund(
     )
 
     return response
+
+
+@router.post("/system/cancellation-refund/{order_id}")
+async def complete_cancellation_refund(
+    order_id: str,
+    admin=Depends(require_role("admin")),
+    db=Depends(get_db),
+):
+    now = datetime.utcnow()
+    order = await db.orders.find_one({"_id": parse_object_id(order_id, "order_id")})
+    if not order:
+        raise HTTPException(404, "Order not found")
+
+    cancellation = order.get("cancellation") or {}
+    payment = order.get("payment") or {}
+    if order.get("status") != "cancelled":
+        raise HTTPException(400, "Only cancelled orders can be refunded here")
+    if payment.get("method") != "RAZORPAY" or payment.get("status") != "paid":
+        raise HTTPException(400, "Only prepaid cancellations need refund review")
+    if cancellation.get("refund_status") == "completed":
+        return {"message": "Cancellation refund already marked completed"}
+
+    refund_amount = cancellation.get("refund_amount")
+    if refund_amount is None:
+        refund_amount = (order.get("pricing") or {}).get("subtotal")
+
+    await db.orders.update_one(
+        {"_id": order["_id"]},
+        {
+            "$set": {
+                "cancellation.refund_status": "completed",
+                "cancellation.refund_amount": refund_amount,
+                "cancellation.refunded_at": now,
+                "cancellation.refund_note": "Refund completion was confirmed by admin.",
+                "updated_at": now,
+            }
+        },
+    )
+
+    await log_audit(
+        db=db,
+        actor_id=str(admin["_id"]),
+        actor_role="admin",
+        action="CANCELLATION_REFUND_COMPLETED",
+        metadata={
+            "order_id": str(order["_id"]),
+            "seller_id": str(order["seller_id"]),
+            "buyer_id": str(order["buyer_id"]),
+            "refund_amount": refund_amount,
+        },
+    )
+    await record_order_event(
+        db=db,
+        order_id=order["_id"],
+        event="CANCELLATION_REFUND_COMPLETED",
+        actor_role="admin",
+        actor_id=admin["_id"],
+        metadata={
+            "refund_amount": refund_amount,
+        },
+    )
+
+    await db.users.update_one(
+        {"_id": order["buyer_id"]},
+        {"$push": {"buyer_notifications": {"$each": [{
+            "type": "refund_update",
+            "title": "Cancellation refund completed",
+            "message": "Your prepaid cancellation refund has been marked completed.",
+            "order_id": str(order["_id"]),
+            "created_at": now,
+            "read": False,
+        }], "$slice": -100}}},
+    )
+
+    return {
+        "message": "Cancellation refund marked completed",
+        "refund_amount": refund_amount,
+    }
 
 # ======================================================
 # RETURN STATUS

@@ -15,6 +15,7 @@ from utils.crypto import encrypt_sensitive_value
 from utils.validators import normalize_phone
 from utils.guards import parse_object_id
 from utils.order_timeline import record_order_event
+from utils.products import release_product_inventory, serialize_product_variant
 from routes.auth import SellerDocuments
 
 router = APIRouter(
@@ -212,6 +213,46 @@ def serialize_wallet_payout_request(row: dict) -> dict:
     }
 
 
+def serialize_wallet_ledger_entry(row: dict) -> dict:
+    entry_id = row.get("_id")
+    order_id = row.get("order_id")
+    reference_id = row.get("reference_id")
+    return {
+        "id": str(entry_id) if entry_id else None,
+        "order_id": str(order_id) if isinstance(order_id, ObjectId) else (str(order_id) if order_id else None),
+        "entry_type": row.get("entry_type"),
+        "credit": float(row.get("credit", 0) or 0),
+        "debit": float(row.get("debit", 0) or 0),
+        "reason_code": row.get("reason_code"),
+        "reference_id": str(reference_id) if isinstance(reference_id, ObjectId) else (str(reference_id) if reference_id else None),
+        "note": row.get("note"),
+        "created_at": row.get("created_at"),
+    }
+
+
+def serialize_seller_offer(row: dict, product: Optional[dict] = None) -> dict:
+    offer_id = row.get("_id")
+    seller_id = row.get("seller_id")
+    product_id = row.get("product_id")
+    festival_id = row.get("festival_id")
+    images = product.get("images") if isinstance(product, dict) else None
+    return {
+        "id": str(offer_id) if offer_id else None,
+        "seller_id": str(seller_id) if isinstance(seller_id, ObjectId) else (str(seller_id) if seller_id else None),
+        "product_id": str(product_id) if isinstance(product_id, ObjectId) else (str(product_id) if product_id else None),
+        "product_title": product.get("title") if isinstance(product, dict) else None,
+        "product_image": (images or [None])[0] if isinstance(images, list) else None,
+        "offer_price": float(row.get("offer_price", 0) or 0),
+        "start_at": row.get("start_at"),
+        "end_at": row.get("end_at"),
+        "festival_id": str(festival_id) if isinstance(festival_id, ObjectId) else (str(festival_id) if festival_id else None),
+        "status": row.get("status"),
+        "used_count": int(row.get("used_count", 0) or 0),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
 async def ensure_delivery_partner_account(
     db,
     *,
@@ -368,10 +409,15 @@ async def finalize_external_delivery(db, *, order: dict, seller_id, message: Opt
     payment = order.get("payment") or {}
     delivered_message = message or "Courier updated order as delivered"
 
-    await db.products.update_one(
-        {"_id": product["_id"]},
-        {"$inc": {"reserved_stock": -qty}}
+    released = await release_product_inventory(
+        db,
+        product_id=product["_id"],
+        quantity=qty,
+        variant_id=(order.get("variant") or {}).get("id"),
+        restock=False,
     )
+    if not released:
+        raise HTTPException(409, "Reserved stock corrupted")
 
     await db.orders.update_one(
         {"_id": order["_id"]},
@@ -793,6 +839,7 @@ async def seller_products(
     cursor = db.products.find({"seller_id": seller["_id"]})
     async for product in cursor:
         reserved = product.get("reserved_stock", 0)
+        variants = [serialize_product_variant(row, include_inventory=True) for row in (product.get("variants") or []) if isinstance(row, dict)]
         products.append({
             "id": str(product["_id"]),
             "title": product["title"],
@@ -801,6 +848,8 @@ async def seller_products(
             "stock": product["stock"],
             "reserved_stock": reserved,
             "available_stock": product["stock"] - reserved,
+            "variant_count": len(variants),
+            "variants": variants,
             "created_at": product["created_at"]
         })
 
@@ -872,6 +921,7 @@ async def seller_orders(
                 "id": str(order.get("product_id")) if order.get("product_id") else None,
                 "title": product.get("title"),
                 "image": (product.get("images") or [None])[0],
+                "variant": order.get("variant"),
             },
             "pricing": {
                 "subtotal": pricing.get("subtotal", 0),
@@ -1604,13 +1654,14 @@ async def get_seller_wallet(
     reserved_balance = await get_reserve_balance(db, seller_id)
     summary = await get_wallet_summary(db, seller_id)
 
-    ledger = (
+    ledger_rows = (
         await db.wallet_ledger
         .find({"seller_id": seller_id})
         .sort("created_at", -1)
         .limit(50)
         .to_list(50)
     )
+    ledger = [serialize_wallet_ledger_entry(row) for row in ledger_rows]
     payout_rows = (
         await db.payout_requests
         .find({"seller_id": seller_id, "type": "emergency"})
@@ -1789,10 +1840,15 @@ async def create_offer(
     db=Depends(get_db),
 ):
     now = datetime.utcnow()
+    if seller.get("seller_status") != "verified":
+        raise HTTPException(403, "Seller not verified")
+    if seller.get("is_frozen") or seller.get("seller_status") == "frozen":
+        raise HTTPException(403, "Seller account frozen")
 
     # 1️⃣ Validate product ownership
+    product_id = parse_object_id(data.product_id, "product_id")
     product = await db.products.find_one({
-        "_id": ObjectId(data.product_id),
+        "_id": product_id,
         "seller_id": seller["_id"],
     })
 
@@ -1810,7 +1866,8 @@ async def create_offer(
     if data.start_at >= data.end_at:
         raise HTTPException(400, "Invalid offer duration")
 
-    # 3️⃣ Enforce SINGLE active offer per product
+    # 3️⃣ Refresh the existing live offer for this product instead of
+    # hard-failing repeated tests from the seller dashboard.
     existing = await db.seller_offers.find_one({
         "product_id": product["_id"],
         "status": "active",
@@ -1818,10 +1875,42 @@ async def create_offer(
     })
 
     if existing:
-        raise HTTPException(
-            400,
-            "An active offer already exists for this product"
+        updated_offer = {
+            **existing,
+            "offer_price": data.offer_price,
+            "start_at": data.start_at,
+            "end_at": data.end_at,
+            "festival_id": None,
+            "updated_at": now,
+        }
+
+        festival_id = None
+        if data.festival_slug:
+            festival = await db.festivals.find_one({
+                "slug": data.festival_slug,
+                "status": "live"
+            })
+
+            if not festival:
+                raise HTTPException(400, "Festival not active")
+
+            festival_id = festival["_id"]
+            updated_offer["festival_id"] = festival_id
+
+        await db.seller_offers.update_one(
+            {"_id": existing["_id"]},
+            {"$set": {
+                "offer_price": data.offer_price,
+                "start_at": data.start_at,
+                "end_at": data.end_at,
+                "festival_id": festival_id,
+                "updated_at": now,
+            }},
         )
+        return {
+            "message": "Offer updated successfully",
+            "offer": serialize_seller_offer(updated_offer, product=product),
+        }
 
     # 4️⃣ Optional Festival Link
     festival_id = None
@@ -1850,9 +1939,12 @@ async def create_offer(
         "updated_at": now,
     }
 
-    await db.seller_offers.insert_one(offer)
+    result = await db.seller_offers.insert_one(offer)
 
-    return {"message": "Offer created successfully"}
+    return {
+        "message": "Offer created successfully",
+        "offer": serialize_seller_offer({**offer, "_id": result.inserted_id}, product=product),
+    }
 
 # ======================================================
 # OFFERS-STOP
@@ -1864,14 +1956,13 @@ async def pause_offer(
     seller=Depends(require_role("seller")),
     db=Depends(get_db),
 ):
-    from bson import ObjectId
-
+    offer_object_id = parse_object_id(offer_id, "offer_id")
     result = await db.seller_offers.update_one(
         {
-            "_id": ObjectId(offer_id),
+            "_id": offer_object_id,
             "seller_id": seller["_id"],
         },
-        {"$set": {"status": "paused"}},
+        {"$set": {"status": "paused", "updated_at": datetime.utcnow()}},
     )
 
     if result.modified_count == 0:
@@ -1889,10 +1980,9 @@ async def delete_offer(
     seller=Depends(require_role("seller")),
     db=Depends(get_db),
 ):
-    from bson import ObjectId
-
+    offer_object_id = parse_object_id(offer_id, "offer_id")
     offer = await db.seller_offers.find_one({
-        "_id": ObjectId(offer_id),
+        "_id": offer_object_id,
         "seller_id": seller["_id"],
     })
 
@@ -1919,4 +2009,15 @@ async def list_offers(
         {"seller_id": seller["_id"]}
     ).sort("created_at", -1).to_list(100)
 
-    return {"offers": offers}
+    product_ids = [row.get("product_id") for row in offers if row.get("product_id")]
+    products_by_id = {}
+    if product_ids:
+        products = await db.products.find(
+            {"_id": {"$in": product_ids}},
+            {"title": 1, "images": 1},
+        ).to_list(len(product_ids))
+        products_by_id = {row["_id"]: row for row in products}
+
+    return {
+        "offers": [serialize_seller_offer(row, product=products_by_id.get(row.get("product_id"))) for row in offers]
+    }

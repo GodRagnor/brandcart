@@ -1,5 +1,8 @@
+from pathlib import Path
+
 from dotenv import load_dotenv
-load_dotenv()
+
+load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 import asyncio
 from fastapi import FastAPI
@@ -25,6 +28,7 @@ from routes.brands import router as brands_router
 from routes.uploads import router as uploads_router
 from routes.cart import router as cart_router
 from routes.questions import router as questions_router
+from routes.wishlist import router as wishlist_router
 
 # WORKERS
 from utils.cod_settlement_worker import cod_settlement_worker
@@ -56,6 +60,7 @@ if not allowed_origins:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$" if ENV != "production" else None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -77,6 +82,7 @@ app.include_router(address_router)
 app.include_router(uploads_router)
 app.include_router(brands_router)
 app.include_router(cart_router)
+app.include_router(wishlist_router)
 app.include_router(questions_router)
 
 # -----------------------------

@@ -1,8 +1,10 @@
+from pathlib import Path
+
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 MONGODB_URI = os.getenv("MONGODB_URI")
 if not MONGODB_URI:

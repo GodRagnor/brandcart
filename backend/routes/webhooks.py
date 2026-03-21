@@ -270,9 +270,25 @@ async def razorpay_webhook(request: Request):
         )
         return response
 
+    if order.get("status") != "created" or order_payment.get("status") != "pending":
+        response = {
+            "ok": True,
+            "ignored": True,
+            "reason": "order_not_payable",
+            "order_status": order.get("status"),
+            "payment_status": order_payment.get("status"),
+        }
+        await complete_idempotency_key(
+            db=db,
+            key=idempotency_key,
+            scope="razorpay_webhook",
+            response=response,
+        )
+        return response
+
     now = datetime.utcnow()
     update_res = await db.orders.update_one(
-        {"_id": order["_id"], "payment.status": "pending"},
+        {"_id": order["_id"], "payment.status": "pending", "status": "created"},
         {
             "$set": {
                 "payment.status": "paid",

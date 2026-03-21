@@ -1,10 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
-import random, hashlib, os, logging
+import logging
 from typing import Optional
 from pydantic import EmailStr
-import re
 from uuid import uuid4
 
 from jose.exceptions import ExpiredSignatureError, JWTError
@@ -12,24 +11,29 @@ from jose.exceptions import ExpiredSignatureError, JWTError
 from database import get_db
 from utils.jwt import ACCESS_TOKEN_TYPE, REFRESH_TOKEN_TYPE, create_access_token, create_refresh_token, decode_token
 from utils.security import ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME, get_current_user, require_role
+from utils.otp import generate_otp, hash_otp
 from utils.validators import normalize_phone
 from utils.audit import log_audit
 from utils.rate_limit import rate_limit
 from utils.otp_notify import notify_otp
-from config.env import BUYER_ACCESS_TOKEN_MINUTES, BUYER_REFRESH_TOKEN_DAYS, SELLER_ACCESS_TOKEN_MINUTES, SELLER_REFRESH_TOKEN_DAYS
+from config.env import (
+    ADMIN_PHONE,
+    AUTH_COOKIE_DOMAIN,
+    AUTH_COOKIE_SAMESITE,
+    AUTH_COOKIE_SECURE,
+    BUYER_ACCESS_TOKEN_MINUTES,
+    BUYER_REFRESH_TOKEN_DAYS,
+    OTP_DEV_MODE,
+    SELLER_ACCESS_TOKEN_MINUTES,
+    SELLER_REFRESH_TOKEN_DAYS,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
-ADMIN_PHONE = os.getenv("ADMIN_PHONE")
-ENV = (os.getenv("ENV", "development") or "development").lower()
-OTP_DEV_MODE = (os.getenv("OTP_DEV_MODE", "true" if ENV != "production" else "false")).lower() in {"1", "true", "yes", "on"}
-
 OTP_EXPIRY_MINUTES = 5
 OTP_MAX_ATTEMPTS = 5
-AUTH_COOKIE_SECURE = ENV == "production"
-AUTH_COOKIE_SAMESITE = "lax"
 
 # ======================
 # Schemas
@@ -41,17 +45,6 @@ class SendOtpRequest(BaseModel):
 class VerifyOtpRequest(BaseModel):
     phone: str
     otp: str
-
-# ======================
-# Helpers
-# ======================
-
-def generate_otp() -> str:
-    return str(random.randint(100000, 999999))
-
-def hash_otp(otp: str) -> str:
-    return hashlib.sha256(otp.encode()).hexdigest()
-
 
 def _session_ttls_for_role(role: str) -> tuple[timedelta, timedelta]:
     normalized_role = (role or "").strip().lower()
@@ -75,6 +68,7 @@ def _set_auth_cookies(response: Response, *, access_token: str, refresh_token: s
         samesite=AUTH_COOKIE_SAMESITE,
         max_age=max(1, int(access_ttl.total_seconds())),
         path="/",
+        domain=AUTH_COOKIE_DOMAIN,
     )
     response.set_cookie(
         key=REFRESH_COOKIE_NAME,
@@ -84,6 +78,7 @@ def _set_auth_cookies(response: Response, *, access_token: str, refresh_token: s
         samesite=AUTH_COOKIE_SAMESITE,
         max_age=max(1, int(refresh_ttl.total_seconds())),
         path="/api/auth",
+        domain=AUTH_COOKIE_DOMAIN,
     )
 
 
@@ -93,12 +88,14 @@ def _clear_auth_cookies(response: Response) -> None:
         path="/",
         secure=AUTH_COOKIE_SECURE,
         samesite=AUTH_COOKIE_SAMESITE,
+        domain=AUTH_COOKIE_DOMAIN,
     )
     response.delete_cookie(
         key=REFRESH_COOKIE_NAME,
         path="/api/auth",
         secure=AUTH_COOKIE_SECURE,
         samesite=AUTH_COOKIE_SAMESITE,
+        domain=AUTH_COOKIE_DOMAIN,
     )
 
 
@@ -147,6 +144,13 @@ async def _create_session_tokens(*, db, user_id, phone: str, role: str, request:
     )
     return access_token, refresh_token, access_ttl, refresh_ttl
 
+
+def _normalize_phone_or_400(phone: str) -> str:
+    try:
+        return normalize_phone(phone)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
 # ======================
 # Send OTP
 # ======================
@@ -154,7 +158,7 @@ async def _create_session_tokens(*, db, user_id, phone: str, role: str, request:
 @router.post("/send-otp", response_model=None)
 async def send_otp(data: SendOtpRequest):
     db = get_db()
-    phone = normalize_phone(data.phone)
+    phone = _normalize_phone_or_400(data.phone)
 
     await rate_limit(
         db=db,
@@ -191,6 +195,10 @@ async def send_otp(data: SendOtpRequest):
         response["otp"] = otp
         logger.warning(f"⚠️  OTP_DEV_MODE: OTP for {phone} is {otp}")
     
+    if not OTP_DEV_MODE and not response["sms_sent"] and not response["email_sent"]:
+        await db.otp_codes.delete_one({"phone": phone})
+        raise HTTPException(status_code=502, detail="OTP could not be delivered. Check SMS/email provider configuration.")
+
     return response
 
 # ======================
@@ -200,7 +208,7 @@ async def send_otp(data: SendOtpRequest):
 @router.post("/verify-otp")
 async def verify_otp(data: VerifyOtpRequest, request: Request, response: Response):
     db = get_db()
-    phone = normalize_phone(data.phone)
+    phone = _normalize_phone_or_400(data.phone)
 
     otp_doc = await db.otp_codes.find_one({"phone": phone})
     if not otp_doc:
@@ -234,6 +242,8 @@ async def verify_otp(data: VerifyOtpRequest, request: Request, response: Respons
             "role": role,
             "seller_status": "none",
             "is_frozen": False,
+            "cart": [],
+            "wishlist": [],
             "created_at": datetime.utcnow(),
             "last_active_at": datetime.utcnow()
         }

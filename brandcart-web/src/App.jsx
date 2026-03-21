@@ -68,7 +68,7 @@ const AUTH_PHONE_KEY = 'brandcartAuthPhone'
 const AUTH_ROLE_KEY = 'brandcartAuthRole'
 const COOKIE_AUTH_TOKEN = '__cookie_session__'
 const ACCOUNT_PROFILE_KEY = 'brandcartAccountProfile'
-const ACCOUNT_CARDS_KEY = 'brandcartSavedCards'
+const LEGACY_ACCOUNT_CARDS_KEY = 'brandcartSavedCards'
 const ACCOUNT_DEVICES_KEY = 'brandcartDeviceSessions'
 const ACCOUNT_NOTIFICATIONS_KEY = 'brandcartNotificationPrefs'
 const ACCOUNT_PRIVACY_KEY = 'brandcartPrivacyPrefs'
@@ -136,6 +136,350 @@ const formatDateTime = (value) => {
   return date.toLocaleString()
 }
 
+const formatStatusText = (value) => {
+  const text = String(value || '').trim()
+  if (!text) {
+    return '-'
+  }
+  return text
+    .replace(/[_-]+/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
+}
+
+const getStatusTone = (value) => {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (['delivered', 'approved', 'completed', 'paid'].includes(normalized)) {
+    return 'positive'
+  }
+  if (['cancelled', 'rejected', 'failed', 'rto'].includes(normalized)) {
+    return 'danger'
+  }
+  if (['requested', 'pending_manual_review', 'scheduled', 'picked_up', 'processing', 'delivery_otp_pending', 'out_for_delivery'].includes(normalized)) {
+    return 'warning'
+  }
+  return 'neutral'
+}
+
+const buyerCancelReasonOptions = [
+  { value: '', label: 'Reason optional' },
+  { value: 'changed_mind', label: 'Changed my mind' },
+  { value: 'ordered_by_mistake', label: 'Ordered by mistake' },
+  { value: 'need_faster_delivery', label: 'Need faster delivery' },
+  { value: 'price_issue', label: 'Found a better price' },
+]
+
+const buyerReturnReasonOptions = [
+  { value: '', label: 'Choose return reason' },
+  { value: 'damaged', label: 'Product arrived damaged' },
+  { value: 'wrong_item', label: 'Wrong item received' },
+  { value: 'defective', label: 'Product is defective' },
+  { value: 'missing_item', label: 'Missing item or accessory' },
+  { value: 'quality_issue', label: 'Quality not as expected' },
+]
+
+const buyerOrderStatusOptions = [
+  { value: 'all', label: 'All orders' },
+  { value: 'created', label: 'Processing' },
+  { value: 'shipped', label: 'Shipped' },
+  { value: 'out_for_delivery', label: 'Out for delivery' },
+  { value: 'delivery_otp_pending', label: 'Delivery OTP pending' },
+  { value: 'delivered', label: 'Delivered' },
+  { value: 'cancelled', label: 'Cancelled' },
+  { value: 'rto', label: 'RTO' },
+  { value: 'return_requested', label: 'Return requested' },
+  { value: 'return_approved', label: 'Return approved' },
+  { value: 'refund_completed', label: 'Refund completed' },
+  { value: 'cancellation_refund_pending', label: 'Cancellation refund pending' },
+]
+
+const createSellerVariantDraft = () => ({
+  id: (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : `variant-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  label: 'Size',
+  value: '',
+  mrp: '',
+  selling_price: '',
+  stock: '',
+  image: '',
+  sku: '',
+})
+
+const getProductVariants = (product) => {
+  if (!Array.isArray(product?.variants)) {
+    return []
+  }
+  return product.variants.filter((variant) => variant && typeof variant === 'object' && variant.id)
+}
+
+const getVariantDisplayLabel = (variant) => {
+  if (!variant || typeof variant !== 'object') {
+    return 'Variant'
+  }
+  const label = String(variant.label || '').trim()
+  const value = String(variant.value || '').trim()
+  if (label && value) {
+    return `${label}: ${value}`
+  }
+  return value || label || String(variant.name || 'Variant')
+}
+
+const getDefaultProductVariant = (product) => {
+  const variants = getProductVariants(product)
+  if (!variants.length) {
+    return null
+  }
+  const preferredId = String(product?.selected_variant?.id || product?.default_variant?.id || '').trim()
+  if (preferredId) {
+    const matched = variants.find((variant) => String(variant?.id || '').trim() === preferredId)
+    if (matched) {
+      return matched
+    }
+  }
+  return variants[0]
+}
+
+const getProductActiveOffer = (product) => {
+  const offer = product?.active_offer
+  if (!offer || typeof offer !== 'object') {
+    return null
+  }
+
+  const offerPrice = Number(offer.offer_price)
+  if (!Number.isFinite(offerPrice) || offerPrice <= 0) {
+    return null
+  }
+
+  return {
+    ...offer,
+    id: String(offer.id || ''),
+    offer_price: offerPrice,
+    savings_amount: Number.isFinite(Number(offer.savings_amount)) ? Number(offer.savings_amount) : null,
+    savings_percent: Number.isFinite(Number(offer.savings_percent)) ? Number(offer.savings_percent) : null,
+  }
+}
+
+const resolveOfferReferencePrice = (mrp, basePrice) => {
+  const parsedMrp = Number(mrp)
+  const parsedBasePrice = Number(basePrice)
+  const hasValidMrp = Number.isFinite(parsedMrp) && parsedMrp > 0
+  const hasValidBasePrice = Number.isFinite(parsedBasePrice) && parsedBasePrice > 0
+
+  if (hasValidMrp && hasValidBasePrice) {
+    return Math.max(parsedMrp, parsedBasePrice)
+  }
+  if (hasValidMrp) {
+    return parsedMrp
+  }
+  return hasValidBasePrice ? parsedBasePrice : null
+}
+
+const getProductPricingMeta = (product) => {
+  const activeVariant = getDefaultProductVariant(product)
+  const basePrice = Number(activeVariant?.selling_price ?? product?.selling_price)
+  const mrp = Number(activeVariant?.mrp ?? product?.mrp)
+  const activeOffer = getProductActiveOffer(product)
+  const hasValidBasePrice = Number.isFinite(basePrice) && basePrice > 0
+  const hasValidMrp = Number.isFinite(mrp) && mrp > 0
+  const offerReferencePrice = resolveOfferReferencePrice(mrp, basePrice)
+  const hasOffer = Boolean(activeOffer && hasValidBasePrice && activeOffer.offer_price < basePrice)
+  const effectivePrice = hasOffer ? activeOffer.offer_price : (hasValidBasePrice ? basePrice : null)
+  const comparePrice = hasOffer
+    ? offerReferencePrice
+    : (hasValidMrp && hasValidBasePrice && mrp > basePrice ? mrp : null)
+  const hasComparePrice = Number.isFinite(comparePrice) && comparePrice > Number(effectivePrice || 0)
+  const savingsAmount = hasComparePrice ? Math.max(0, Number(comparePrice) - Number(effectivePrice || 0)) : null
+  const savingsPercent = hasComparePrice && Number(effectivePrice || 0) > 0
+    ? Math.round((Number(savingsAmount || 0) / Number(comparePrice)) * 100)
+    : null
+  const discountBadgeLabel = hasComparePrice
+    ? (Number.isFinite(Number(savingsPercent)) && Number(savingsPercent) > 0 ? `${Number(savingsPercent)}% off` : (activeOffer?.festival_name || 'Discount'))
+    : null
+
+  return {
+    activeOffer: hasOffer ? activeOffer : null,
+    activeVariant,
+    basePrice: hasValidBasePrice ? basePrice : null,
+    effectivePrice,
+    comparePrice,
+    hasComparePrice,
+    savingsAmount,
+    savingsPercent,
+    discountBadgeLabel,
+    mrp: hasValidMrp ? mrp : null,
+  }
+}
+
+const buildCartItemFromProduct = (product, preferredImage = '') => {
+  if (!product?.id) {
+    return null
+  }
+
+  const pricing = getProductPricingMeta(product)
+  const activeVariant = pricing.activeVariant
+  const fallbackImage = Array.isArray(product.images) && product.images.length > 0 ? product.images[0] : null
+  const image = preferredImage || activeVariant?.image || fallbackImage || null
+  const variantId = String(activeVariant?.id || '').trim()
+
+  return {
+    id: product.id,
+    cart_key: variantId ? `${product.id}:${variantId}` : product.id,
+    title: product.title,
+    image,
+    price: pricing.effectivePrice ?? Number(product?.selling_price || 0),
+    base_price: pricing.activeOffer && pricing.hasComparePrice ? pricing.comparePrice : null,
+    offer_id: pricing.activeOffer?.id || '',
+    variant_id: variantId,
+    variant_label: activeVariant ? getVariantDisplayLabel(activeVariant) : '',
+    qty: 1,
+  }
+}
+
+const buildCartEntryKey = (productId, variantId = '') => {
+  const normalizedProductId = String(productId || '').trim()
+  const normalizedVariantId = String(variantId || '').trim()
+  if (!normalizedProductId) {
+    return ''
+  }
+  return normalizedVariantId ? `${normalizedProductId}:${normalizedVariantId}` : normalizedProductId
+}
+
+const normalizeServerCartItems = (items) => (
+  (Array.isArray(items) ? items : [])
+    .map((item) => {
+      const productId = String(item?.id || item?.product_id || '').trim()
+      if (!productId) {
+        return null
+      }
+
+      const variantId = String(item?.variant_id || '').trim()
+      const qty = Math.max(1, Number.parseInt(item?.qty ?? item?.quantity ?? 1, 10) || 1)
+      const parsedPrice = Number(item?.price ?? item?.unit_price ?? item?.selling_price ?? 0)
+      const parsedBasePrice = Number(item?.base_price)
+      const image = item?.image || (Array.isArray(item?.images) && item.images.length > 0 ? item.images[0] : null) || null
+
+      return {
+        id: productId,
+        cart_key: String(item?.cart_key || buildCartEntryKey(productId, variantId)),
+        title: item?.title || 'Product',
+        image,
+        price: Number.isFinite(parsedPrice) ? parsedPrice : 0,
+        base_price: Number.isFinite(parsedBasePrice) ? parsedBasePrice : null,
+        offer_id: String(item?.offer_id || '').trim(),
+        variant_id: variantId,
+        variant_label: String(item?.variant_label || '').trim(),
+        qty,
+      }
+    })
+    .filter(Boolean)
+)
+
+const buildCartSyncPayload = (items) => {
+  const ordered = []
+  const byKey = new Map()
+
+  for (const item of (Array.isArray(items) ? items : [])) {
+    const productId = String(item?.id || item?.product_id || '').trim()
+    if (!productId) {
+      continue
+    }
+
+    const variantId = String(item?.variant_id || '').trim()
+    const key = buildCartEntryKey(productId, variantId)
+    const quantity = Math.max(1, Number.parseInt(item?.qty ?? item?.quantity ?? 1, 10) || 1)
+    const payload = {
+      product_id: productId,
+      quantity,
+      ...(variantId ? { variant_id: variantId } : {}),
+    }
+    const offerId = String(item?.offer_id || '').trim()
+    if (offerId) {
+      payload.offer_id = offerId
+    }
+
+    if (!byKey.has(key)) {
+      byKey.set(key, payload)
+      ordered.push(key)
+      continue
+    }
+
+    const existing = byKey.get(key)
+    existing.quantity = quantity
+    if (payload.offer_id) {
+      existing.offer_id = payload.offer_id
+    }
+  }
+
+  return ordered.map((key) => byKey.get(key)).filter(Boolean)
+}
+
+const buildWishlistSyncPayload = (ids) => {
+  const ordered = []
+  const seen = new Set()
+
+  for (const value of (Array.isArray(ids) ? ids : [])) {
+    const productId = String(value || '').trim()
+    if (!productId || seen.has(productId)) {
+      continue
+    }
+    seen.add(productId)
+    ordered.push(productId)
+  }
+
+  return ordered
+}
+
+const mergeCartSyncPayloads = (serverPayload, localPayload) => {
+  const ordered = []
+  const byKey = new Map()
+  const mergeItem = (item) => {
+    const productId = String(item?.product_id || '').trim()
+    if (!productId) {
+      return
+    }
+
+    const variantId = String(item?.variant_id || '').trim()
+    const key = buildCartEntryKey(productId, variantId)
+    const quantity = Math.max(1, Number.parseInt(item?.quantity ?? 1, 10) || 1)
+    if (!byKey.has(key)) {
+      byKey.set(key, {
+        product_id: productId,
+        quantity,
+        ...(variantId ? { variant_id: variantId } : {}),
+        ...(item?.offer_id ? { offer_id: item.offer_id } : {}),
+      })
+      ordered.push(key)
+      return
+    }
+
+    const existing = byKey.get(key)
+    existing.quantity = Math.max(existing.quantity || 1, quantity)
+    if (!existing.offer_id && item?.offer_id) {
+      existing.offer_id = item.offer_id
+    }
+  }
+
+  ;(Array.isArray(serverPayload) ? serverPayload : []).forEach(mergeItem)
+  ;(Array.isArray(localPayload) ? localPayload : []).forEach(mergeItem)
+
+  return ordered.map((key) => byKey.get(key)).filter(Boolean)
+}
+
+const mergeWishlistSyncPayloads = (serverIds, localIds) => (
+  buildWishlistSyncPayload([
+    ...(Array.isArray(serverIds) ? serverIds : []),
+    ...(Array.isArray(localIds) ? localIds : []),
+  ])
+)
+
+const buildCollectionsSyncSignature = (cartPayload, wishlistPayload) => JSON.stringify({
+  cart: [...(Array.isArray(cartPayload) ? cartPayload : [])].sort((left, right) => (
+    buildCartEntryKey(left?.product_id, left?.variant_id).localeCompare(buildCartEntryKey(right?.product_id, right?.variant_id))
+  )),
+  wishlist: [...(Array.isArray(wishlistPayload) ? wishlistPayload : [])].sort(),
+})
+
 const normalizeOrderStatus = (value) => String(value || '').trim().toLowerCase()
 
 const buildOrderTrackingTimeline = (order) => {
@@ -170,6 +514,15 @@ const buildOrderTrackingTimeline = (order) => {
     })
   }
 
+  if (status === 'cancelled') {
+    steps.push({
+      event: 'CANCELLED',
+      label: 'Cancelled',
+      created_at: order?.cancellation?.requested_at || order?.updated_at || null,
+      done: true,
+    })
+  }
+
   const returnStatus = normalizeOrderStatus(order?.return?.status)
   if (returnStatus === 'requested') {
     steps.push({ event: 'RETURN_REQUESTED', label: 'Return Requested', created_at: order?.updated_at || null, done: true })
@@ -179,8 +532,34 @@ const buildOrderTrackingTimeline = (order) => {
     steps.push({ event: 'RETURN_REJECTED', label: 'Return Rejected', created_at: order?.updated_at || null, done: true })
   }
 
+  const pickupStatus = normalizeOrderStatus(order?.return?.pickup_status)
+  if (pickupStatus === 'scheduled') {
+    steps.push({
+      event: 'RETURN_PICKUP_SCHEDULED',
+      label: 'Pickup Scheduled',
+      created_at: order?.return?.pickup_at || order?.updated_at || null,
+      done: true,
+    })
+  } else if (pickupStatus === 'picked_up') {
+    steps.push({
+      event: 'RETURN_PICKED_UP',
+      label: 'Product Picked Up',
+      created_at: order?.return?.pickup_completed_at || order?.updated_at || null,
+      done: true,
+    })
+  }
+
   if (normalizeOrderStatus(order?.return?.refund_status) === 'completed') {
     steps.push({ event: 'REFUND_COMPLETED', label: 'Refund Completed', created_at: order?.updated_at || null, done: true })
+  }
+
+  if (normalizeOrderStatus(order?.cancellation?.refund_status) === 'completed') {
+    steps.push({
+      event: 'CANCELLATION_REFUND_COMPLETED',
+      label: 'Cancellation Refund Completed',
+      created_at: order?.cancellation?.refunded_at || order?.updated_at || null,
+      done: true,
+    })
   }
 
   return steps
@@ -483,11 +862,15 @@ function App() {
   const [products, setProducts] = useState([])
   const [isLoadingProducts, setIsLoadingProducts] = useState(true)
   const [productsError, setProductsError] = useState('')
+  const [offerHighlights, setOfferHighlights] = useState([])
+  const [isLoadingOfferHighlights, setIsLoadingOfferHighlights] = useState(false)
+  const [offerHighlightsError, setOfferHighlightsError] = useState('')
 
   const [activeProductId, setActiveProductId] = useState('')
   const [activeProductSummary, setActiveProductSummary] = useState(null)
   const [productDetail, setProductDetail] = useState(null)
   const [selectedImage, setSelectedImage] = useState('')
+  const [selectedVariantId, setSelectedVariantId] = useState('')
   const [isLoadingDetail, setIsLoadingDetail] = useState(false)
   const [detailError, setDetailError] = useState('')
 
@@ -523,6 +906,8 @@ function App() {
   const [isVerifyingOtp, setIsVerifyingOtp] = useState(false)
   const [isOtpSent, setIsOtpSent] = useState(false)
   const [checkoutPending, setCheckoutPending] = useState(false)
+  const [checkoutFlow, setCheckoutFlow] = useState(null)
+  const [buyNowItem, setBuyNowItem] = useState(null)
   const [addresses, setAddresses] = useState([])
   const [isLoadingAddresses, setIsLoadingAddresses] = useState(false)
   const [isSavingAddress, setIsSavingAddress] = useState(false)
@@ -536,6 +921,9 @@ function App() {
   const [buyerOrderTimeline, setBuyerOrderTimeline] = useState([])
   const [isLoadingBuyerTimeline, setIsLoadingBuyerTimeline] = useState(false)
   const [activeBuyerTimelineOrderId, setActiveBuyerTimelineOrderId] = useState('')
+  const [buyerUpdatingOrderActionId, setBuyerUpdatingOrderActionId] = useState('')
+  const [buyerCancelReasonDrafts, setBuyerCancelReasonDrafts] = useState({})
+  const [buyerReturnReasonDrafts, setBuyerReturnReasonDrafts] = useState({})
   const [deliveryPincode, setDeliveryPincode] = useState('')
   const [isCheckingDelivery, setIsCheckingDelivery] = useState(false)
   const [deliveryCheck, setDeliveryCheck] = useState({
@@ -553,12 +941,6 @@ function App() {
     email: '',
     gender: 'Prefer not to say',
   }))
-  const [savedCards, setSavedCards] = useState([]) // Security: Cards should never be stored client-side
-  const [cardForm, setCardForm] = useState({
-    holder: '',
-    number: '',
-    expiry: '',
-  })
   const [deviceSessions, setDeviceSessions] = useState(() => readStoredJson(ACCOUNT_DEVICES_KEY, []))
   const [notificationPrefs, setNotificationPrefs] = useState(() => readStoredJson(ACCOUNT_NOTIFICATIONS_KEY, {
     orderUpdates: true,
@@ -637,6 +1019,7 @@ function App() {
     stock: '',
     images: '',
   })
+  const [sellerProductVariants, setSellerProductVariants] = useState([])
   const [isCreatingSellerProduct, setIsCreatingSellerProduct] = useState(false)
   const [sellerProductUploadFiles, setSellerProductUploadFiles] = useState([])
   const [isUploadingSellerProductImages, setIsUploadingSellerProductImages] = useState(false)
@@ -702,6 +1085,8 @@ function App() {
   const [isLoadingAdminFinanceSummary, setIsLoadingAdminFinanceSummary] = useState(false)
   const [adminOrderSummary, setAdminOrderSummary] = useState(null)
   const [isLoadingAdminOrderSummary, setIsLoadingAdminOrderSummary] = useState(false)
+  const [adminOrderCareCases, setAdminOrderCareCases] = useState(null)
+  const [isLoadingAdminOrderCareCases, setIsLoadingAdminOrderCareCases] = useState(false)
   const [adminPayoutRequests, setAdminPayoutRequests] = useState([])
   const [adminPayoutStatusFilter, setAdminPayoutStatusFilter] = useState('')
   const [isLoadingAdminPayoutRequests, setIsLoadingAdminPayoutRequests] = useState(false)
@@ -711,6 +1096,9 @@ function App() {
   const [adminUpdatingSellerActionId, setAdminUpdatingSellerActionId] = useState('')
   const [adminRiskSnapshots, setAdminRiskSnapshots] = useState({})
   const [adminLoadingRiskSellerId, setAdminLoadingRiskSellerId] = useState('')
+  const [adminOffersSummary, setAdminOffersSummary] = useState(null)
+  const [isLoadingAdminOffersSummary, setIsLoadingAdminOffersSummary] = useState(false)
+  const [adminUpdatingOrderCareId, setAdminUpdatingOrderCareId] = useState('')
   const [commissionInput, setCommissionInput] = useState('')
   const [isUpdatingCommission, setIsUpdatingCommission] = useState(false)
   const [festivalForm, setFestivalForm] = useState({
@@ -721,6 +1109,10 @@ function App() {
     eligible_tiers: 'verified_fast',
   })
   const [isCreatingFestival, setIsCreatingFestival] = useState(false)
+  const hasHydratedSyncedCollectionsRef = useRef(false)
+  const syncedCollectionsSignatureRef = useRef('')
+  const collectionSyncNoticeRef = useRef(false)
+  const collectionSyncRequestIdRef = useRef(0)
   const [addressForm, setAddressForm] = useState({
     name: '',
     phone: '',
@@ -855,21 +1247,53 @@ function App() {
   const loadProducts = async (search = '') => {
     setIsLoadingProducts(true)
     setProductsError('')
+    const trimmedSearch = search.trim()
+    const shouldLoadHighlights = !trimmedSearch
+
+    if (shouldLoadHighlights) {
+      setIsLoadingOfferHighlights(true)
+      setOfferHighlightsError('')
+    } else {
+      setOfferHighlights([])
+      setOfferHighlightsError('')
+      setIsLoadingOfferHighlights(false)
+    }
 
     try {
-      const path = search.trim()
-        ? `/api/products?search=${encodeURIComponent(search.trim())}`
+      const path = trimmedSearch
+        ? `/api/products?search=${encodeURIComponent(trimmedSearch)}`
         : '/api/products/trending?limit=24'
 
-      const data = await apiGet(path)
+      const [data, highlightData] = await Promise.all([
+        apiGet(path),
+        shouldLoadHighlights
+          ? apiGet('/api/products/offer-highlights?limit=6').catch((error) => ({ __error: error }))
+          : Promise.resolve(null),
+      ])
       const list = Array.isArray(data) ? data : []
       const withReviews = await attachReviewStats(list)
       setProducts(withReviews)
+
+      if (shouldLoadHighlights) {
+        if (highlightData?.__error) {
+          setOfferHighlights([])
+          setOfferHighlightsError(highlightData.__error instanceof Error ? highlightData.__error.message : 'Failed to load live offers')
+        } else {
+          setOfferHighlights(Array.isArray(highlightData?.highlights) ? highlightData.highlights : [])
+          setOfferHighlightsError('')
+        }
+      }
     } catch (error) {
       setProducts([])
       setProductsError(error instanceof Error ? error.message : 'Failed to load products')
+      if (shouldLoadHighlights) {
+        setOfferHighlights([])
+      }
     } finally {
       setIsLoadingProducts(false)
+      if (shouldLoadHighlights) {
+        setIsLoadingOfferHighlights(false)
+      }
     }
   }
 
@@ -886,17 +1310,25 @@ function App() {
     setIsOtpSent(false)
     setAuthOtpInput('')
     setCheckoutPending(false)
+    setCheckoutFlow(null)
+    setBuyNowItem(null)
     setAddresses([])
+    setSelectedCheckoutAddress(null)
+    setPaymentError('')
     setBuyerOrders([])
     setBuyerOrderTimeline([])
     setActiveBuyerTimelineOrderId('')
+    setBuyerCancelReasonDrafts({})
+    setBuyerReturnReasonDrafts({})
     setAdminSellerRequests([])
     setAdminActiveSellers([])
     setAdminSellerRanking([])
     setAdminRiskDashboard(null)
     setAdminFinanceSummary(null)
     setAdminOrderSummary(null)
+    setAdminOrderCareCases(null)
     setAdminPayoutRequests([])
+    setAdminOffersSummary(null)
     setAdminRiskSnapshots({})
     setAdminRejectReasons({})
     setActiveQuickPanel('')
@@ -910,6 +1342,93 @@ function App() {
     })
   }
 
+  const hydrateSyncedCollections = useEffectEvent(async () => {
+    const requestId = collectionSyncRequestIdRef.current + 1
+    collectionSyncRequestIdRef.current = requestId
+    const localCartPayload = buildCartSyncPayload(cartItems)
+    const localWishlistPayload = buildWishlistSyncPayload(wishlistIds)
+
+    try {
+      const [remoteCart, remoteWishlist] = await Promise.all([
+        apiGet('/api/cart', { token: authToken }),
+        apiGet('/api/wishlist', { token: authToken }),
+      ])
+
+      const mergedCartPayload = mergeCartSyncPayloads(
+        buildCartSyncPayload(remoteCart?.items),
+        localCartPayload,
+      )
+      const mergedWishlistPayload = mergeWishlistSyncPayloads(
+        remoteWishlist?.product_ids,
+        localWishlistPayload,
+      )
+
+      const [nextCart, nextWishlist] = await Promise.all([
+        apiPost('/api/cart/sync', { items: mergedCartPayload }, { token: authToken }),
+        apiPost('/api/wishlist/sync', { product_ids: mergedWishlistPayload }, { token: authToken }),
+      ])
+
+      if (requestId !== collectionSyncRequestIdRef.current) {
+        return
+      }
+
+      const nextCartItems = normalizeServerCartItems(nextCart?.items)
+      const nextWishlistIds = buildWishlistSyncPayload(nextWishlist?.product_ids)
+      syncedCollectionsSignatureRef.current = buildCollectionsSyncSignature(
+        buildCartSyncPayload(nextCartItems),
+        nextWishlistIds,
+      )
+      hasHydratedSyncedCollectionsRef.current = true
+      collectionSyncNoticeRef.current = false
+      setCartItems(nextCartItems)
+      setWishlistIds(nextWishlistIds)
+    } catch (error) {
+      if (requestId !== collectionSyncRequestIdRef.current) {
+        return
+      }
+      hasHydratedSyncedCollectionsRef.current = true
+      if (!collectionSyncNoticeRef.current) {
+        const message = error instanceof Error ? error.message : 'Account sync is unavailable right now'
+        flashNotice(message === 'Authentication required' ? 'Login to sync cart and wishlist' : 'Account sync unavailable. Using this device copy for now.')
+        collectionSyncNoticeRef.current = true
+      }
+    }
+  })
+
+  const pushSyncedCollections = useEffectEvent(async (cartPayload, wishlistPayload) => {
+    const requestId = collectionSyncRequestIdRef.current + 1
+    collectionSyncRequestIdRef.current = requestId
+    try {
+      const [nextCart, nextWishlist] = await Promise.all([
+        apiPost('/api/cart/sync', { items: cartPayload }, { token: authToken }),
+        apiPost('/api/wishlist/sync', { product_ids: wishlistPayload }, { token: authToken }),
+      ])
+
+      if (requestId !== collectionSyncRequestIdRef.current) {
+        return
+      }
+
+      const nextCartItems = normalizeServerCartItems(nextCart?.items)
+      const nextWishlistIds = buildWishlistSyncPayload(nextWishlist?.product_ids)
+      syncedCollectionsSignatureRef.current = buildCollectionsSyncSignature(
+        buildCartSyncPayload(nextCartItems),
+        nextWishlistIds,
+      )
+      collectionSyncNoticeRef.current = false
+      setCartItems(nextCartItems)
+      setWishlistIds(nextWishlistIds)
+    } catch (error) {
+      if (requestId !== collectionSyncRequestIdRef.current) {
+        return
+      }
+      if (!collectionSyncNoticeRef.current) {
+        const message = error instanceof Error ? error.message : 'Account sync is unavailable right now'
+        flashNotice(message === 'Authentication required' ? 'Login to sync cart and wishlist' : 'Account sync unavailable. Using this device copy for now.')
+        collectionSyncNoticeRef.current = true
+      }
+    }
+  })
+
   useEffect(() => {
     loadProductsEffect()
   }, [])
@@ -921,6 +1440,41 @@ function App() {
   useEffect(() => {
     localStorage.setItem('brandcartWishlist', JSON.stringify(Array.isArray(wishlistIds) ? wishlistIds : []))
   }, [wishlistIds])
+
+  useEffect(() => {
+    localStorage.removeItem(LEGACY_ACCOUNT_CARDS_KEY)
+  }, [])
+
+  useEffect(() => {
+    if (!authToken || isRestoringSession) {
+      hasHydratedSyncedCollectionsRef.current = false
+      syncedCollectionsSignatureRef.current = ''
+      collectionSyncNoticeRef.current = false
+      collectionSyncRequestIdRef.current = 0
+      return
+    }
+
+    hydrateSyncedCollections()
+  }, [authToken, isRestoringSession])
+
+  useEffect(() => {
+    if (!authToken || isRestoringSession || !hasHydratedSyncedCollectionsRef.current) {
+      return
+    }
+
+    const cartPayload = buildCartSyncPayload(cartItems)
+    const wishlistPayload = buildWishlistSyncPayload(wishlistIds)
+    const signature = buildCollectionsSyncSignature(cartPayload, wishlistPayload)
+    if (signature === syncedCollectionsSignatureRef.current) {
+      return
+    }
+
+    const timeoutId = setTimeout(() => {
+      pushSyncedCollections(cartPayload, wishlistPayload)
+    }, 250)
+
+    return () => clearTimeout(timeoutId)
+  }, [authToken, isRestoringSession, cartItems, wishlistIds])
 
   useEffect(() => {
     localStorage.removeItem(AUTH_TOKEN_KEY)
@@ -1291,6 +1845,11 @@ function App() {
       try {
         const detail = await apiGet(`/api/products/${activeProductId}`)
         setProductDetail(detail)
+        if (Array.isArray(detail?.variants) && detail.variants.length > 0) {
+          setSelectedVariantId(String(detail?.default_variant?.id || detail.variants[0]?.id || ''))
+        } else {
+          setSelectedVariantId('')
+        }
         if (Array.isArray(detail?.images) && detail.images.length > 0) {
           setSelectedImage(detail.images[0])
         } else {
@@ -1298,6 +1857,7 @@ function App() {
         }
       } catch (error) {
         setProductDetail(null)
+        setSelectedVariantId('')
         setDetailError(error instanceof Error ? error.message : 'Failed to load product detail')
       } finally {
         setIsLoadingDetail(false)
@@ -1379,6 +1939,11 @@ function App() {
       return
     }
 
+    if (productDetail?.seller) {
+      setSellerProfile(productDetail.seller)
+      return
+    }
+
     if (activeProductSummary?.seller) {
       setSellerProfile(activeProductSummary.seller)
       return
@@ -1408,7 +1973,7 @@ function App() {
     }
 
     loadSellerFallback()
-  }, [activeProductId, activeProductSummary])
+  }, [activeProductId, activeProductSummary, productDetail?.seller])
 
   useEffect(() => {
     if (!activeProductId || !productDetail?.category) {
@@ -1521,11 +2086,16 @@ function App() {
   const openAddressPanel = () => {
     if (!isLoggedIn) {
       setCheckoutPending(false)
+      setCheckoutFlow(null)
+      setBuyNowItem(null)
       setActiveQuickPanel('auth')
       flashNotice('Login required')
       return
     }
+    setCheckoutFlow(null)
+    setBuyNowItem(null)
     setSelectedCheckoutAddress(null)
+    setPaymentError('')
     setActiveQuickPanel('address')
     loadAddresses()
   }
@@ -1673,6 +2243,11 @@ function App() {
   }
 
   const proceedToPayment = (selectedAddress) => {
+    if (!checkoutFlow || (checkoutFlow === 'buy_now' && !buyNowItem)) {
+      setSelectedCheckoutAddress(selectedAddress || null)
+      flashNotice('Address selected')
+      return
+    }
     setSelectedCheckoutAddress(selectedAddress || null)
     setSelectedPaymentMethod('RAZORPAY')
     setPaymentError('')
@@ -1715,7 +2290,7 @@ function App() {
     return razorpayCheckoutPromise
   }
 
-  const buildCreateOrderPath = ({ productId, quantity, paymentMethod, addressId, idempotencyKey }) => {
+  const buildCreateOrderPath = ({ productId, quantity, paymentMethod, addressId, idempotencyKey, offerId, variantId }) => {
     const params = new URLSearchParams({
       product_id: String(productId),
       quantity: String(quantity),
@@ -1724,6 +2299,12 @@ function App() {
     })
     if (addressId) {
       params.set('address_id', String(addressId))
+    }
+    if (offerId) {
+      params.set('offer_id', String(offerId))
+    }
+    if (variantId) {
+      params.set('variant_id', String(variantId))
     }
     return `/api/orders/create?${params.toString()}`
   }
@@ -1735,7 +2316,11 @@ function App() {
     }
 
     const results = []
-    for (const item of cartItems) {
+    const itemsToCheckout = checkoutItems
+    if (!itemsToCheckout.length) {
+      throw new Error('Cart is empty')
+    }
+    for (const item of itemsToCheckout) {
       const response = await apiPost(
         buildCreateOrderPath({
           productId: item.id,
@@ -1743,6 +2328,8 @@ function App() {
           paymentMethod: 'COD',
           addressId,
           idempotencyKey: createIdempotencyKey('cod'),
+          offerId: item.offer_id,
+          variantId: item.variant_id,
         }),
         undefined,
         { token: authToken },
@@ -1753,11 +2340,11 @@ function App() {
   }
 
   const placeRazorpayOrder = async () => {
-    if (cartItems.length !== 1) {
+    if (checkoutItems.length !== 1) {
       throw new Error('Online payment is supported for one item at a time. Use Buy Now for Razorpay or use COD for full cart.')
     }
 
-    const item = cartItems[0]
+    const item = checkoutItems[0]
     const addressId = selectedCheckoutAddress?._id
     if (!addressId) {
       throw new Error('Address is missing')
@@ -1770,6 +2357,8 @@ function App() {
         paymentMethod: 'RAZORPAY',
         addressId,
         idempotencyKey: createIdempotencyKey('rzp-create'),
+        offerId: item.offer_id,
+        variantId: item.variant_id,
       }),
       undefined,
       { token: authToken },
@@ -1828,7 +2417,7 @@ function App() {
       flashNotice('Select delivery address')
       return
     }
-    if (!cartItems.length) {
+    if (!checkoutItems.length) {
       flashNotice('Cart is empty')
       return
     }
@@ -1844,14 +2433,20 @@ function App() {
         throw new Error('Unsupported payment method')
       }
 
-      const itemCount = cartItems.reduce((sum, item) => sum + Number(item.qty || 1), 0)
+      const itemCount = checkoutItems.reduce((sum, item) => sum + Number(item.qty || 1), 0)
       const selected = paymentOptions.find((item) => item.id === selectedPaymentMethod)
       const methodLabel = selected?.title || selectedPaymentMethod
       const city = selectedCheckoutAddress?.city
 
-      setCartItems([])
+      if (checkoutFlow === 'buy_now') {
+        setBuyNowItem(null)
+      } else {
+        setCartItems([])
+      }
       setCheckoutPending(false)
+      setCheckoutFlow(null)
       setSelectedCheckoutAddress(null)
+      setPaymentError('')
       closeQuickPanel()
       flashNotice(`Order placed via ${methodLabel} for ${itemCount} item${itemCount > 1 ? 's' : ''}${city ? ` to ${city}` : ''}`)
     } catch (error) {
@@ -1868,21 +2463,24 @@ function App() {
       return
     }
 
-    const fallbackImage = Array.isArray(product.images) && product.images.length > 0 ? product.images[0] : null
+    const nextItem = buildCartItemFromProduct(product, preferredImage)
+    if (!nextItem) {
+      return
+    }
 
     setCartItems((prev) => {
       const next = Array.isArray(prev) ? [...prev] : []
-      const existing = next.find((item) => item.id === product.id)
+      const existing = next.find((item) => (item.cart_key || item.id) === (nextItem.cart_key || nextItem.id))
       if (existing) {
         existing.qty = (existing.qty || 1) + 1
+        existing.price = nextItem.price
+        existing.base_price = nextItem.base_price
+        existing.offer_id = nextItem.offer_id
+        existing.image = nextItem.image
+        existing.variant_id = nextItem.variant_id
+        existing.variant_label = nextItem.variant_label
       } else {
-        next.push({
-          id: product.id,
-          title: product.title,
-          image: preferredImage || fallbackImage || null,
-          price: product.selling_price,
-          qty: 1,
-        })
+        next.push(nextItem)
       }
       return next
     })
@@ -1982,6 +2580,8 @@ function App() {
   const openOrdersPanel = () => {
     if (!isLoggedIn) {
       setCheckoutPending(false)
+      setCheckoutFlow(null)
+      setBuyNowItem(null)
       setActiveQuickPanel((prev) => (prev === 'auth' ? '' : 'auth'))
       return
     }
@@ -1990,12 +2590,17 @@ function App() {
   }
 
   const openCartPanel = () => {
+    setCheckoutPending(false)
+    setCheckoutFlow(null)
+    setBuyNowItem(null)
     setActiveQuickPanel((prev) => (prev === 'cart' ? '' : 'cart'))
   }
 
   const openAccountPanel = () => {
     if (!isLoggedIn) {
       setCheckoutPending(false)
+      setCheckoutFlow(null)
+      setBuyNowItem(null)
       setActiveQuickPanel((prev) => (prev === 'auth' ? '' : 'auth'))
       return
     }
@@ -2005,6 +2610,11 @@ function App() {
 
   const closeQuickPanel = () => {
     setAccountView('menu')
+    setCheckoutPending(false)
+    setCheckoutFlow(null)
+    setBuyNowItem(null)
+    setSelectedCheckoutAddress(null)
+    setPaymentError('')
     setActiveQuickPanel('')
   }
 
@@ -2030,31 +2640,6 @@ function App() {
     }
     flashNotice('Profile updated')
     setAccountView('menu')
-  }
-
-  const addSavedCard = (event) => {
-    event.preventDefault()
-    const digits = cardForm.number.replace(/\D/g, '')
-    if (digits.length < 12 || !cardForm.holder.trim() || !cardForm.expiry.trim()) {
-      flashNotice('Enter valid card details')
-      return
-    }
-    setSavedCards((prev) => ([
-      {
-        id: window.crypto?.randomUUID ? window.crypto.randomUUID() : `card-${Date.now()}`,
-        holder: cardForm.holder.trim(),
-        last4: digits.slice(-4),
-        expiry: cardForm.expiry.trim(),
-      },
-      ...prev,
-    ]))
-    setCardForm({ holder: '', number: '', expiry: '' })
-    flashNotice('Card saved')
-  }
-
-  const removeSavedCard = (id) => {
-    setSavedCards((prev) => prev.filter((item) => item.id !== id))
-    flashNotice('Card removed')
   }
 
   const saveLanguage = (language) => {
@@ -2104,15 +2689,31 @@ function App() {
 
   const loadBuyerOrders = async (statusOverride = buyerOrderStatusFilter) => {
     if (!authToken) {
-      return
+      return []
     }
     setIsLoadingBuyerOrders(true)
     try {
       const response = await apiGet(`/api/orders/buyer/my-orders?status=${encodeURIComponent(statusOverride || 'all')}&limit=50&page=1`, { token: authToken })
-      setBuyerOrders(Array.isArray(response?.orders) ? response.orders : [])
+      const nextOrders = Array.isArray(response?.orders) ? response.orders : []
+      setBuyerOrders(nextOrders)
+      if (activeBuyerTimelineOrderId) {
+        const activeOrder = nextOrders.find((row) => String(row?.id || '').trim() === activeBuyerTimelineOrderId)
+        if (activeOrder) {
+          setBuyerOrderTimeline(buildOrderTrackingTimeline(activeOrder))
+        } else {
+          setActiveBuyerTimelineOrderId('')
+          setBuyerOrderTimeline([])
+        }
+      }
+      return nextOrders
     } catch (error) {
       setBuyerOrders([])
+      if (activeBuyerTimelineOrderId) {
+        setActiveBuyerTimelineOrderId('')
+        setBuyerOrderTimeline([])
+      }
       flashNotice(error instanceof Error ? error.message : 'Could not load your orders')
+      return []
     } finally {
       setIsLoadingBuyerOrders(false)
     }
@@ -2142,6 +2743,93 @@ function App() {
       flashNotice('Order status loaded')
     } finally {
       setIsLoadingBuyerTimeline(false)
+    }
+  }
+
+  const cancelBuyerOrder = async (orderId) => {
+    const id = String(orderId || '').trim()
+    if (!authToken || !id) {
+      return
+    }
+    setBuyerUpdatingOrderActionId(`${id}:cancel`)
+    try {
+      const reason = buyerCancelReasonDrafts[id]
+      const response = await apiPost(`/api/orders/${encodeURIComponent(id)}/cancel`, { reason: reason || undefined }, { token: authToken })
+      setBuyerCancelReasonDrafts((prev) => ({ ...prev, [id]: '' }))
+      flashNotice(response?.refund_status ? 'Order cancelled. Refund review is now pending.' : 'Order cancelled')
+      await loadBuyerOrders()
+      if (activeBuyerTimelineOrderId === id) {
+        await loadBuyerOrderTimeline(id)
+      }
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not cancel order')
+    } finally {
+      setBuyerUpdatingOrderActionId('')
+    }
+  }
+
+  const requestBuyerReturn = async (orderId) => {
+    const id = String(orderId || '').trim()
+    if (!authToken || !id) {
+      return
+    }
+    const reason = String(buyerReturnReasonDrafts[id] || '').trim()
+    if (!reason) {
+      flashNotice('Choose a return reason first')
+      return
+    }
+    setBuyerUpdatingOrderActionId(`${id}:return`)
+    try {
+      await apiPost(`/api/orders/${encodeURIComponent(id)}/return-request`, { reason }, { token: authToken })
+      setBuyerReturnReasonDrafts((prev) => ({ ...prev, [id]: '' }))
+      flashNotice('Return requested')
+      await loadBuyerOrders()
+      if (activeBuyerTimelineOrderId === id) {
+        await loadBuyerOrderTimeline(id)
+      }
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not request return')
+    } finally {
+      setBuyerUpdatingOrderActionId('')
+    }
+  }
+
+  const runAdminOrderCareAction = async (orderId, action) => {
+    const id = String(orderId || '').trim()
+    if (!authToken || userRole !== 'admin' || !id) {
+      return
+    }
+    const configs = {
+      schedule_pickup: {
+        endpoint: `/api/orders/system/schedule-pickup/${encodeURIComponent(id)}`,
+        message: 'Pickup scheduled',
+      },
+      mark_picked_up: {
+        endpoint: `/api/orders/system/pickup-complete/${encodeURIComponent(id)}`,
+        message: 'Pickup marked complete',
+      },
+      complete_return_refund: {
+        endpoint: `/api/orders/system/refund/${encodeURIComponent(id)}`,
+        message: 'Return refund completed',
+      },
+      complete_cancellation_refund: {
+        endpoint: `/api/orders/system/cancellation-refund/${encodeURIComponent(id)}`,
+        message: 'Cancellation refund completed',
+      },
+    }
+    const config = configs[action]
+    if (!config) {
+      return
+    }
+    setAdminUpdatingOrderCareId(`${id}:${action}`)
+    try {
+      await apiPost(config.endpoint, {}, { token: authToken })
+      flashNotice(config.message)
+      await Promise.all([loadAdminOrderCareCases(), loadAdminOrderSummary()])
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not update order care case')
+    } finally {
+      setAdminUpdatingOrderCareId('')
     }
   }
 
@@ -2530,30 +3218,90 @@ function App() {
     return validation.quantity
   }
 
+  const addSellerVariantDraft = () => {
+    setSellerProductVariants((prev) => [...prev, createSellerVariantDraft()])
+  }
+
+  const updateSellerVariantDraft = (draftId, field, value) => {
+    setSellerProductVariants((prev) => prev.map((item) => (item.id === draftId ? { ...item, [field]: value } : item)))
+  }
+
+  const removeSellerVariantDraft = (draftId) => {
+    setSellerProductVariants((prev) => prev.filter((item) => item.id !== draftId))
+  }
+
   const createSellerProduct = async (event) => {
     event.preventDefault()
     if (!authToken) {
       return
     }
-    const mrpValidation = validatePrice(sellerCreateProductForm.mrp)
-    const sellingPriceValidation = validatePrice(sellerCreateProductForm.selling_price)
     const images = sellerCreateProductForm.images
       .split(/[\n,]+/)
       .map((item) => item.trim())
       .filter(Boolean)
+    const normalizedVariants = []
+    for (const draft of sellerProductVariants) {
+      const label = sanitizeText(draft.label, 40)
+      const value = sanitizeText(draft.value, 80)
+      const sku = sanitizeText(draft.sku, 40)
+      const image = String(draft.image || '').trim()
+      const hasAnyField = [label, value, draft.mrp, draft.selling_price, draft.stock, sku, image].some((item) => String(item || '').trim())
+      if (!hasAnyField) {
+        continue
+      }
+      const mrpValidation = validatePrice(draft.mrp)
+      const sellingPriceValidation = validatePrice(draft.selling_price)
+      const stock = Number(draft.stock)
+      if (!label || !value || !mrpValidation.valid || !sellingPriceValidation.valid || !Number.isInteger(stock) || stock < 0) {
+        flashNotice(`Complete valid fields for variant ${value || label || 'entry'}`)
+        return
+      }
+      if (sellingPriceValidation.price > mrpValidation.price) {
+        flashNotice(`Variant ${value || label || 'entry'} has selling price above MRP`)
+        return
+      }
+      normalizedVariants.push({
+        label,
+        value,
+        sku: sku || undefined,
+        mrp: mrpValidation.price,
+        selling_price: sellingPriceValidation.price,
+        stock,
+        image: image || undefined,
+      })
+    }
+
+    const hasVariants = normalizedVariants.length > 0
+    const mrpValidation = validatePrice(sellerCreateProductForm.mrp)
+    const sellingPriceValidation = validatePrice(sellerCreateProductForm.selling_price)
     const stock = Number(sellerCreateProductForm.stock)
+    const sortedVariants = hasVariants
+      ? [...normalizedVariants].sort((left, right) => (
+        Number(left.selling_price || 0) - Number(right.selling_price || 0)
+        || Number(left.mrp || 0) - Number(right.mrp || 0)
+        || String(left.value || '').localeCompare(String(right.value || ''))
+      ))
+      : []
+    const fallbackVariant = sortedVariants[0] || null
     const payload = {
       title: sanitizeText(sellerCreateProductForm.title, 140),
       description: sanitizeText(sellerCreateProductForm.description, 1600) || undefined,
       category: sanitizeText(sellerCreateProductForm.category, 80),
       sub_category: sanitizeText(sellerCreateProductForm.sub_category, 80) || undefined,
       tags: sellerCreateProductForm.tags.split(',').map((tag) => sanitizeText(tag, 40)).filter(Boolean),
-      mrp: mrpValidation.valid ? mrpValidation.price : NaN,
-      selling_price: sellingPriceValidation.valid ? sellingPriceValidation.price : NaN,
-      stock,
+      mrp: hasVariants ? Number(fallbackVariant?.mrp || NaN) : (mrpValidation.valid ? mrpValidation.price : NaN),
+      selling_price: hasVariants ? Number(fallbackVariant?.selling_price || NaN) : (sellingPriceValidation.valid ? sellingPriceValidation.price : NaN),
+      stock: hasVariants ? normalizedVariants.reduce((sum, item) => sum + Number(item.stock || 0), 0) : stock,
       images,
+      variants: normalizedVariants,
     }
-    if (!payload.title || !payload.category || !mrpValidation.valid || !sellingPriceValidation.valid || !Number.isInteger(payload.stock) || payload.stock < 0 || images.length === 0) {
+    if (
+      !payload.title
+      || !payload.category
+      || (!hasVariants && (!mrpValidation.valid || !sellingPriceValidation.valid || !Number.isInteger(payload.stock) || payload.stock < 0))
+      || (hasVariants && normalizedVariants.length === 0)
+      || images.length === 0
+    ) {
       flashNotice('Complete valid product details')
       return
     }
@@ -2576,6 +3324,7 @@ function App() {
         stock: '',
         images: '',
       })
+      setSellerProductVariants([])
       await refreshSellerDashboard()
     } catch (error) {
       flashNotice(error instanceof Error ? error.message : 'Could not create product')
@@ -2645,10 +3394,30 @@ function App() {
       flashNotice('Complete offer fields')
       return
     }
+    const selectedProduct = sellerProducts.find((product) => String(product?.id || '').trim() === payload.product_id)
+    if (!selectedProduct) {
+      flashNotice('Select a valid seller product')
+      return
+    }
+    const basePrice = Number(selectedProduct?.selling_price)
+    if (!Number.isFinite(basePrice) || basePrice <= 0) {
+      flashNotice('Selected product price is unavailable')
+      return
+    }
+    if (payload.offer_price >= basePrice) {
+      flashNotice(`Offer price must be lower than product price (${formatCurrency(basePrice)})`)
+      return
+    }
+    const startAtMs = Date.parse(payload.start_at)
+    const endAtMs = Date.parse(payload.end_at)
+    if (!Number.isFinite(startAtMs) || !Number.isFinite(endAtMs) || startAtMs >= endAtMs) {
+      flashNotice('Offer end time must be later than start time')
+      return
+    }
     setIsCreatingSellerOffer(true)
     try {
-      await apiPost('/api/seller/offers', payload, { token: authToken })
-      flashNotice('Offer created')
+      const response = await apiPost('/api/seller/offers', payload, { token: authToken })
+      flashNotice(response?.message || 'Offer saved')
       setSellerOfferForm({
         product_id: '',
         offer_price: '',
@@ -3058,6 +3827,36 @@ function App() {
     }
   }
 
+  const loadAdminOrderCareCases = async () => {
+    if (!authToken || userRole !== 'admin') {
+      return
+    }
+    setIsLoadingAdminOrderCareCases(true)
+    try {
+      const response = await apiGet('/api/admin/orders/care-cases', { token: authToken })
+      setAdminOrderCareCases(response && typeof response === 'object' ? response : null)
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Failed to load order care queue')
+    } finally {
+      setIsLoadingAdminOrderCareCases(false)
+    }
+  }
+
+  const loadAdminOffersSummary = async () => {
+    if (!authToken || userRole !== 'admin') {
+      return
+    }
+    setIsLoadingAdminOffersSummary(true)
+    try {
+      const response = await apiGet('/api/admin/offers/summary', { token: authToken })
+      setAdminOffersSummary(response && typeof response === 'object' ? response : null)
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Failed to load offers summary')
+    } finally {
+      setIsLoadingAdminOffersSummary(false)
+    }
+  }
+
   const loadAdminPayoutRequests = async (statusOverride = adminPayoutStatusFilter) => {
     if (!authToken || userRole !== 'admin') {
       return
@@ -3082,6 +3881,8 @@ function App() {
       loadAdminRiskDashboard(),
       loadAdminFinanceSummary(),
       loadAdminOrderSummary(),
+      loadAdminOrderCareCases(),
+      loadAdminOffersSummary(),
       loadAdminPayoutRequests(),
     ])
   }
@@ -3282,6 +4083,7 @@ function App() {
       }, { token: authToken })
       flashNotice('Festival created')
       setFestivalForm((prev) => ({ ...prev, slug: '', name: '' }))
+      await loadAdminOffersSummary()
     } catch (error) {
       flashNotice(error instanceof Error ? error.message : 'Could not create festival')
     } finally {
@@ -3424,14 +4226,14 @@ function App() {
   const updateCartQty = (id, change) => {
     setCartItems((prev) => {
       const next = prev
-        .map((item) => (item.id === id ? { ...item, qty: Math.max(0, (item.qty || 1) + change) } : item))
+        .map((item) => (((item.cart_key || item.id) === id) ? { ...item, qty: Math.max(0, (item.qty || 1) + change) } : item))
         .filter((item) => (item.qty || 0) > 0)
       return next
     })
   }
 
   const removeCartItem = (id) => {
-    setCartItems((prev) => prev.filter((item) => item.id !== id))
+    setCartItems((prev) => prev.filter((item) => (item.cart_key || item.id) !== id))
     flashNotice('Removed from cart')
   }
 
@@ -3440,6 +4242,8 @@ function App() {
       flashNotice('Cart is empty')
       return
     }
+    setCheckoutFlow('cart')
+    setBuyNowItem(null)
     if (!isLoggedIn) {
       setCheckoutPending(true)
       setActiveQuickPanel('auth')
@@ -3462,13 +4266,14 @@ function App() {
     }
 
     const image = selectedImage || detailImages[0] || (Array.isArray(productDetail.images) ? productDetail.images[0] : null)
-    setCartItems([{
-      id: productDetail.id,
-      title: productDetail.title,
-      image: image || null,
-      price: productDetail.selling_price,
-      qty: 1,
-    }])
+    const nextItem = buildCartItemFromProduct(productDetail, image || null)
+    if (!nextItem) {
+      return
+    }
+    setBuyNowItem(nextItem)
+    setCheckoutFlow('buy_now')
+    setPaymentError('')
+    setSelectedCheckoutAddress(null)
 
     if (!isLoggedIn) {
       setCheckoutPending(true)
@@ -3557,15 +4362,24 @@ function App() {
   }
 
   const detailImages = Array.isArray(productDetail?.images) ? productDetail.images : []
-  const detailPrice = formatInr(productDetail?.selling_price)
-  const detailMrp = formatInr(productDetail?.mrp)
-  const detailHasStrike = Number.isFinite(Number(productDetail?.mrp))
-    && Number.isFinite(Number(productDetail?.selling_price))
-    && Number(productDetail.mrp) > Number(productDetail.selling_price)
+  const detailPricing = getProductPricingMeta(productDetail)
+  const detailOffer = detailPricing.activeOffer
+  const detailPrice = formatInr(detailPricing.effectivePrice)
+  const detailComparePrice = formatInr(detailPricing.comparePrice)
+  const detailHasStrike = detailPricing.hasComparePrice
   const isPdp = Boolean(activeProductId)
   const isWishlisted = Boolean(activeProductId && wishlistIds.includes(activeProductId))
   const prevIsPdpRef = useRef(isPdp)
   const [viewTransition, setViewTransition] = useState('')
+  const isCheckoutFlow = checkoutFlow === 'cart' || (checkoutFlow === 'buy_now' && Boolean(buyNowItem))
+  const checkoutItems = checkoutFlow === 'buy_now' && buyNowItem
+    ? [buyNowItem]
+    : (checkoutFlow === 'cart' ? cartItems : [])
+  const checkoutItemTotal = checkoutItems.reduce((sum, item) => sum + Number(item.qty || 1), 0)
+  const checkoutSubtotal = checkoutItems.reduce((sum, item) => {
+    const line = Number(item.price || 0) * Number(item.qty || 1)
+    return Number.isFinite(line) ? sum + line : sum
+  }, 0)
   const cartItemTotal = cartItems.reduce((sum, item) => sum + Number(item.qty || 1), 0)
   const cartSubtotal = cartItems.reduce((sum, item) => {
     const line = Number(item.price || 0) * Number(item.qty || 1)
@@ -3582,11 +4396,14 @@ function App() {
   const spotlightProducts = categoryProducts.slice(0, 8)
   const launchProducts = categoryProducts.slice(8, 16)
   const heroProduct = categoryProducts[0] || null
+  const homeOfferLead = offerHighlights[0] || null
+  const homeOfferLeadPricing = homeOfferLead ? getProductPricingMeta(homeOfferLead) : null
+  const homeOfferTiles = offerHighlights.slice(1, 5)
   const accountViewTitle = ({
     menu: 'Account Settings',
     devices: 'Manage Devices',
     profile: 'Edit Profile',
-    cards: 'Saved Cards',
+    cards: 'Payments & Security',
     language: 'Select Language',
     notifications: 'Notification Settings',
     privacy: 'Privacy Center',
@@ -3606,6 +4423,26 @@ function App() {
     const text = typeof label === 'string' ? label : String(label || '')
     return text.toLowerCase().includes(accountMenuNeedle)
   }
+  const buyerOrderStats = {
+    total: buyerOrders.length,
+    active: buyerOrders.filter((order) => !['delivered', 'cancelled', 'rto'].includes(normalizeOrderStatus(order?.status))).length,
+    returns: buyerOrders.filter((order) => {
+      const returnStatus = normalizeOrderStatus(order?.return?.status)
+      const pickupStatus = normalizeOrderStatus(order?.return?.pickup_status)
+      return Boolean(returnStatus || pickupStatus)
+    }).length,
+    refundsPending: buyerOrders.filter((order) => {
+      const returnRefundStatus = normalizeOrderStatus(order?.return?.refund_status)
+      const cancellationRefundStatus = normalizeOrderStatus(order?.cancellation?.refund_status)
+      return ['pending_manual_review', 'processing'].includes(returnRefundStatus)
+        || ['pending_manual_review', 'processing'].includes(cancellationRefundStatus)
+    }).length,
+  }
+  const adminOrderCareSummary = adminOrderCareCases?.summary || {}
+  const adminCancellationQueue = Array.isArray(adminOrderCareCases?.cancellation_queue) ? adminOrderCareCases.cancellation_queue : []
+  const adminReturnQueue = Array.isArray(adminOrderCareCases?.return_queue) ? adminOrderCareCases.return_queue : []
+  const adminRefundQueue = Array.isArray(adminOrderCareCases?.refund_queue) ? adminOrderCareCases.refund_queue : []
+  const adminOrderCareTotal = adminCancellationQueue.length + adminReturnQueue.length + adminRefundQueue.length
 
   useEffect(() => {
     const previous = prevIsPdpRef.current
@@ -3641,6 +4478,8 @@ function App() {
                 || isLoadingAdminRiskDashboard
                 || isLoadingAdminFinanceSummary
                 || isLoadingAdminOrderSummary
+                || isLoadingAdminOrderCareCases
+                || isLoadingAdminOffersSummary
                 || isLoadingAdminPayoutRequests
               }
             >
@@ -3720,7 +4559,331 @@ function App() {
               <strong>High Risk Sellers</strong>
               <p>{isLoadingAdminRiskDashboard ? '...' : Number(adminRiskDashboard?.risky_sellers?.length || 0)}</p>
             </article>
+            <article className="admin-metric-card">
+              <strong>Active Offers</strong>
+              <p>{isLoadingAdminOffersSummary ? '...' : Number(adminOffersSummary?.summary?.active_offers || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Sellers Running Offers</strong>
+              <p>{isLoadingAdminOffersSummary ? '...' : Number(adminOffersSummary?.summary?.sellers_running_offers || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Festival Offers</strong>
+              <p>{isLoadingAdminOffersSummary ? '...' : Number(adminOffersSummary?.summary?.festival_offers || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Scheduled Offers</strong>
+              <p>{isLoadingAdminOffersSummary ? '...' : Number(adminOffersSummary?.summary?.scheduled_offers || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Live Festivals</strong>
+              <p>{isLoadingAdminOffersSummary ? '...' : Number(adminOffersSummary?.summary?.live_festivals || 0)}</p>
+            </article>
           </div>
+        </section>
+
+        <section className="admin-panel">
+          <div className="admin-panel-head">
+            <h2>Order Care Desk</h2>
+            <span>{isLoadingAdminOrderCareCases ? 'Loading...' : `${adminOrderCareTotal} active case cards`}</span>
+          </div>
+          <div className="admin-metrics-grid">
+            <article className="admin-metric-card">
+              <strong>Buyer Cancellations</strong>
+              <p>{isLoadingAdminOrderCareCases ? '...' : Number(adminOrderCareSummary?.buyer_cancellations || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Cancellation Refunds Pending</strong>
+              <p>{isLoadingAdminOrderCareCases ? '...' : Number(adminOrderCareSummary?.prepaid_cancellation_refunds_pending || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Open Return Requests</strong>
+              <p>{isLoadingAdminOrderCareCases ? '...' : Number(adminOrderCareSummary?.open_return_requests || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Pickup Scheduled</strong>
+              <p>{isLoadingAdminOrderCareCases ? '...' : Number(adminOrderCareSummary?.pickup_scheduled || 0)}</p>
+            </article>
+            <article className="admin-metric-card">
+              <strong>Refunds Pending</strong>
+              <p>{isLoadingAdminOrderCareCases ? '...' : Number(adminOrderCareSummary?.refunds_pending || 0)}</p>
+            </article>
+          </div>
+          {isLoadingAdminOrderCareCases && <p className="quick-panel-meta">Loading order care queue...</p>}
+          {!isLoadingAdminOrderCareCases && adminOrderCareTotal === 0 && (
+            <p className="quick-panel-meta">No active cancellation, pickup, or refund cases right now.</p>
+          )}
+          {!isLoadingAdminOrderCareCases && adminOrderCareTotal > 0 && (
+            <div className="admin-care-layout">
+              <div className="admin-care-column">
+                <div className="admin-care-heading">
+                  <h3>Cancellations</h3>
+                  <span>Pre-shipment buyer cancellations and refund review</span>
+                </div>
+                <div className="admin-request-list">
+                  {adminCancellationQueue.length === 0 && <p className="quick-panel-meta">No buyer cancellations waiting here.</p>}
+                  {adminCancellationQueue.map((item) => {
+                    const refundActionKey = `${item.order_id}:complete_cancellation_refund`
+                    const isUpdatingRefund = adminUpdatingOrderCareId === refundActionKey
+                    return (
+                      <article className="account-tile admin-care-ticket" key={`cancel-${item.order_id}`}>
+                        <div className="admin-care-ticket-head">
+                          <div>
+                            <strong>{item?.product?.title || 'Cancelled order'}</strong>
+                            <p>Order {item?.order_id || '-'}</p>
+                          </div>
+                          <span className={`status-chip is-${getStatusTone(item?.status)}`}>{formatStatusText(item?.status)}</span>
+                        </div>
+                        <p>Seller: {item?.seller_brand || '-'}</p>
+                        <p>Buyer Area: {[item?.buyer_city, item?.buyer_pincode].filter(Boolean).join(' | ') || '-'}</p>
+                        <p>Amount: {formatCurrency(item?.pricing?.subtotal || 0)} | Payment: {formatStatusText(item?.payment?.method)} / {formatStatusText(item?.payment?.status)}</p>
+                        <p>Cancelled: {formatDateTime(item?.cancellation?.requested_at || item?.updated_at)}</p>
+                        {item?.cancellation?.reason && <p>Reason: {formatStatusText(item.cancellation.reason)}</p>}
+                        <div className="buyer-order-care">
+                          {item?.payment?.status && (
+                            <span className={`status-chip is-${getStatusTone(item.payment.status)}`}>
+                              Payment {formatStatusText(item.payment.status)}
+                            </span>
+                          )}
+                          {item?.cancellation?.refund_status && (
+                            <span className={`status-chip is-${getStatusTone(item.cancellation.refund_status)}`}>
+                              Refund {formatStatusText(item.cancellation.refund_status)}
+                            </span>
+                          )}
+                        </div>
+                        {item?.cancellation?.refund_note && <p>{item.cancellation.refund_note}</p>}
+                        {item?.cancellation?.refunded_at && <p>Refunded: {formatDateTime(item.cancellation.refunded_at)}</p>}
+                        {item?.actions?.can_complete_cancellation_refund && (
+                          <div className="admin-request-actions">
+                            <button
+                              type="button"
+                              className="account-inline-btn"
+                              disabled={isUpdatingRefund}
+                              onClick={() => runAdminOrderCareAction(item.order_id, 'complete_cancellation_refund')}
+                            >
+                              {isUpdatingRefund ? 'Updating...' : 'Mark Refund Complete'}
+                            </button>
+                          </div>
+                        )}
+                      </article>
+                    )
+                  })}
+                </div>
+              </div>
+
+              <div className="admin-care-column">
+                <div className="admin-care-heading">
+                  <h3>Returns & Pickup</h3>
+                  <span>Approve logistics steps before refund release</span>
+                </div>
+                <div className="admin-request-list">
+                  {adminReturnQueue.length === 0 && <p className="quick-panel-meta">No return pickups need admin action.</p>}
+                  {adminReturnQueue.map((item) => {
+                    const scheduleActionKey = `${item.order_id}:schedule_pickup`
+                    const pickupActionKey = `${item.order_id}:mark_picked_up`
+                    const isSchedulingPickup = adminUpdatingOrderCareId === scheduleActionKey
+                    const isMarkingPickup = adminUpdatingOrderCareId === pickupActionKey
+                    return (
+                      <article className="account-tile admin-care-ticket" key={`return-${item.order_id}`}>
+                        <div className="admin-care-ticket-head">
+                          <div>
+                            <strong>{item?.product?.title || 'Return case'}</strong>
+                            <p>Order {item?.order_id || '-'}</p>
+                          </div>
+                          <span className={`status-chip is-${getStatusTone(item?.return?.status || item?.status)}`}>
+                            {formatStatusText(item?.return?.status || item?.status)}
+                          </span>
+                        </div>
+                        <p>Seller: {item?.seller_brand || '-'}</p>
+                        <p>Buyer Area: {[item?.buyer_city, item?.buyer_pincode].filter(Boolean).join(' | ') || '-'}</p>
+                        <p>Amount: {formatCurrency(item?.pricing?.subtotal || 0)} | Payment: {formatStatusText(item?.payment?.method)} / {formatStatusText(item?.payment?.status)}</p>
+                        {item?.return?.reason && <p>Reason: {formatStatusText(item.return.reason)}</p>}
+                        <p>Requested: {formatDateTime(item?.return?.requested_at || item?.updated_at)}</p>
+                        {item?.return?.seller_action_deadline && <p>Seller SLA: {formatDateTime(item.return.seller_action_deadline)}</p>}
+                        {item?.return?.pickup_at && <p>Pickup Slot: {formatDateTime(item.return.pickup_at)}</p>}
+                        {item?.return?.pickup_completed_at && <p>Picked Up: {formatDateTime(item.return.pickup_completed_at)}</p>}
+                        <div className="buyer-order-care">
+                          {item?.return?.status && (
+                            <span className={`status-chip is-${getStatusTone(item.return.status)}`}>
+                              Return {formatStatusText(item.return.status)}
+                            </span>
+                          )}
+                          {item?.return?.pickup_status && (
+                            <span className={`status-chip is-${getStatusTone(item.return.pickup_status)}`}>
+                              Pickup {formatStatusText(item.return.pickup_status)}
+                            </span>
+                          )}
+                        </div>
+                        <div className="admin-request-actions">
+                          {item?.actions?.can_schedule_pickup && (
+                            <button
+                              type="button"
+                              className="account-inline-btn"
+                              disabled={isSchedulingPickup}
+                              onClick={() => runAdminOrderCareAction(item.order_id, 'schedule_pickup')}
+                            >
+                              {isSchedulingPickup ? 'Updating...' : 'Schedule Pickup'}
+                            </button>
+                          )}
+                          {item?.actions?.can_mark_pickup_complete && (
+                            <button
+                              type="button"
+                              className="account-inline-btn"
+                              disabled={isMarkingPickup}
+                              onClick={() => runAdminOrderCareAction(item.order_id, 'mark_picked_up')}
+                            >
+                              {isMarkingPickup ? 'Updating...' : 'Mark Picked Up'}
+                            </button>
+                          )}
+                        </div>
+                      </article>
+                    )
+                  })}
+                </div>
+              </div>
+
+              <div className="admin-care-column">
+                <div className="admin-care-heading">
+                  <h3>Refund Release</h3>
+                  <span>Cases ready for final money movement</span>
+                </div>
+                <div className="admin-request-list">
+                  {adminRefundQueue.length === 0 && <p className="quick-panel-meta">No refunds are awaiting completion.</p>}
+                  {adminRefundQueue.map((item) => {
+                    const returnRefundActionKey = `${item.order_id}:complete_return_refund`
+                    const cancellationRefundActionKey = `${item.order_id}:complete_cancellation_refund`
+                    const isCompletingReturnRefund = adminUpdatingOrderCareId === returnRefundActionKey
+                    const isCompletingCancellationRefund = adminUpdatingOrderCareId === cancellationRefundActionKey
+                    return (
+                      <article className="account-tile admin-care-ticket" key={`refund-${item.order_id}`}>
+                        <div className="admin-care-ticket-head">
+                          <div>
+                            <strong>{item?.product?.title || 'Refund case'}</strong>
+                            <p>Order {item?.order_id || '-'}</p>
+                          </div>
+                          <span className={`status-chip is-${getStatusTone(item?.return?.refund_status || item?.cancellation?.refund_status || item?.status)}`}>
+                            {formatStatusText(item?.return?.refund_status || item?.cancellation?.refund_status || item?.status)}
+                          </span>
+                        </div>
+                        <p>Seller: {item?.seller_brand || '-'}</p>
+                        <p>Amount: {formatCurrency(item?.pricing?.subtotal || 0)} | Payment: {formatStatusText(item?.payment?.method)} / {formatStatusText(item?.payment?.status)}</p>
+                        {item?.return?.pickup_completed_at && <p>Picked Up: {formatDateTime(item.return.pickup_completed_at)}</p>}
+                        {item?.cancellation?.requested_at && <p>Cancelled: {formatDateTime(item.cancellation.requested_at)}</p>}
+                        <div className="buyer-order-care">
+                          {item?.return?.refund_status && (
+                            <span className={`status-chip is-${getStatusTone(item.return.refund_status)}`}>
+                              Return Refund {formatStatusText(item.return.refund_status)}
+                            </span>
+                          )}
+                          {item?.cancellation?.refund_status && (
+                            <span className={`status-chip is-${getStatusTone(item.cancellation.refund_status)}`}>
+                              Cancellation Refund {formatStatusText(item.cancellation.refund_status)}
+                            </span>
+                          )}
+                        </div>
+                        <div className="admin-request-actions">
+                          {item?.actions?.can_complete_return_refund && (
+                            <button
+                              type="button"
+                              className="account-inline-btn"
+                              disabled={isCompletingReturnRefund}
+                              onClick={() => runAdminOrderCareAction(item.order_id, 'complete_return_refund')}
+                            >
+                              {isCompletingReturnRefund ? 'Updating...' : 'Complete Return Refund'}
+                            </button>
+                          )}
+                          {item?.actions?.can_complete_cancellation_refund && (
+                            <button
+                              type="button"
+                              className="account-inline-btn"
+                              disabled={isCompletingCancellationRefund}
+                              onClick={() => runAdminOrderCareAction(item.order_id, 'complete_cancellation_refund')}
+                            >
+                              {isCompletingCancellationRefund ? 'Updating...' : 'Complete Cancellation Refund'}
+                            </button>
+                          )}
+                        </div>
+                      </article>
+                    )
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
+
+        <section className="admin-panel">
+          <div className="admin-panel-head">
+            <h2>Promotions Radar</h2>
+            <span>{isLoadingAdminOffersSummary ? 'Loading...' : `${Number(adminOffersSummary?.summary?.active_offers || 0)} live offers`}</span>
+          </div>
+          {isLoadingAdminOffersSummary && <p className="quick-panel-meta">Loading live promotions...</p>}
+          {!isLoadingAdminOffersSummary
+            && Number(adminOffersSummary?.summary?.active_offers || 0) === 0
+            && Number(adminOffersSummary?.summary?.live_festivals || 0) === 0
+            && Number(adminOffersSummary?.summary?.scheduled_offers || 0) === 0 && (
+            <p className="quick-panel-meta">No live or scheduled promotions are running right now.</p>
+          )}
+          {!isLoadingAdminOffersSummary && (
+            Number(adminOffersSummary?.summary?.active_offers || 0) > 0
+            || Number(adminOffersSummary?.summary?.live_festivals || 0) > 0
+            || Number(adminOffersSummary?.summary?.scheduled_offers || 0) > 0
+          ) && (
+            <div className="admin-offers-layout">
+              <div className="admin-offers-column">
+                <div className="admin-offers-heading">
+                  <h3>Top Value</h3>
+                  <span>Best savings right now</span>
+                </div>
+                <div className="admin-request-list">
+                  {(Array.isArray(adminOffersSummary?.top_offers) ? adminOffersSummary.top_offers : []).map((offer) => (
+                    <article className="account-tile admin-offer-tile" key={offer.offer_id}>
+                      <strong>{offer.product_title || 'Offer product'}</strong>
+                      <p>Seller: {offer.seller_brand || offer.seller_id || '-'}</p>
+                      <p>Live Price: {formatInr(offer.offer_price) || '₹0'}{Number.isFinite(Number(offer.base_price)) ? ` from ${formatInr(offer.base_price) || '₹0'}` : ''}</p>
+                      <p>Saved: {formatInr(offer.savings_amount) || '₹0'}{Number.isFinite(Number(offer.savings_percent)) ? ` (${Number(offer.savings_percent)}%)` : ''}</p>
+                      <p>Used: {Number(offer.used_count || 0)} times</p>
+                      <p>{offer.festival_name ? `Festival: ${offer.festival_name}` : 'Standalone offer'}</p>
+                    </article>
+                  ))}
+                </div>
+              </div>
+
+              <div className="admin-offers-column">
+                <div className="admin-offers-heading">
+                  <h3>Ending Soon</h3>
+                  <span>Offers to review before they expire</span>
+                </div>
+                <div className="admin-request-list">
+                  {(Array.isArray(adminOffersSummary?.expiring_offers) ? adminOffersSummary.expiring_offers : []).map((offer) => (
+                    <article className="account-tile admin-offer-tile" key={`expiring-${offer.offer_id}`}>
+                      <strong>{offer.product_title || 'Offer product'}</strong>
+                      <p>Seller: {offer.seller_brand || offer.seller_id || '-'}</p>
+                      <p>Ends: {formatDateTime(offer.end_at)}</p>
+                      <p>Live Price: {formatInr(offer.offer_price) || '₹0'}</p>
+                      <p>Status: {offer.seller_frozen ? 'Seller frozen' : (offer.seller_status || '-')}</p>
+                    </article>
+                  ))}
+                </div>
+              </div>
+
+              <div className="admin-offers-column">
+                <div className="admin-offers-heading">
+                  <h3>Live Festivals</h3>
+                  <span>Campaigns sellers can attach right now</span>
+                </div>
+                <div className="admin-festival-list">
+                  {(Array.isArray(adminOffersSummary?.live_festivals) ? adminOffersSummary.live_festivals : []).map((festival, index) => (
+                    <article className="admin-festival-chip" key={`${festival.slug || festival.name || 'festival'}-${index}`}>
+                      <strong>{festival.name || 'Untitled festival'}</strong>
+                      <p>{festival.slug || '-'}</p>
+                      <small>{festival.end_at ? `Ends ${formatDateTime(festival.end_at)}` : 'Live now'}</small>
+                    </article>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
         </section>
 
         <section className="admin-panel">
@@ -4291,70 +5454,165 @@ function App() {
       {cartNotice && <div className="cart-notice" role="status">{cartNotice}</div>}
 
       {!activeProductId && !isCategoryView && !activeQuickPanel && (
-        <section className={`home-products ${viewTransition === 'to-home' ? 'is-entering' : ''}`} aria-labelledby="home-products-title">
-          <div className="home-products-head">
-            <h2 id="home-products-title">Products</h2>
-          </div>
+        <>
+          {!searchText.trim() && (
+            <section className={`offers-hero ${viewTransition === 'to-home' ? 'is-entering' : ''}`} aria-labelledby="offers-hero-title">
+              <div className="offers-hero-head">
+                <div>
+                  <p className="offers-hero-kicker">Live Offers</p>
+                  <h2 id="offers-hero-title">Live deals worth opening first</h2>
+                </div>
+                {homeOfferLead?.active_offer?.end_at && (
+                  <span className="offers-hero-timer">Ends {formatDateTime(homeOfferLead.active_offer.end_at)}</span>
+                )}
+              </div>
 
-          {isLoadingProducts && <p className="products-meta">Loading products...</p>}
+              {isLoadingOfferHighlights && <p className="products-meta">Loading live offers...</p>}
+              {!isLoadingOfferHighlights && offerHighlightsError && (
+                <p className="products-meta products-error">Could not fetch live offers: {offerHighlightsError}</p>
+              )}
 
-          {!isLoadingProducts && productsError && (
-            <p className="products-meta products-error">Could not fetch products: {productsError}</p>
-          )}
-
-          {!isLoadingProducts && !productsError && products.length === 0 && (
-            <p className="products-meta">No products found.</p>
-          )}
-
-          {!isLoadingProducts && !productsError && products.length > 0 && (
-            <div className="product-grid">
-              {products.map((product) => {
-                const image = Array.isArray(product.images) ? product.images[0] : null
-                const price = formatInr(product.selling_price)
-                const mrp = formatInr(product.mrp)
-                const hasDiscount = Number.isFinite(Number(product.mrp))
-                  && Number.isFinite(Number(product.selling_price))
-                  && Number(product.mrp) > Number(product.selling_price)
-                const hasReviews = Number(product.review_count) > 0 && Number.isFinite(Number(product.review_average))
-
-                return (
+              {!isLoadingOfferHighlights && !offerHighlightsError && homeOfferLead && (
+                <div className="offers-hero-grid">
                   <article
-                    className="product-card"
-                    key={product.id}
-                    onClick={() => openProduct(product)}
-                    onKeyDown={(event) => event.key === 'Enter' && openProduct(product)}
+                    className="offers-hero-lead"
+                    onClick={() => openProduct(homeOfferLead)}
+                    onKeyDown={(event) => event.key === 'Enter' && openProduct(homeOfferLead)}
                     role="button"
                     tabIndex={0}
                   >
-                    <div className="product-media">
-                      {image ? <img src={image} alt={product.title} loading="lazy" /> : <span>No image</span>}
+                    <div className="offers-hero-copy">
+                      <span className="offers-hero-chip">{homeOfferLead.offer_banner_label || 'Live Offer'}</span>
+                      <h3>{homeOfferLead.title}</h3>
+                      <p>
+                        Save {formatInr(homeOfferLead?.active_offer?.savings_amount) || '₹0'}
+                        {Number.isFinite(Number(homeOfferLead?.active_offer?.savings_percent))
+                          ? ` (${Number(homeOfferLead.active_offer.savings_percent)}% off)`
+                          : ''}
+                      </p>
+                      <div className="offers-hero-pricing">
+                        <strong>{formatInr(homeOfferLeadPricing?.effectivePrice ?? homeOfferLead?.active_offer?.offer_price ?? homeOfferLead?.display_price ?? homeOfferLead?.selling_price) || '-'}</strong>
+                        {homeOfferLeadPricing?.hasComparePrice && <span>{formatInr(homeOfferLeadPricing.comparePrice)}</span>}
+                      </div>
+                      <span className="account-primary-btn">Shop This Offer</span>
                     </div>
-                    <div className="product-copy">
-                      <h3>{product.title}</h3>
-                      <p className="product-category">{product.category || 'Uncategorized'}</p>
-                      <div className="product-rating">
-                        {hasReviews ? (
-                          <>
-                            <span className="rating-chip">
-                              {Number(product.review_average).toFixed(1)} <span aria-hidden="true">&#9733;</span>
-                            </span>
-                            <span className="rating-count">({product.review_count})</span>
-                          </>
-                        ) : (
-                          <span className="rating-empty">No reviews yet</span>
-                        )}
-                      </div>
-                      <div className="product-pricing">
-                        <strong>{price || '-'}</strong>
-                        {hasDiscount && <span>{mrp}</span>}
-                      </div>
+                    <div className="offers-hero-media">
+                      {Array.isArray(homeOfferLead.images) && homeOfferLead.images[0]
+                        ? <img src={homeOfferLead.images[0]} alt={homeOfferLead.title} loading="lazy" />
+                        : <span>Live</span>}
                     </div>
                   </article>
-                )
-              })}
-            </div>
+
+                  <div className="offers-hero-list">
+                    {homeOfferTiles.map((item) => {
+                      const tilePricing = getProductPricingMeta(item)
+                      return (
+                      <article
+                        className="offers-hero-card"
+                        key={item.id}
+                        onClick={() => openProduct(item)}
+                        onKeyDown={(event) => event.key === 'Enter' && openProduct(item)}
+                        role="button"
+                        tabIndex={0}
+                      >
+                        <div>
+                          <span className="offers-hero-chip is-soft">{item.offer_banner_label || item?.active_offer?.festival_name || 'Live Offer'}</span>
+                          <h4>{item.title}</h4>
+                          <div className="offers-hero-card-price">
+                            <strong>{formatInr(tilePricing?.effectivePrice ?? item?.active_offer?.offer_price ?? item?.display_price ?? item?.selling_price) || '-'}</strong>
+                            {tilePricing?.hasComparePrice && <span>{formatInr(tilePricing.comparePrice)}</span>}
+                          </div>
+                        </div>
+                        <small>
+                          Save {formatInr(item?.active_offer?.savings_amount) || '₹0'}
+                          {Number.isFinite(Number(item?.active_offer?.savings_percent))
+                            ? ` • ${Number(item.active_offer.savings_percent)}% off`
+                            : ''}
+                        </small>
+                      </article>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+            </section>
           )}
-        </section>
+
+          <section className={`home-products ${viewTransition === 'to-home' ? 'is-entering' : ''}`} aria-labelledby="home-products-title">
+            <div className="home-products-head">
+              <h2 id="home-products-title">{searchText.trim() ? 'Search Results' : 'Products'}</h2>
+            </div>
+
+            {isLoadingProducts && <p className="products-meta">Loading products...</p>}
+
+            {!isLoadingProducts && productsError && (
+              <p className="products-meta products-error">Could not fetch products: {productsError}</p>
+            )}
+
+            {!isLoadingProducts && !productsError && products.length === 0 && (
+              <p className="products-meta">No products found.</p>
+            )}
+
+            {!isLoadingProducts && !productsError && products.length > 0 && (
+              <div className="product-grid">
+                {products.map((product) => {
+                  const image = Array.isArray(product.images) ? product.images[0] : null
+                  const pricing = getProductPricingMeta(product)
+                  const price = formatInr(pricing.effectivePrice)
+                  const comparePrice = formatInr(pricing.comparePrice)
+                  const hasReviews = Number(product.review_count) > 0 && Number.isFinite(Number(product.review_average))
+
+                  return (
+                    <article
+                      className="product-card"
+                      key={product.id}
+                      onClick={() => openProduct(product)}
+                      onKeyDown={(event) => event.key === 'Enter' && openProduct(product)}
+                      role="button"
+                      tabIndex={0}
+                    >
+                      <div className="product-media">
+                        {pricing.discountBadgeLabel && (
+                          <span className="product-offer-badge">
+                            {pricing.discountBadgeLabel}
+                          </span>
+                        )}
+                        {image ? <img src={image} alt={product.title} loading="lazy" /> : <span>No image</span>}
+                      </div>
+                      <div className="product-copy">
+                        <h3>{product.title}</h3>
+                        <p className="product-category">{product.category || 'Uncategorized'}</p>
+                        <div className="product-rating">
+                          {hasReviews ? (
+                            <>
+                              <span className="rating-chip">
+                                {Number(product.review_average).toFixed(1)} <span aria-hidden="true">&#9733;</span>
+                              </span>
+                              <span className="rating-count">({product.review_count})</span>
+                            </>
+                          ) : (
+                            <span className="rating-empty">No reviews yet</span>
+                          )}
+                        </div>
+                        <div className="product-pricing">
+                          <strong>{price || '-'}</strong>
+                          {pricing.hasComparePrice && <span>{comparePrice}</span>}
+                        </div>
+                        {pricing.hasComparePrice && (
+                          <p className="product-offer-note">
+                            Save {formatInr(pricing.savingsAmount) || '₹0'}
+                            {pricing.activeOffer?.festival_name ? ` | ${pricing.activeOffer.festival_name}` : ''}
+                            {pricing.activeOffer?.end_at ? ` | Ends ${formatDateTime(pricing.activeOffer.end_at)}` : ''}
+                          </p>
+                        )}
+                      </div>
+                    </article>
+                  )
+                })}
+              </div>
+            )}
+          </section>
+        </>
       )}
 
       {activeProductId && !activeQuickPanel && (
@@ -4445,8 +5703,22 @@ function App() {
 
                   <div className="pdp-price-row">
                     <strong>{detailPrice || '-'}</strong>
-                    {detailHasStrike && <span>{detailMrp}</span>}
+                    {detailHasStrike && <span>{detailComparePrice}</span>}
                   </div>
+                  {detailPricing.hasComparePrice && (
+                    <div className="pdp-offer-banner">
+                      <span>{detailOffer?.festival_name || detailPricing.discountBadgeLabel || 'Discount'}</span>
+                      <strong>
+                        Save {formatInr(detailPricing.savingsAmount) || '₹0'}
+                        {Number.isFinite(Number(detailPricing.savingsPercent)) ? ` (${Number(detailPricing.savingsPercent)}% off)` : ''}
+                      </strong>
+                      <p>
+                        {detailOffer?.end_at
+                          ? `Offer ends ${formatDateTime(detailOffer.end_at)}`
+                          : 'Offer live now'}
+                      </p>
+                    </div>
+                  )}
 
                   <form className="pdp-delivery-check" onSubmit={checkDeliveryAvailability}>
                     <label htmlFor="pdp-pincode">Check delivery to your area</label>
@@ -4559,7 +5831,9 @@ function App() {
                   <div className="similar-row">
                     {similarProducts.map((item) => {
                       const image = Array.isArray(item.images) ? item.images[0] : null
-                      const price = formatInr(item.selling_price)
+                      const pricing = getProductPricingMeta(item)
+                      const price = formatInr(pricing.effectivePrice)
+                      const comparePrice = formatInr(pricing.comparePrice)
                       const hasReviews = Number(item.review_count) > 0 && Number.isFinite(Number(item.review_average))
 
                       return (
@@ -4572,6 +5846,7 @@ function App() {
                           tabIndex={0}
                         >
                           <div className="similar-media">
+                            {pricing.discountBadgeLabel && <span className="product-offer-badge">{pricing.discountBadgeLabel}</span>}
                             {image ? <img src={image} alt={item.title} loading="lazy" /> : <span>No image</span>}
                           </div>
                           <h3>{item.title}</h3>
@@ -4581,6 +5856,13 @@ function App() {
                             <p className="similar-reviews">No reviews yet</p>
                           )}
                           <strong>{price || '-'}</strong>
+                          {pricing.hasComparePrice && <span className="similar-price-compare">{comparePrice}</span>}
+                          {pricing.hasComparePrice && (
+                            <p className="similar-reviews">
+                              Save {formatInr(pricing.savingsAmount) || '₹0'}
+                              {pricing.activeOffer?.end_at ? ` | Ends ${formatDateTime(pricing.activeOffer.end_at)}` : ''}
+                            </p>
+                          )}
                         </article>
                       )
                     })}
@@ -4716,21 +5998,33 @@ function App() {
             <div className="quick-panel-body">
               {isLoadingWishlistItems && <p className="quick-panel-meta">Loading wishlist...</p>}
               {!isLoadingWishlistItems && wishlistItems.length === 0 && <p className="quick-panel-meta">No items in wishlist.</p>}
-              {!isLoadingWishlistItems && wishlistItems.map((item) => (
-                <article className="quick-panel-item" key={item.id}>
-                  <button type="button" className="quick-panel-thumb" onClick={() => { openProduct(item); closeQuickPanel() }}>
-                    {Array.isArray(item.images) && item.images[0] ? <img src={item.images[0]} alt={item.title} /> : <span>No image</span>}
-                  </button>
-                  <div className="quick-panel-copy">
-                    <strong>{item.title}</strong>
-                    <p>{formatInr(item.selling_price) || '-'}</p>
-                    <div className="quick-panel-row">
-                      <button type="button" onClick={() => addProductToCart(item)}>Add to Cart</button>
-                      <button type="button" onClick={() => removeFromWishlist(item.id)}>Remove</button>
+              {!isLoadingWishlistItems && wishlistItems.map((item) => {
+                const pricing = getProductPricingMeta(item)
+                return (
+                  <article className="quick-panel-item" key={item.id}>
+                    <button type="button" className="quick-panel-thumb" onClick={() => { openProduct(item); closeQuickPanel() }}>
+                      {Array.isArray(item.images) && item.images[0] ? <img src={item.images[0]} alt={item.title} /> : <span>No image</span>}
+                    </button>
+                    <div className="quick-panel-copy">
+                      <strong>{item.title}</strong>
+                      <p className="quick-panel-price">
+                        <strong>{formatInr(pricing.effectivePrice) || '-'}</strong>
+                        {pricing.hasComparePrice && <span>{formatInr(pricing.comparePrice)}</span>}
+                      </p>
+                      {pricing.hasComparePrice && (
+                        <p className="quick-panel-discount">
+                          {pricing.discountBadgeLabel}
+                          {pricing.savingsAmount ? ` | Save ${formatInr(pricing.savingsAmount) || '₹0'}` : ''}
+                        </p>
+                      )}
+                      <div className="quick-panel-row">
+                        <button type="button" onClick={() => addProductToCart(item)}>Add to Cart</button>
+                        <button type="button" onClick={() => removeFromWishlist(item.id)}>Remove</button>
+                      </div>
                     </div>
-                  </div>
-                </article>
-              ))}
+                  </article>
+                )
+              })}
             </div>
           </>
         )}
@@ -4744,18 +6038,24 @@ function App() {
             <div className="quick-panel-body">
               {cartItems.length === 0 && <p className="quick-panel-meta">Your cart is empty.</p>}
               {cartItems.map((item) => (
-                <article className="quick-panel-item" key={item.id}>
+                <article className="quick-panel-item" key={item.cart_key || item.id}>
                   <button type="button" className="quick-panel-thumb" onClick={() => { openProduct(item); closeQuickPanel() }}>
                     {item.image ? <img src={item.image} alt={item.title} /> : <span>No image</span>}
                   </button>
                   <div className="quick-panel-copy">
                     <strong>{item.title}</strong>
-                    <p>{formatInr(item.price) || '-'}</p>
+                    {item.variant_label && <p className="quick-panel-discount">{item.variant_label}</p>}
+                    <p className="quick-panel-price">
+                      <strong>{formatInr(item.price) || '-'}</strong>
+                      {Number.isFinite(Number(item.base_price)) && Number(item.base_price) > Number(item.price || 0) && (
+                        <span>{formatInr(item.base_price)}</span>
+                      )}
+                    </p>
                     <div className="quick-panel-row">
-                      <button type="button" onClick={() => updateCartQty(item.id, -1)}>-</button>
+                      <button type="button" onClick={() => updateCartQty(item.cart_key || item.id, -1)}>-</button>
                       <span>{item.qty || 1}</span>
-                      <button type="button" onClick={() => updateCartQty(item.id, 1)}>+</button>
-                      <button type="button" onClick={() => removeCartItem(item.id)}>Remove</button>
+                      <button type="button" onClick={() => updateCartQty(item.cart_key || item.id, 1)}>+</button>
+                      <button type="button" onClick={() => removeCartItem(item.cart_key || item.id)}>Remove</button>
                     </div>
                   </div>
                 </article>
@@ -4814,11 +6114,15 @@ function App() {
         {activeQuickPanel === 'address' && (
           <>
             <div className="quick-panel-head">
-              <h3>Add Address</h3>
+              <h3>{isCheckoutFlow ? 'Select Delivery Address' : 'Manage Addresses'}</h3>
               <button type="button" onClick={closeQuickPanel}>Back</button>
             </div>
             <div className="quick-panel-body">
-              <p className="quick-panel-meta">Select a delivery address or add a new one.</p>
+              <p className="quick-panel-meta">
+                {isCheckoutFlow
+                  ? 'Choose where this order should be delivered or add a new address.'
+                  : 'Review your saved addresses or add a new one.'}
+              </p>
 
               {isLoadingAddresses && <p className="quick-panel-meta">Loading addresses...</p>}
               {!isLoadingAddresses && addresses.length === 0 && <p className="quick-panel-meta">No saved addresses yet.</p>}
@@ -4829,7 +6133,9 @@ function App() {
                     <p>{address.line1}, {address.city}, {address.state} - {address.pincode}</p>
                     <p>{address.phone}</p>
                   </div>
-                  <button type="button" onClick={() => proceedToPayment(address)}>Deliver Here</button>
+                  <button type="button" onClick={() => proceedToPayment(address)}>
+                    {isCheckoutFlow ? 'Deliver Here' : (selectedCheckoutAddress?._id === address._id ? 'Selected' : 'Select')}
+                  </button>
                 </article>
               ))}
 
@@ -4901,6 +6207,11 @@ function App() {
               <p className="quick-panel-meta">
                 Deliver to: <strong>{selectedCheckoutAddress ? `${selectedCheckoutAddress.name}, ${selectedCheckoutAddress.city}` : 'Select an address'}</strong>
               </p>
+              <p className="quick-panel-meta">
+                Checkout for: <strong>{checkoutItemTotal} item{checkoutItemTotal === 1 ? '' : 's'}</strong>
+                {' '}| Total: <strong>{formatInr(checkoutSubtotal) || '-'}</strong>
+              </p>
+              <p className="quick-panel-meta">Cards are entered securely in Razorpay Checkout. Brandcart does not store full card details on this device.</p>
               <div className="payment-list">
                 {paymentOptions.map((option) => (
                   <button
@@ -4957,8 +6268,8 @@ function App() {
                         <span>Addresses</span>
                       </article>
                       <article>
-                        <strong>{savedCards.length}</strong>
-                        <span>Cards</span>
+                        <strong>Secure</strong>
+                        <span>Payments</span>
                       </article>
                       <article>
                         <strong>{reviewDrafts.length + qaItems.length}</strong>
@@ -5009,7 +6320,7 @@ function App() {
                       {[
                         ['device', 'Manage Devices', 'manage_devices'],
                         ['profile', 'Edit Profile', 'edit_profile'],
-                        ['cards', 'Saved Credit / Debit & Gift Cards', 'saved_cards'],
+                        ['cards', 'Payments & Security', 'saved_cards'],
                         ['address', 'Saved Addresses', 'saved_addresses'],
                         ['language', `Select Language (${accountLanguage})`, 'language'],
                         ['notification', `Notification Settings (${notificationsEnabled ? 'On' : 'Off'})`, 'notifications'],
@@ -5084,7 +6395,7 @@ function App() {
                     `Logout ${userPhone || 'buyer'}`,
                     'Manage Devices',
                     'Edit Profile',
-                    'Saved Credit / Debit & Gift Cards',
+                    'Payments & Security',
                     'Saved Addresses',
                     `Select Language (${accountLanguage})`,
                     `Notification Settings (${notificationsEnabled ? 'On' : 'Off'})`,
@@ -5164,23 +6475,16 @@ function App() {
               {accountView === 'cards' && (
                 <section className="account-section">
                   <div className="account-content">
-                    <form className="account-form" onSubmit={addSavedCard}>
-                      <label>Card Holder Name</label>
-                      <input type="text" value={cardForm.holder} onChange={(event) => setCardForm((prev) => ({ ...prev, holder: event.target.value }))} />
-                      <label>Card Number</label>
-                      <input type="text" inputMode="numeric" value={cardForm.number} onChange={(event) => setCardForm((prev) => ({ ...prev, number: event.target.value.replace(/\D/g, '').slice(0, 16) }))} />
-                      <label>Expiry (MM/YY)</label>
-                      <input type="text" value={cardForm.expiry} onChange={(event) => setCardForm((prev) => ({ ...prev, expiry: event.target.value.slice(0, 5) }))} />
-                      <button type="submit" className="account-primary-btn">Save Card</button>
-                    </form>
-                    {savedCards.length === 0 && <p className="quick-panel-meta">No saved cards.</p>}
-                    {savedCards.map((item) => (
-                      <article className="account-tile" key={item.id}>
-                        <strong>XXXX XXXX XXXX {item.last4}</strong>
-                        <p>{item.holder} | Exp: {item.expiry}</p>
-                        <button type="button" className="account-inline-btn" onClick={() => removeSavedCard(item.id)}>Remove</button>
-                      </article>
-                    ))}
+                    <article className="account-tile">
+                      <strong>Provider-managed card entry</strong>
+                      <p>Brandcart uses Razorpay Checkout for card, UPI, wallet, and netbanking payments.</p>
+                      <p className="quick-panel-meta">Full card numbers are not stored in this browser anymore.</p>
+                    </article>
+                    <article className="account-tile">
+                      <strong>Next upgrade</strong>
+                      <p>Saved instruments will appear here only after gateway tokenization is enabled server-side.</p>
+                      <p className="quick-panel-meta">Until then, card entry happens securely inside the payment provider checkout during payment.</p>
+                    </article>
                   </div>
                 </section>
               )}
@@ -5244,21 +6548,33 @@ function App() {
                   <div className="account-content">
                     {isLoadingWishlistItems && <p className="quick-panel-meta">Loading wishlist...</p>}
                     {!isLoadingWishlistItems && wishlistItems.length === 0 && <p className="quick-panel-meta">No items in wishlist.</p>}
-                    {!isLoadingWishlistItems && wishlistItems.map((item) => (
-                      <article className="quick-panel-item" key={item.id}>
-                        <button type="button" className="quick-panel-thumb" onClick={() => { openProduct(item); closeQuickPanel() }}>
-                          {Array.isArray(item.images) && item.images[0] ? <img src={item.images[0]} alt={item.title} /> : <span>No image</span>}
-                        </button>
-                        <div className="quick-panel-copy">
-                          <strong>{item.title}</strong>
-                          <p>{formatInr(item.selling_price) || '-'}</p>
-                          <div className="quick-panel-row">
-                            <button type="button" onClick={() => addProductToCart(item)}>Add to Cart</button>
-                            <button type="button" onClick={() => removeFromWishlist(item.id)}>Remove</button>
+                    {!isLoadingWishlistItems && wishlistItems.map((item) => {
+                      const pricing = getProductPricingMeta(item)
+                      return (
+                        <article className="quick-panel-item" key={item.id}>
+                          <button type="button" className="quick-panel-thumb" onClick={() => { openProduct(item); closeQuickPanel() }}>
+                            {Array.isArray(item.images) && item.images[0] ? <img src={item.images[0]} alt={item.title} /> : <span>No image</span>}
+                          </button>
+                          <div className="quick-panel-copy">
+                            <strong>{item.title}</strong>
+                            <p className="quick-panel-price">
+                              <strong>{formatInr(pricing.effectivePrice) || '-'}</strong>
+                              {pricing.hasComparePrice && <span>{formatInr(pricing.comparePrice)}</span>}
+                            </p>
+                            {pricing.hasComparePrice && (
+                              <p className="quick-panel-discount">
+                                {pricing.discountBadgeLabel}
+                                {pricing.savingsAmount ? ` | Save ${formatInr(pricing.savingsAmount) || '₹0'}` : ''}
+                              </p>
+                            )}
+                            <div className="quick-panel-row">
+                              <button type="button" onClick={() => addProductToCart(item)}>Add to Cart</button>
+                              <button type="button" onClick={() => removeFromWishlist(item.id)}>Remove</button>
+                            </div>
                           </div>
-                        </div>
-                      </article>
-                    ))}
+                        </article>
+                      )
+                    })}
                   </div>
                 </section>
               )}
@@ -5266,57 +6582,200 @@ function App() {
               {accountView === 'orders' && (
                 <section className="account-section">
                   <div className="account-content">
-                    <div className="form-group">
-                      <label>Order Status</label>
-                      <select value={buyerOrderStatusFilter} onChange={(event) => setBuyerOrderStatusFilter(event.target.value)}>
-                        {['all', 'created', 'shipped', 'out_for_delivery', 'delivery_otp_pending', 'delivered', 'cancelled', 'rto', 'return_requested'].map((status) => (
-                          <option key={status} value={status}>{status}</option>
-                        ))}
-                      </select>
+                    <div className="buyer-order-stats">
+                      <article>
+                        <strong>{buyerOrderStats.total}</strong>
+                        <span>Total Orders</span>
+                      </article>
+                      <article>
+                        <strong>{buyerOrderStats.active}</strong>
+                        <span>Active Shipments</span>
+                      </article>
+                      <article>
+                        <strong>{buyerOrderStats.returns}</strong>
+                        <span>Return Cases</span>
+                      </article>
+                      <article>
+                        <strong>{buyerOrderStats.refundsPending}</strong>
+                        <span>Refund Reviews</span>
+                      </article>
                     </div>
-                    <button type="button" className="account-inline-btn" disabled={isLoadingBuyerOrders} onClick={() => loadBuyerOrders()}>
-                      {isLoadingBuyerOrders ? 'Loading...' : 'Refresh Orders'}
-                    </button>
+                    <div className="buyer-order-toolbar">
+                      <div className="form-group">
+                        <label>Order Status</label>
+                        <select value={buyerOrderStatusFilter} onChange={(event) => setBuyerOrderStatusFilter(event.target.value)}>
+                          {buyerOrderStatusOptions.map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <button type="button" className="account-inline-btn" disabled={isLoadingBuyerOrders} onClick={() => loadBuyerOrders()}>
+                        {isLoadingBuyerOrders ? 'Loading...' : 'Refresh Orders'}
+                      </button>
+                    </div>
                     {isLoadingBuyerOrders && <p className="quick-panel-meta">Loading your orders...</p>}
                     {!isLoadingBuyerOrders && buyerOrders.length === 0 && <p className="quick-panel-meta">No orders found.</p>}
-                    {!isLoadingBuyerOrders && buyerOrders.map((order) => (
-                      <article className="account-tile" key={order.id || Math.random()}>
-                        <strong>{order?.product?.title || 'Product'} ({order?.id || '-'})</strong>
-                        <p>Status: {order?.status || '-'}</p>
-                        <p>Payment: {order?.payment?.method || '-'} ({order?.payment?.status || '-'})</p>
-                        <p>Amount: {formatCurrency(order?.pricing?.subtotal || 0)} | Qty: {Number(order?.quantity || 0)}</p>
-                        <p>Seller: {order?.seller_snapshot?.brand_name || '-'}</p>
-                        <p>Shipping Partner: {order?.shipping?.partner_name || 'Seller will update shipment soon'}</p>
-                        {order?.shipping?.tracking_number && (
-                          <p>AWB / Tracking ID: {order.shipping.tracking_number}</p>
-                        )}
-                        {order?.shipping?.tracking_url && (
-                          <p>
-                            Tracking Link:{' '}
-                            <a href={order.shipping.tracking_url} target="_blank" rel="noreferrer">Open courier tracking</a>
-                          </p>
-                        )}
-                        {order?.delivery_otp && !order?.shipping?.partner_name && (
-                          <p>Delivery OTP: <strong>{order.delivery_otp}</strong></p>
-                        )}
-                        {!order?.delivery_otp && order?.status === 'out_for_delivery' && !order?.shipping?.partner_name && (
-                          <p>Delivery OTP: waiting for courier update</p>
-                        )}
-                        {order?.shipping?.last_status_sync_at && (
-                          <p>Last Courier Sync: {formatDateTime(order?.shipping?.last_status_sync_at)}</p>
-                        )}
-                        <p>Placed: {formatDateTime(order?.created_at)}</p>
-                        <button
-                          type="button"
-                          className="account-inline-btn"
-                          disabled={isLoadingBuyerTimeline}
-                          onClick={() => loadBuyerOrderTimeline(order?.id)}
-                        >
-                          {isLoadingBuyerTimeline && activeBuyerTimelineOrderId === order?.id ? 'Loading...' : 'Track Order'}
-                        </button>
-                      </article>
-                    ))}
-                    <h4>Timeline</h4>
+                    {!isLoadingBuyerOrders && buyerOrders.map((order) => {
+                      const orderId = String(order?.id || '')
+                      const isUpdatingCancel = buyerUpdatingOrderActionId === `${orderId}:cancel`
+                      const isUpdatingReturn = buyerUpdatingOrderActionId === `${orderId}:return`
+                      const productPreview = order?.product?.id
+                        ? {
+                          id: order.product.id,
+                          title: order?.product?.title || 'Product',
+                          images: order?.product?.image ? [order.product.image] : [],
+                        }
+                        : null
+                      return (
+                        <article className="buyer-order-card" key={orderId || Math.random()}>
+                          <button
+                            type="button"
+                            className="buyer-order-media"
+                            onClick={() => {
+                              if (productPreview) {
+                                openProduct(productPreview)
+                                closeQuickPanel()
+                              }
+                            }}
+                            disabled={!productPreview}
+                          >
+                            {order?.product?.image ? <img src={order.product.image} alt={order?.product?.title || 'Product'} /> : <span>{getInitials(order?.product?.title || 'Product')}</span>}
+                          </button>
+                          <div className="buyer-order-body">
+                            <div className="buyer-order-head">
+                              <div>
+                                <strong>{order?.product?.title || 'Product'}</strong>
+                                <p>Order {orderId || '-'}</p>
+                              </div>
+                              <span className={`status-chip is-${getStatusTone(order?.status)}`}>{formatStatusText(order?.status)}</span>
+                            </div>
+                            <div className="buyer-order-meta">
+                              <p>Amount: {formatCurrency(order?.pricing?.subtotal || 0)} | Qty: {Number(order?.quantity || 0)}</p>
+                              <p>Payment: {formatStatusText(order?.payment?.method)} / {formatStatusText(order?.payment?.status)}</p>
+                              <p>Seller: {order?.seller_snapshot?.brand_name || '-'}</p>
+                              <p>Shipping Partner: {order?.shipping?.partner_name || 'Seller will update shipment soon'}</p>
+                              {order?.shipping?.tracking_number && <p>AWB / Tracking ID: {order.shipping.tracking_number}</p>}
+                              {order?.delivery_otp && !order?.shipping?.partner_name && <p>Delivery OTP: <strong>{order.delivery_otp}</strong></p>}
+                              {!order?.delivery_otp && order?.status === 'out_for_delivery' && !order?.shipping?.partner_name && <p>Delivery OTP: waiting for courier update</p>}
+                              {order?.shipping?.last_status_sync_at && <p>Last Courier Sync: {formatDateTime(order.shipping.last_status_sync_at)}</p>}
+                              <p>Placed: {formatDateTime(order?.created_at)}</p>
+                              {order?.delivered_at && <p>Delivered: {formatDateTime(order.delivered_at)}</p>}
+                              {order?.return_window_ends_at && <p>Return Window: {formatDateTime(order.return_window_ends_at)}</p>}
+                              {order?.cancellation?.requested_at && <p>Cancellation Requested: {formatDateTime(order.cancellation.requested_at)}</p>}
+                              {order?.return?.requested_at && <p>Return Requested: {formatDateTime(order.return.requested_at)}</p>}
+                              {order?.return?.seller_action_deadline && <p>Seller Response Due: {formatDateTime(order.return.seller_action_deadline)}</p>}
+                              {order?.return?.pickup_completed_at && <p>Pickup Completed: {formatDateTime(order.return.pickup_completed_at)}</p>}
+                              {order?.return?.refunded_at && <p>Refunded: {formatDateTime(order.return.refunded_at)}</p>}
+                              {order?.cancellation?.refunded_at && <p>Refunded: {formatDateTime(order.cancellation.refunded_at)}</p>}
+                              {order?.shipping?.tracking_url && (
+                                <p>
+                                  Tracking Link:{' '}
+                                  <a href={order.shipping.tracking_url} target="_blank" rel="noreferrer">Open courier tracking</a>
+                                </p>
+                              )}
+                            </div>
+                            <div className="buyer-order-care">
+                              {order?.payment?.status && (
+                                <span className={`status-chip is-${getStatusTone(order.payment.status)}`}>
+                                  Payment {formatStatusText(order.payment.status)}
+                                </span>
+                              )}
+                              {order?.return?.status && (
+                                <span className={`status-chip is-${getStatusTone(order.return.status)}`}>
+                                  Return {formatStatusText(order.return.status)}
+                                </span>
+                              )}
+                              {order?.return?.pickup_status && (
+                                <span className={`status-chip is-${getStatusTone(order.return.pickup_status)}`}>
+                                  Pickup {formatStatusText(order.return.pickup_status)}
+                                </span>
+                              )}
+                              {order?.return?.refund_status && (
+                                <span className={`status-chip is-${getStatusTone(order.return.refund_status)}`}>
+                                  Return Refund {formatStatusText(order.return.refund_status)}
+                                </span>
+                              )}
+                              {order?.cancellation?.refund_status && (
+                                <span className={`status-chip is-${getStatusTone(order.cancellation.refund_status)}`}>
+                                  Cancellation Refund {formatStatusText(order.cancellation.refund_status)}
+                                </span>
+                              )}
+                            </div>
+                            {order?.cancellation?.refund_note && <p className="quick-panel-meta">{order.cancellation.refund_note}</p>}
+                            {order?.return?.reason && <p className="quick-panel-meta">Return Reason: {formatStatusText(order.return.reason)}</p>}
+                            <div className="buyer-order-actions">
+                              <button
+                                type="button"
+                                className="account-inline-btn"
+                                disabled={isLoadingBuyerTimeline}
+                                onClick={() => loadBuyerOrderTimeline(orderId)}
+                              >
+                                {isLoadingBuyerTimeline && activeBuyerTimelineOrderId === orderId ? 'Loading...' : 'Track Order'}
+                              </button>
+                              {productPreview && (
+                                <button
+                                  type="button"
+                                  className="account-inline-btn"
+                                  onClick={() => {
+                                    openProduct(productPreview)
+                                    closeQuickPanel()
+                                  }}
+                                >
+                                  View Product
+                                </button>
+                              )}
+                            </div>
+                            {order?.actions?.can_cancel && (
+                              <div className="buyer-order-action-form">
+                                <div className="form-group">
+                                  <label>Cancel reason</label>
+                                  <select
+                                    value={buyerCancelReasonDrafts[orderId] || ''}
+                                    onChange={(event) => setBuyerCancelReasonDrafts((prev) => ({ ...prev, [orderId]: event.target.value }))}
+                                  >
+                                    {buyerCancelReasonOptions.map((option) => (
+                                      <option key={option.value || 'optional'} value={option.value}>{option.label}</option>
+                                    ))}
+                                  </select>
+                                </div>
+                                <button
+                                  type="button"
+                                  className="account-inline-btn"
+                                  disabled={isUpdatingCancel}
+                                  onClick={() => cancelBuyerOrder(orderId)}
+                                >
+                                  {isUpdatingCancel ? 'Cancelling...' : 'Cancel Order'}
+                                </button>
+                              </div>
+                            )}
+                            {order?.actions?.can_return && (
+                              <div className="buyer-order-action-form">
+                                <div className="form-group">
+                                  <label>Return reason</label>
+                                  <select
+                                    value={buyerReturnReasonDrafts[orderId] || ''}
+                                    onChange={(event) => setBuyerReturnReasonDrafts((prev) => ({ ...prev, [orderId]: event.target.value }))}
+                                  >
+                                    {buyerReturnReasonOptions.map((option) => (
+                                      <option key={option.value || 'required'} value={option.value}>{option.label}</option>
+                                    ))}
+                                  </select>
+                                </div>
+                                <button
+                                  type="button"
+                                  className="account-inline-btn"
+                                  disabled={isUpdatingReturn}
+                                  onClick={() => requestBuyerReturn(orderId)}
+                                >
+                                  {isUpdatingReturn ? 'Submitting...' : 'Request Return'}
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </article>
+                      )
+                    })}
+                    <p className="account-section-title">Tracking Timeline</p>
                     {buyerOrderTimeline.length === 0 ? (
                       <p className="quick-panel-meta">Select an order and tap "Track Order".</p>
                     ) : (
@@ -5684,6 +7143,87 @@ function App() {
                           onChange={(event) => setSellerCreateProductForm((prev) => ({ ...prev, stock: event.target.value }))}
                         />
                       </div>
+                      <div className="seller-variant-editor">
+                        <div className="seller-variant-head">
+                          <div>
+                            <strong>Variants</strong>
+                            <p className="quick-panel-meta">Optional. Add size, color, storage, or pack options. If variants are added, price and stock are derived automatically from them.</p>
+                          </div>
+                          <button type="button" className="account-inline-btn" onClick={addSellerVariantDraft}>Add Variant</button>
+                        </div>
+                        {sellerProductVariants.length === 0 && <p className="quick-panel-meta">No variants added. This product will use the single price and stock above.</p>}
+                        {sellerProductVariants.length > 0 && (
+                          <div className="seller-variant-list">
+                            {sellerProductVariants.map((variant, index) => (
+                              <article className="seller-variant-card" key={variant.id}>
+                                <div className="seller-variant-grid">
+                                  <div className="form-group">
+                                    <label>Label</label>
+                                    <input
+                                      type="text"
+                                      value={variant.label}
+                                      onChange={(event) => updateSellerVariantDraft(variant.id, 'label', event.target.value)}
+                                      placeholder="Size / Color / Storage"
+                                    />
+                                  </div>
+                                  <div className="form-group">
+                                    <label>Option</label>
+                                    <input
+                                      type="text"
+                                      value={variant.value}
+                                      onChange={(event) => updateSellerVariantDraft(variant.id, 'value', event.target.value)}
+                                      placeholder="128 GB / Black / XL"
+                                    />
+                                  </div>
+                                  <div className="form-group">
+                                    <label>MRP</label>
+                                    <input
+                                      type="number"
+                                      value={variant.mrp}
+                                      onChange={(event) => updateSellerVariantDraft(variant.id, 'mrp', event.target.value)}
+                                    />
+                                  </div>
+                                  <div className="form-group">
+                                    <label>Selling</label>
+                                    <input
+                                      type="number"
+                                      value={variant.selling_price}
+                                      onChange={(event) => updateSellerVariantDraft(variant.id, 'selling_price', event.target.value)}
+                                    />
+                                  </div>
+                                  <div className="form-group">
+                                    <label>Stock</label>
+                                    <input
+                                      type="number"
+                                      value={variant.stock}
+                                      onChange={(event) => updateSellerVariantDraft(variant.id, 'stock', event.target.value)}
+                                    />
+                                  </div>
+                                  <div className="form-group">
+                                    <label>SKU</label>
+                                    <input
+                                      type="text"
+                                      value={variant.sku}
+                                      onChange={(event) => updateSellerVariantDraft(variant.id, 'sku', event.target.value.toUpperCase())}
+                                      placeholder={`VAR-${index + 1}`}
+                                    />
+                                  </div>
+                                </div>
+                                <div className="form-group">
+                                  <label>Variant Image URL (optional)</label>
+                                  <input
+                                    type="text"
+                                    value={variant.image}
+                                    onChange={(event) => updateSellerVariantDraft(variant.id, 'image', event.target.value)}
+                                    placeholder="https://..."
+                                  />
+                                </div>
+                                <button type="button" className="account-inline-btn" onClick={() => removeSellerVariantDraft(variant.id)}>Remove Variant</button>
+                              </article>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                       <div className="form-group">
                         <label>Image URLs (comma or new-line separated)</label>
                         <textarea
@@ -5739,6 +7279,18 @@ function App() {
                             <div className="product-info">
                               <strong>{product.title}</strong>
                               <p className="product-category">Stock: {product.stock} | Reserved: {product.reserved_stock} | Available: {product.available_stock}</p>
+                              {Number(product.variant_count || 0) > 0 && (
+                                <p className="product-category">Variants: {Number(product.variant_count || 0)}</p>
+                              )}
+                              {Array.isArray(product.variants) && product.variants.length > 0 && (
+                                <div className="seller-variant-summary">
+                                  {product.variants.slice(0, 6).map((variant) => (
+                                    <span key={variant.id || variant.name}>
+                                      {getVariantDisplayLabel(variant)} | {formatCurrency(variant.selling_price)} | {Number(variant.available_stock || 0)} left
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
                             </div>
                             <div className="product-pricing">
                               <strong>{formatCurrency(product.selling_price)}</strong>
@@ -5971,7 +7523,13 @@ function App() {
                     )}
                   </div>
                 )
-              case 'offers':
+              case 'offers': {
+                const selectedOfferProduct = sellerProducts.find((product) => String(product?.id || '') === String(sellerOfferForm.product_id || ''))
+                const existingSelectedOffer = sellerOffers.find((offer) => (
+                  String(offer?.product_id || '') === String(sellerOfferForm.product_id || '')
+                  && String(offer?.status || '').toLowerCase() === 'active'
+                  && (!offer?.end_at || Date.parse(offer.end_at) >= Date.now())
+                ))
                 return (
                   <div className="seller-section">
                     <h2>Offers</h2>
@@ -5994,9 +7552,14 @@ function App() {
                         <label>Offer Price</label>
                         <input
                           type="number"
+                          min="0"
+                          step="0.01"
                           value={sellerOfferForm.offer_price}
                           onChange={(event) => setSellerOfferForm((prev) => ({ ...prev, offer_price: event.target.value }))}
                         />
+                        {selectedOfferProduct && (
+                          <p className="quick-panel-meta">Current product price: {formatCurrency(selectedOfferProduct.selling_price)}</p>
+                        )}
                       </div>
                       <div className="form-group">
                         <label>Start</label>
@@ -6021,9 +7584,13 @@ function App() {
                           value={sellerOfferForm.festival_slug}
                           onChange={(event) => setSellerOfferForm((prev) => ({ ...prev, festival_slug: event.target.value }))}
                         />
+                        <p className="quick-panel-meta">Leave this blank unless an admin gave you a live festival slug.</p>
                       </div>
+                      {existingSelectedOffer && (
+                        <p className="quick-panel-meta">A live offer already exists for this product. Saving here will update that offer instead of throwing a 400.</p>
+                      )}
                       <button type="submit" className="seller-button primary" disabled={isCreatingSellerOffer}>
-                        {isCreatingSellerOffer ? 'Creating...' : 'Create Offer'}
+                        {isCreatingSellerOffer ? 'Saving...' : 'Create / Update Offer'}
                       </button>
                     </form>
                     <h3>Existing Offers</h3>
@@ -6038,7 +7605,7 @@ function App() {
                           return (
                             <div key={offerId || `offer-${index}`} className="product-row">
                               <div className="product-info">
-                                <strong>Product: {String(offer.product_id || '-')}</strong>
+                                <strong>Product: {offer.product_title || String(offer.product_id || '-')}</strong>
                                 <p className="product-category">Offer: {formatCurrency(offer.offer_price)} | Status: {offer.status || '-'}</p>
                                 <p className="product-category">{formatDateTime(offer.start_at)} to {formatDateTime(offer.end_at)}</p>
                               </div>
@@ -6067,6 +7634,7 @@ function App() {
                     )}
                   </div>
                 )
+              }
               case 'wallet': {
                 const payoutRequests = Array.isArray(sellerWallet?.payout_requests) ? sellerWallet.payout_requests : []
                 const activeEmergencyPayout = sellerWallet?.emergency_payout?.active_request || payoutRequests.find((request) => ['requested', 'processing'].includes(String(request?.status || '').toLowerCase()))
@@ -6074,6 +7642,7 @@ function App() {
                 return (
                   <div className="seller-section">
                     <h2>Wallet & Payouts</h2>
+                    {!sellerWallet && <p className="quick-panel-meta">Wallet data is unavailable right now. Refresh the dashboard and try again.</p>}
                     {sellerWallet && (
                       <>
                         <div className="wallet-summary">

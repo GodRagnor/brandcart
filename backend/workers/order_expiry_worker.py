@@ -25,17 +25,24 @@ async def order_expiry_worker():
 
         async for order in cursor:
             try:
-                # Cancel order
-                await db.orders.update_one(
-                    {"_id": order["_id"]},
+                # Cancel only if the order is still awaiting online payment.
+                update_res = await db.orders.update_one(
+                    {
+                        "_id": order["_id"],
+                        "payment.method": "RAZORPAY",
+                        "payment.status": "pending",
+                        "status": "created",
+                    },
                     {
                         "$set": {
                             "status": "cancelled",
                             "updated_at": now,
                             "cancel_reason": "RAZORPAY_PAYMENT_TIMEOUT",
                         }
-                    }
+                    },
                 )
+                if update_res.modified_count != 1:
+                    continue
 
                 # Release reserved stock if order expired before payment
                 await db.products.update_one(

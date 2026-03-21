@@ -1,7 +1,8 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 # =====================================================
 # ENV
@@ -85,6 +86,9 @@ BANK_DATA_ENCRYPTION_KEY = os.getenv("BANK_DATA_ENCRYPTION_KEY")
 # OTP & NOTIFICATIONS
 # =====================================================
 OTP_DEV_MODE = (os.getenv("OTP_DEV_MODE", "true")).lower() in {"1", "true", "yes", "on"}
+AUTH_COOKIE_SECURE = (os.getenv("AUTH_COOKIE_SECURE", "true" if ENV.lower() == "production" else "false")).lower() in {"1", "true", "yes", "on"}
+AUTH_COOKIE_SAMESITE = (os.getenv("AUTH_COOKIE_SAMESITE", "lax") or "lax").strip().lower()
+AUTH_COOKIE_DOMAIN = (os.getenv("AUTH_COOKIE_DOMAIN") or "").strip() or None
 
 # SMS Configuration (Twilio)
 SMS_PROVIDER = (os.getenv("SMS_PROVIDER") or "twilio").lower()
@@ -105,6 +109,19 @@ def validate_production_env() -> None:
     if (ENV or "").lower() != "production":
         return
 
+    if OTP_DEV_MODE:
+        raise RuntimeError("Production env misconfigured. OTP_DEV_MODE must be false in production.")
+
+    allowed_samesite = {"lax", "strict", "none"}
+    if AUTH_COOKIE_SAMESITE not in allowed_samesite:
+        raise RuntimeError(
+            f"Production env misconfigured. AUTH_COOKIE_SAMESITE must be one of: {', '.join(sorted(allowed_samesite))}"
+        )
+    if AUTH_COOKIE_SAMESITE == "none" and not AUTH_COOKIE_SECURE:
+        raise RuntimeError(
+            "Production env misconfigured. AUTH_COOKIE_SECURE must be true when AUTH_COOKIE_SAMESITE=none."
+        )
+
     required = {
         "JWT_SECRET": JWT_SECRET,
         "OTP_SECRET": OTP_SECRET,
@@ -121,9 +138,7 @@ def validate_production_env() -> None:
         "CLOUDINARY_API_KEY": CLOUDINARY_API_KEY,
         "CLOUDINARY_API_SECRET": CLOUDINARY_API_SECRET,
         "MONGODB_URI": MONGO_URI,
-        "TWILIO_ACCOUNT_SID": TWILIO_ACCOUNT_SID,
-        "TWILIO_AUTH_TOKEN": TWILIO_AUTH_TOKEN,
-        "TWILIO_FROM_PHONE": TWILIO_FROM_PHONE,
+        "BANK_DATA_ENCRYPTION_KEY": BANK_DATA_ENCRYPTION_KEY,
     }
 
     invalid = []
@@ -131,6 +146,41 @@ def validate_production_env() -> None:
         val = (value or "").strip()
         if not val or val.startswith("CHANGE_THIS"):
             invalid.append(key)
+
+    otp_channels_enabled = False
+    if SMS_PROVIDER == "twilio":
+        otp_channels_enabled = True
+        for key, value in {
+            "TWILIO_ACCOUNT_SID": TWILIO_ACCOUNT_SID,
+            "TWILIO_AUTH_TOKEN": TWILIO_AUTH_TOKEN,
+            "TWILIO_FROM_PHONE": TWILIO_FROM_PHONE,
+        }.items():
+            val = (value or "").strip()
+            if not val or val.startswith("CHANGE_THIS"):
+                invalid.append(key)
+    elif SMS_PROVIDER not in {"", "none"}:
+        invalid.append("SMS_PROVIDER")
+
+    if EMAIL_PROVIDER == "smtp":
+        otp_channels_enabled = True
+        for key, value in {
+            "SMTP_HOST": SMTP_HOST,
+            "SMTP_USER": SMTP_USER,
+            "SMTP_PASSWORD": SMTP_PASSWORD,
+        }.items():
+            val = (value or "").strip()
+            if not val or val.startswith("CHANGE_THIS"):
+                invalid.append(key)
+    elif EMAIL_PROVIDER not in {"", "none"}:
+        invalid.append("EMAIL_PROVIDER")
+
+    if not otp_channels_enabled:
+        invalid.append("OTP_PROVIDER")
+
+    if (RAZORPAY_KEY_ID or "").startswith("rzp_test_"):
+        invalid.append("RAZORPAY_KEY_ID_LIVE")
+    if (RAZORPAYX_KEY_ID or "").startswith("rzp_test_"):
+        invalid.append("RAZORPAYX_KEY_ID_LIVE")
 
     if invalid:
         raise RuntimeError(f"Production env misconfigured. Invalid keys: {', '.join(sorted(invalid))}")

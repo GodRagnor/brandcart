@@ -11,6 +11,11 @@ from utils.security import get_current_user, require_role
 from utils.slug import make_slug, generate_unique_seller_slug
 from utils.trust import SELLER_TIER_CONFIG
 from utils.payouts import execute_bank_payout, fetch_payout_status
+from utils.products import (
+    get_default_product_variant,
+    resolve_offer_reference_price,
+    serialize_active_offer,
+)
 from models.user import SellerTier
 
 
@@ -135,6 +140,72 @@ def serialize_payout_request(row: dict, seller: Optional[dict]) -> dict:
             "ifsc_code": bank_details.get("ifsc_code"),
             "bank_name": bank_details.get("bank_name"),
         } if bank_details else None,
+    }
+
+
+def serialize_order_care_case(row: dict, product: Optional[dict]) -> dict:
+    product_images = (product or {}).get("images") or []
+    cancellation = row.get("cancellation") or {}
+    return_data = row.get("return") or {}
+    payment = row.get("payment") or {}
+    pricing = row.get("pricing") or {}
+    delivery = row.get("delivery_address") or {}
+    snapshot = row.get("seller_snapshot") or {}
+    cancellation_status = cancellation.get("refund_status")
+    return_refund_status = return_data.get("refund_status")
+
+    return {
+        "order_id": str(row["_id"]),
+        "status": row.get("status"),
+        "product": {
+            "id": str(row.get("product_id")) if row.get("product_id") else None,
+            "title": (product or {}).get("title"),
+            "image": product_images[0] if product_images else None,
+        },
+        "seller_brand": snapshot.get("brand_name"),
+        "buyer_city": delivery.get("city"),
+        "buyer_pincode": delivery.get("pincode"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "pricing": {
+            "subtotal": pricing.get("subtotal", 0),
+            "unit_price": pricing.get("unit_price", 0),
+        },
+        "payment": {
+            "method": payment.get("method"),
+            "status": payment.get("status"),
+        },
+        "cancellation": {
+            "reason": cancellation.get("reason") or row.get("cancel_reason"),
+            "requested_at": cancellation.get("requested_at"),
+            "refund_status": cancellation_status,
+            "refund_amount": cancellation.get("refund_amount"),
+            "refunded_at": cancellation.get("refunded_at"),
+            "refund_note": cancellation.get("refund_note"),
+        },
+        "return": {
+            "status": return_data.get("status"),
+            "reason": return_data.get("reason"),
+            "requested_at": return_data.get("requested_at"),
+            "seller_action_deadline": return_data.get("seller_action_deadline"),
+            "pickup_status": return_data.get("pickup_status"),
+            "pickup_at": return_data.get("pickup_at"),
+            "pickup_completed_at": return_data.get("pickup_completed_at"),
+            "refund_status": return_refund_status,
+            "refund_amount": return_data.get("refund_amount"),
+            "refunded_at": return_data.get("refunded_at"),
+        },
+        "actions": {
+            "can_schedule_pickup": return_data.get("status") == "approved" and return_data.get("pickup_status") is None,
+            "can_mark_pickup_complete": return_data.get("pickup_status") == "scheduled",
+            "can_complete_return_refund": return_data.get("pickup_status") == "picked_up" and return_refund_status != "completed",
+            "can_complete_cancellation_refund": (
+                row.get("status") == "cancelled"
+                and payment.get("method") == "RAZORPAY"
+                and payment.get("status") == "paid"
+                and cancellation_status != "completed"
+            ),
+        },
     }
 
 
@@ -504,6 +575,143 @@ async def create_festival(
     await db.festivals.insert_one(festival)
     return {"message": "Festival created"}
 
+
+@router.get("/offers/summary")
+async def offers_summary(
+    admin=Depends(require_role("admin")),
+    db=Depends(get_db),
+):
+    now = datetime.utcnow()
+    active_filter = {
+        "status": "active",
+        "start_at": {"$lte": now},
+        "end_at": {"$gte": now},
+    }
+
+    active_offers = await db.seller_offers.find(active_filter).sort([
+        ("updated_at", -1),
+        ("end_at", 1),
+    ]).to_list(200)
+
+    seller_ids = await db.seller_offers.distinct("seller_id", active_filter)
+    scheduled_offers = await db.seller_offers.count_documents({
+        "status": "active",
+        "start_at": {"$gt": now},
+    })
+    festival_offer_count = await db.seller_offers.count_documents({
+        **active_filter,
+        "festival_id": {"$ne": None},
+    })
+    live_festivals = await db.festivals.find(
+        {"status": "live"},
+        {"name": 1, "slug": 1, "end_at": 1},
+    ).sort("created_at", -1).to_list(12)
+
+    product_ids = []
+    seen_product_ids = set()
+    festival_ids = []
+    seen_festival_ids = set()
+    for offer in active_offers:
+        product_id = offer.get("product_id")
+        if product_id and product_id not in seen_product_ids:
+            seen_product_ids.add(product_id)
+            product_ids.append(product_id)
+        festival_id = offer.get("festival_id")
+        if festival_id and festival_id not in seen_festival_ids:
+            seen_festival_ids.add(festival_id)
+            festival_ids.append(festival_id)
+
+    products = await db.products.find(
+        {"_id": {"$in": product_ids}},
+        {"title": 1, "selling_price": 1, "mrp": 1, "images": 1, "seller_id": 1, "variants": 1, "default_variant_id": 1},
+    ).to_list(len(product_ids) or 1)
+    products_by_id = {row["_id"]: row for row in products}
+
+    sellers = await db.users.find(
+        {"_id": {"$in": seller_ids}, "role": "seller"},
+        {"seller_profile.brand_name": 1, "phone": 1, "seller_status": 1, "is_frozen": 1},
+    ).to_list(len(seller_ids) or 1)
+    sellers_by_id = {row["_id"]: row for row in sellers}
+
+    festivals = await db.festivals.find(
+        {"_id": {"$in": festival_ids}},
+        {"name": 1, "slug": 1},
+    ).to_list(len(festival_ids) or 1)
+    festivals_by_id = {row["_id"]: row for row in festivals}
+
+    offer_rows = []
+    for offer in active_offers:
+        product = products_by_id.get(offer.get("product_id"))
+        seller = sellers_by_id.get(offer.get("seller_id"))
+        if not product or not seller:
+            continue
+
+        festival = festivals_by_id.get(offer.get("festival_id"))
+        default_variant = get_default_product_variant(product)
+        reference_price = resolve_offer_reference_price(
+            mrp=(default_variant or {}).get("mrp", product.get("mrp")),
+            selling_price=(default_variant or {}).get("selling_price", product.get("selling_price")),
+        )
+        promo = serialize_active_offer(
+            offer,
+            base_price=reference_price,
+            festival_name=festival.get("name") if festival else None,
+        ) or {}
+
+        offer_rows.append({
+            "offer_id": str(offer["_id"]),
+            "product_id": str(product["_id"]),
+            "product_title": product.get("title"),
+            "product_image": (product.get("images") or [None])[0],
+            "seller_id": str(seller["_id"]),
+            "seller_brand": seller.get("seller_profile", {}).get("brand_name"),
+            "seller_phone": seller.get("phone"),
+            "seller_status": seller.get("seller_status"),
+            "seller_frozen": bool(seller.get("is_frozen")),
+            "offer_price": promo.get("offer_price"),
+            "base_price": reference_price,
+            "savings_amount": promo.get("savings_amount"),
+            "savings_percent": promo.get("savings_percent"),
+            "festival_name": promo.get("festival_name"),
+            "festival_slug": festival.get("slug") if festival else None,
+            "start_at": offer.get("start_at"),
+            "end_at": offer.get("end_at"),
+            "used_count": int(offer.get("used_count", 0) or 0),
+        })
+
+    top_offers = sorted(
+        offer_rows,
+        key=lambda row: (
+            -(float(row.get("savings_amount") or 0)),
+            -int(row.get("used_count") or 0),
+            str(row.get("end_at") or ""),
+        ),
+    )[:6]
+    expiring_offers = sorted(
+        offer_rows,
+        key=lambda row: str(row.get("end_at") or ""),
+    )[:6]
+
+    return {
+        "summary": {
+            "active_offers": len(offer_rows),
+            "scheduled_offers": scheduled_offers,
+            "festival_offers": festival_offer_count,
+            "sellers_running_offers": len(seller_ids),
+            "live_festivals": len(live_festivals),
+        },
+        "top_offers": top_offers,
+        "expiring_offers": expiring_offers,
+        "live_festivals": [
+            {
+                "name": row.get("name"),
+                "slug": row.get("slug"),
+                "end_at": row.get("end_at"),
+            }
+            for row in live_festivals
+        ],
+    }
+
 # =========================================================
 # SELLER RISK SNAPSHOT
 # =========================================================
@@ -664,6 +872,71 @@ async def order_summary(
         "delivered_orders": delivered,
         "rto_orders": rto,
         "refunds_completed": refunds,
+    }
+
+
+@router.get("/orders/care-cases")
+async def order_care_cases(
+    admin=Depends(require_role("admin")),
+    db=Depends(get_db),
+):
+    buyer_cancellations = await db.orders.count_documents({
+        "status": "cancelled",
+        "cancel_reason": "BUYER_REQUESTED",
+    })
+    prepaid_cancellation_refunds_pending = await db.orders.count_documents({
+        "status": "cancelled",
+        "payment.method": "RAZORPAY",
+        "payment.status": "paid",
+        "cancellation.refund_status": {"$ne": "completed"},
+    })
+    open_return_requests = await db.orders.count_documents({"return.status": "requested"})
+    pickup_scheduled = await db.orders.count_documents({"return.pickup_status": "scheduled"})
+    refunds_pending = await db.orders.count_documents({
+        "return.pickup_status": "picked_up",
+        "return.refund_status": {"$ne": "completed"},
+    })
+
+    raw_rows = await db.orders.find({
+        "$or": [
+            {"status": "cancelled"},
+            {"return.status": {"$in": ["requested", "approved", "rejected"]}},
+            {"return.pickup_status": {"$in": ["scheduled", "picked_up"]}},
+            {"return.refund_status": "completed"},
+        ]
+    }).sort("updated_at", -1).limit(80).to_list(80)
+
+    product_ids = [row.get("product_id") for row in raw_rows if row.get("product_id")]
+    products = await db.products.find(
+        {"_id": {"$in": product_ids}},
+        {"title": 1, "images": 1},
+    ).to_list(len(product_ids) or 1)
+    products_by_id = {row["_id"]: row for row in products}
+
+    cases = [serialize_order_care_case(row, products_by_id.get(row.get("product_id"))) for row in raw_rows]
+    cancellation_queue = [row for row in cases if row.get("status") == "cancelled"][:8]
+    return_queue = [
+        row for row in cases
+        if (row.get("return") or {}).get("status") in {"requested", "approved"}
+        or (row.get("return") or {}).get("pickup_status") in {"scheduled", "picked_up"}
+    ][:8]
+    refund_queue = [
+        row for row in cases
+        if (row.get("actions") or {}).get("can_complete_return_refund")
+        or (row.get("actions") or {}).get("can_complete_cancellation_refund")
+    ][:8]
+
+    return {
+        "summary": {
+            "buyer_cancellations": buyer_cancellations,
+            "prepaid_cancellation_refunds_pending": prepaid_cancellation_refunds_pending,
+            "open_return_requests": open_return_requests,
+            "pickup_scheduled": pickup_scheduled,
+            "refunds_pending": refunds_pending,
+        },
+        "cancellation_queue": cancellation_queue,
+        "return_queue": return_queue,
+        "refund_queue": refund_queue,
     }
 
 

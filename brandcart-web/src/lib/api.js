@@ -1,8 +1,30 @@
 const envBase = import.meta.env.VITE_API_BASE_URL?.trim() || ''
-const API_BASE_URL = validateApiUrl(envBase)
+const API_BASE_URL = resolveApiBaseUrl(envBase)
 const COOKIE_SESSION_TOKEN = '__cookie_session__'
 
 let refreshPromise = null
+
+function isLocalLoopbackUrl(url) {
+  if (!url) return false
+  try {
+    const parsed = new URL(url)
+    return parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1'
+  } catch {
+    return false
+  }
+}
+
+function resolveApiBaseUrl(url) {
+  if (import.meta.env.DEV && typeof window !== 'undefined') {
+    const hostname = window.location.hostname
+    const isLocalFrontend = hostname === 'localhost' || hostname === '127.0.0.1'
+    if (isLocalFrontend && (!url || isLocalLoopbackUrl(url))) {
+      return ''
+    }
+  }
+
+  return validateApiUrl(url)
+}
 
 function validateApiUrl(url) {
   if (!url) return ''
@@ -100,8 +122,10 @@ async function apiRequest(path, options = {}) {
   if (!res.ok) {
     let message = `HTTP ${res.status}`
     let errorCode = ''
+    let responseText = ''
     try {
-      const payload = await res.json()
+      responseText = await res.text()
+      const payload = responseText ? JSON.parse(responseText) : null
       if (payload?.detail) {
         message = typeof payload.detail === 'string' ? payload.detail : JSON.stringify(payload.detail)
       } else if (payload?.message) {
@@ -111,7 +135,7 @@ async function apiRequest(path, options = {}) {
         errorCode = payload.code
       }
     } catch {
-      message = `HTTP ${res.status}`
+      message = responseText?.trim() || `HTTP ${res.status}`
     }
 
     if (res.status === 401) {
