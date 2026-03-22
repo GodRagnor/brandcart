@@ -16,6 +16,12 @@ from utils.validators import normalize_phone
 from utils.guards import parse_object_id
 from utils.order_timeline import record_order_event
 from utils.products import release_product_inventory, serialize_product_variant
+from utils.promo_codes import (
+    ALLOWED_PROMO_KINDS,
+    normalize_promo_code,
+    normalize_promo_payment_methods,
+    is_reserved_static_promo_code,
+)
 from routes.auth import SellerDocuments
 
 router = APIRouter(
@@ -51,6 +57,20 @@ class SellerOfferCreate(BaseModel):
     start_at: datetime
     end_at: datetime
     festival_slug: Optional[str] = None
+
+
+class SellerPromoCodeCreate(BaseModel):
+    code: str = Field(..., min_length=3, max_length=24)
+    title: str = Field(..., min_length=3, max_length=80)
+    description: Optional[str] = Field(default=None, max_length=180)
+    product_id: Optional[str] = None
+    kind: str = Field(..., min_length=4, max_length=12)
+    value: float = Field(..., gt=0)
+    max_discount: Optional[float] = Field(default=None, gt=0)
+    min_subtotal: float = Field(default=0, ge=0)
+    payment_methods: List[str] = Field(default_factory=lambda: ["COD", "RAZORPAY"])
+    start_at: datetime
+    end_at: datetime
 
 
 class EmergencyPayoutRequest(BaseModel):
@@ -248,6 +268,32 @@ def serialize_seller_offer(row: dict, product: Optional[dict] = None) -> dict:
         "festival_id": str(festival_id) if isinstance(festival_id, ObjectId) else (str(festival_id) if festival_id else None),
         "status": row.get("status"),
         "used_count": int(row.get("used_count", 0) or 0),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def serialize_seller_promo_code(row: dict, product: Optional[dict] = None) -> dict:
+    promo_id = row.get("_id")
+    seller_id = row.get("seller_id")
+    product_id = row.get("product_id")
+    return {
+        "id": str(promo_id) if promo_id else None,
+        "seller_id": str(seller_id) if isinstance(seller_id, ObjectId) else (str(seller_id) if seller_id else None),
+        "product_id": str(product_id) if isinstance(product_id, ObjectId) else (str(product_id) if product_id else None),
+        "product_title": product.get("title") if isinstance(product, dict) else None,
+        "code": row.get("code"),
+        "title": row.get("title"),
+        "description": row.get("description"),
+        "kind": row.get("kind"),
+        "value": float(row.get("value", 0) or 0),
+        "max_discount": float(row.get("max_discount", 0) or 0),
+        "min_subtotal": float(row.get("min_subtotal", 0) or 0),
+        "payment_methods": normalize_promo_payment_methods(row.get("payment_methods") or []),
+        "status": row.get("status") or "active",
+        "used_count": int(row.get("used_count", 0) or 0),
+        "start_at": row.get("start_at"),
+        "end_at": row.get("end_at"),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
     }
@@ -2021,3 +2067,176 @@ async def list_offers(
     return {
         "offers": [serialize_seller_offer(row, product=products_by_id.get(row.get("product_id"))) for row in offers]
     }
+
+
+@router.get("/promo-codes")
+async def list_promo_codes(
+    seller=Depends(require_role("seller")),
+    db=Depends(get_db),
+):
+    promo_codes = await db.seller_promo_codes.find(
+        {"seller_id": seller["_id"]}
+    ).sort("created_at", -1).to_list(200)
+
+    product_ids = [row.get("product_id") for row in promo_codes if row.get("product_id")]
+    products_by_id = {}
+    if product_ids:
+        products = await db.products.find(
+            {"_id": {"$in": product_ids}},
+            {"title": 1},
+        ).to_list(len(product_ids))
+        products_by_id = {row["_id"]: row for row in products}
+
+    return {
+        "promo_codes": [
+            serialize_seller_promo_code(row, product=products_by_id.get(row.get("product_id")))
+            for row in promo_codes
+        ]
+    }
+
+
+@router.post("/promo-codes")
+async def create_promo_code(
+    data: SellerPromoCodeCreate,
+    seller=Depends(require_role("seller")),
+    db=Depends(get_db),
+):
+    now = datetime.utcnow()
+    if seller.get("seller_status") != "verified":
+        raise HTTPException(403, "Seller not verified")
+    if seller.get("is_frozen") or seller.get("seller_status") == "frozen":
+        raise HTTPException(403, "Seller account frozen")
+
+    code = normalize_promo_code(data.code)
+    if len(code) < 3:
+        raise HTTPException(400, "Promo code must be at least 3 characters")
+    if is_reserved_static_promo_code(code):
+        raise HTTPException(400, "Promo code is reserved by Brandcart")
+
+    title = clean_optional_text(data.title)
+    if not title:
+        raise HTTPException(400, "Promo title is required")
+
+    kind = clean_optional_text(data.kind, lower=True)
+    if kind not in ALLOWED_PROMO_KINDS:
+        raise HTTPException(400, "Invalid promo type")
+
+    if kind == "percent" and float(data.value) > 100:
+        raise HTTPException(400, "Percent promo cannot exceed 100")
+
+    payment_methods = normalize_promo_payment_methods(data.payment_methods)
+    if not payment_methods:
+        raise HTTPException(400, "Choose at least one payment method")
+
+    if data.start_at >= data.end_at:
+        raise HTTPException(400, "Promo end time must be later than start time")
+
+    product_object_id = None
+    product = None
+    if clean_optional_text(data.product_id):
+        product_object_id = parse_object_id(data.product_id, "product_id")
+        product = await db.products.find_one({
+            "_id": product_object_id,
+            "seller_id": seller["_id"],
+        })
+        if not product:
+            raise HTTPException(404, "Product not found")
+
+    existing = await db.seller_promo_codes.find_one({"code": code})
+    if existing and existing.get("seller_id") != seller["_id"]:
+        raise HTTPException(400, "Promo code already used by another seller")
+
+    payload = {
+        "seller_id": seller["_id"],
+        "product_id": product_object_id,
+        "code": code,
+        "title": title,
+        "description": clean_optional_text(data.description),
+        "kind": kind,
+        "value": round(float(data.value), 2),
+        "max_discount": round(float(data.max_discount or 0), 2) if data.max_discount else 0.0,
+        "min_subtotal": round(float(data.min_subtotal or 0), 2),
+        "payment_methods": payment_methods,
+        "start_at": data.start_at,
+        "end_at": data.end_at,
+        "status": "active",
+        "updated_at": now,
+    }
+
+    if existing:
+        await db.seller_promo_codes.update_one(
+            {"_id": existing["_id"], "seller_id": seller["_id"]},
+            {"$set": payload},
+        )
+        updated = {**existing, **payload}
+        return {
+            "message": "Promo code updated successfully",
+            "promo_code": serialize_seller_promo_code(updated, product=product),
+        }
+
+    payload["used_count"] = 0
+    payload["created_at"] = now
+    result = await db.seller_promo_codes.insert_one(payload)
+
+    return {
+        "message": "Promo code created successfully",
+        "promo_code": serialize_seller_promo_code({**payload, "_id": result.inserted_id}, product=product),
+    }
+
+
+@router.patch("/promo-codes/{promo_code_id}/pause")
+async def pause_promo_code(
+    promo_code_id: str,
+    seller=Depends(require_role("seller")),
+    db=Depends(get_db),
+):
+    promo_object_id = parse_object_id(promo_code_id, "promo_code_id")
+    result = await db.seller_promo_codes.update_one(
+        {
+            "_id": promo_object_id,
+            "seller_id": seller["_id"],
+        },
+        {"$set": {"status": "paused", "updated_at": datetime.utcnow()}},
+    )
+    if result.modified_count == 0:
+        raise HTTPException(404, "Promo code not found")
+    return {"message": "Promo code paused"}
+
+
+@router.patch("/promo-codes/{promo_code_id}/resume")
+async def resume_promo_code(
+    promo_code_id: str,
+    seller=Depends(require_role("seller")),
+    db=Depends(get_db),
+):
+    promo_object_id = parse_object_id(promo_code_id, "promo_code_id")
+    result = await db.seller_promo_codes.update_one(
+        {
+            "_id": promo_object_id,
+            "seller_id": seller["_id"],
+        },
+        {"$set": {"status": "active", "updated_at": datetime.utcnow()}},
+    )
+    if result.modified_count == 0:
+        raise HTTPException(404, "Promo code not found")
+    return {"message": "Promo code resumed"}
+
+
+@router.delete("/promo-codes/{promo_code_id}")
+async def delete_promo_code(
+    promo_code_id: str,
+    seller=Depends(require_role("seller")),
+    db=Depends(get_db),
+):
+    promo_object_id = parse_object_id(promo_code_id, "promo_code_id")
+    promo_code = await db.seller_promo_codes.find_one({
+        "_id": promo_object_id,
+        "seller_id": seller["_id"],
+    })
+    if not promo_code:
+        raise HTTPException(404, "Promo code not found")
+    if int(promo_code.get("used_count", 0) or 0) > 0:
+        raise HTTPException(400, "Cannot delete promo code already used")
+
+    await db.seller_promo_codes.delete_one({"_id": promo_code["_id"]})
+    return {"message": "Promo code deleted"}

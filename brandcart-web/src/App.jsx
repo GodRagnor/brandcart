@@ -74,11 +74,14 @@ const ACCOUNT_NOTIFICATIONS_KEY = 'brandcartNotificationPrefs'
 const ACCOUNT_PRIVACY_KEY = 'brandcartPrivacyPrefs'
 const ACCOUNT_QA_KEY = 'brandcartQaItems'
 const ACCOUNT_REVIEWS_KEY = 'brandcartReviewDrafts'
+const RECENTLY_VIEWED_KEY = 'brandcartRecentlyViewed'
+const RECENTLY_VIEWED_LIMIT = 8
 const paymentOptions = [
   { id: 'RAZORPAY', title: 'UPI / Card / Wallet / NetBanking', subtitle: 'Secure online payment via Razorpay' },
   { id: 'COD', title: 'Cash on Delivery', subtitle: 'Pay when product is delivered' },
 ]
 let razorpayCheckoutPromise = null
+const normalizeCouponCodeInput = (value) => String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 24)
 
 const readAuthToken = () => ''
 const readAuthPhone = () => ''
@@ -115,6 +118,32 @@ const getInitials = (name) => {
   }
   const parts = name.trim().split(/\s+/).slice(0, 2)
   return parts.map((part) => part[0]?.toUpperCase() || '').join('') || 'BR'
+}
+
+const sanitizeRecentlyViewedProduct = (product) => {
+  if (!product?.id) {
+    return null
+  }
+
+  const reviewAverageCandidate = Number(product?.review_average ?? product?.rating?.avg ?? product?.rating)
+  const reviewCountCandidate = Number(product?.review_count ?? product?.rating?.count ?? 0)
+  const sellingPriceCandidate = Number(product?.selling_price ?? product?.display_price ?? 0)
+  const mrpCandidate = Number(product?.mrp)
+
+  return {
+    id: String(product.id),
+    title: product?.title || 'Product',
+    images: Array.isArray(product?.images) ? product.images.filter(Boolean).slice(0, 1) : [],
+    category: product?.category || '',
+    sub_category: product?.sub_category || '',
+    selling_price: Number.isFinite(sellingPriceCandidate) ? sellingPriceCandidate : 0,
+    mrp: Number.isFinite(mrpCandidate) ? mrpCandidate : null,
+    active_offer: product?.active_offer || null,
+    review_average: Number.isFinite(reviewAverageCandidate) ? reviewAverageCandidate : null,
+    review_count: Number.isFinite(reviewCountCandidate) ? reviewCountCandidate : 0,
+    created_at: product?.created_at || '',
+    updated_at: product?.updated_at || '',
+  }
 }
 
 // currency helper reused by seller dashboard
@@ -343,6 +372,120 @@ const buildCartEntryKey = (productId, variantId = '') => {
     return ''
   }
   return normalizedVariantId ? `${normalizedProductId}:${normalizedVariantId}` : normalizedProductId
+}
+
+const buildCartItemFromOrder = (order) => {
+  const productId = String(order?.product?.id || '').trim()
+  if (!productId) {
+    return null
+  }
+
+  const variant = order?.product?.variant || null
+  const variantId = String(variant?.id || '').trim()
+  const quantity = Math.max(1, Number.parseInt(order?.quantity ?? 1, 10) || 1)
+  const subtotalCandidate = Number(order?.pricing?.subtotal ?? 0)
+  const unitPriceCandidate = Number(
+    order?.pricing?.unit_price
+    ?? variant?.selling_price
+    ?? (quantity > 0 ? (subtotalCandidate / quantity) : 0)
+  )
+  const comparePriceCandidate = Number(variant?.mrp)
+  const variantLabel = [variant?.label, variant?.value].filter(Boolean).join(' | ') || variant?.name || ''
+
+  return {
+    id: productId,
+    cart_key: buildCartEntryKey(productId, variantId),
+    title: order?.product?.title || 'Product',
+    image: variant?.image || order?.product?.image || null,
+    price: Number.isFinite(unitPriceCandidate) ? unitPriceCandidate : 0,
+    base_price: Number.isFinite(comparePriceCandidate) && comparePriceCandidate > Number(unitPriceCandidate || 0)
+      ? comparePriceCandidate
+      : null,
+    offer_id: '',
+    variant_id: variantId,
+    variant_label: variantLabel,
+    qty: quantity,
+  }
+}
+
+const applyCatalogControls = (
+  items,
+  {
+    sortKey = 'featured',
+    priceBand = 'all',
+    ratingBand = 'all',
+    discountOnly = false,
+  } = {},
+) => {
+  const safeItems = Array.isArray(items) ? items : []
+  const minimumRating = ratingBand === 'all' ? 0 : Number.parseFloat(ratingBand)
+  const enriched = safeItems
+    .map((item) => {
+      const pricing = getProductPricingMeta(item)
+      const effectivePriceCandidate = Number(pricing.effectivePrice ?? item?.selling_price ?? item?.display_price ?? 0)
+      const reviewAverageCandidate = Number(item?.review_average ?? item?.rating?.avg ?? item?.rating)
+      const reviewCountCandidate = Number(item?.review_count ?? item?.rating?.count ?? 0)
+      const createdAt = Date.parse(item?.created_at || item?.updated_at || '') || 0
+
+      return {
+        item,
+        pricing,
+        effectivePrice: Number.isFinite(effectivePriceCandidate) ? effectivePriceCandidate : 0,
+        reviewAverage: Number.isFinite(reviewAverageCandidate) ? reviewAverageCandidate : 0,
+        reviewCount: Number.isFinite(reviewCountCandidate) ? reviewCountCandidate : 0,
+        createdAt,
+        discountPercent: Number.isFinite(Number(pricing.savingsPercent)) ? Number(pricing.savingsPercent) : 0,
+      }
+    })
+    .filter(({ pricing, effectivePrice, reviewAverage }) => {
+      if (discountOnly && !pricing.hasComparePrice) {
+        return false
+      }
+
+      if (minimumRating > 0 && reviewAverage < minimumRating) {
+        return false
+      }
+
+      if (priceBand === 'under_500') {
+        return effectivePrice < 500
+      }
+      if (priceBand === '500_to_1500') {
+        return effectivePrice >= 500 && effectivePrice <= 1500
+      }
+      if (priceBand === '1500_to_5000') {
+        return effectivePrice >= 1500 && effectivePrice <= 5000
+      }
+      if (priceBand === 'above_5000') {
+        return effectivePrice > 5000
+      }
+
+      return true
+    })
+
+  enriched.sort((left, right) => {
+    if (sortKey === 'price_low_to_high') {
+      return left.effectivePrice - right.effectivePrice || right.reviewAverage - left.reviewAverage
+    }
+    if (sortKey === 'price_high_to_low') {
+      return right.effectivePrice - left.effectivePrice || right.reviewAverage - left.reviewAverage
+    }
+    if (sortKey === 'rating_high_to_low') {
+      return right.reviewAverage - left.reviewAverage || right.reviewCount - left.reviewCount || left.effectivePrice - right.effectivePrice
+    }
+    if (sortKey === 'discount_high_to_low') {
+      return right.discountPercent - left.discountPercent || right.reviewAverage - left.reviewAverage || left.effectivePrice - right.effectivePrice
+    }
+    if (sortKey === 'newest_first') {
+      return right.createdAt - left.createdAt || right.reviewAverage - left.reviewAverage
+    }
+
+    return right.reviewAverage - left.reviewAverage
+      || right.reviewCount - left.reviewCount
+      || right.discountPercent - left.discountPercent
+      || left.effectivePrice - right.effectivePrice
+  })
+
+  return enriched.map(({ item }) => item)
 }
 
 const normalizeServerCartItems = (items) => (
@@ -870,7 +1013,6 @@ function App() {
   const [activeProductSummary, setActiveProductSummary] = useState(null)
   const [productDetail, setProductDetail] = useState(null)
   const [selectedImage, setSelectedImage] = useState('')
-  const [selectedVariantId, setSelectedVariantId] = useState('')
   const [isLoadingDetail, setIsLoadingDetail] = useState(false)
   const [detailError, setDetailError] = useState('')
 
@@ -915,6 +1057,11 @@ function App() {
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState('RAZORPAY')
   const [isPlacingOrder, setIsPlacingOrder] = useState(false)
   const [paymentError, setPaymentError] = useState('')
+  const [checkoutPromoInput, setCheckoutPromoInput] = useState('')
+  const [checkoutPromoCode, setCheckoutPromoCode] = useState('')
+  const [checkoutQuote, setCheckoutQuote] = useState(null)
+  const [isLoadingCheckoutQuote, setIsLoadingCheckoutQuote] = useState(false)
+  const [checkoutQuoteError, setCheckoutQuoteError] = useState('')
   const [buyerOrders, setBuyerOrders] = useState([])
   const [isLoadingBuyerOrders, setIsLoadingBuyerOrders] = useState(false)
   const [buyerOrderStatusFilter, setBuyerOrderStatusFilter] = useState('all')
@@ -924,6 +1071,17 @@ function App() {
   const [buyerUpdatingOrderActionId, setBuyerUpdatingOrderActionId] = useState('')
   const [buyerCancelReasonDrafts, setBuyerCancelReasonDrafts] = useState({})
   const [buyerReturnReasonDrafts, setBuyerReturnReasonDrafts] = useState({})
+  const [catalogSortKey, setCatalogSortKey] = useState('featured')
+  const [catalogPriceBand, setCatalogPriceBand] = useState('all')
+  const [catalogRatingBand, setCatalogRatingBand] = useState('all')
+  const [catalogDiscountOnly, setCatalogDiscountOnly] = useState(false)
+  const [recentlyViewedProducts, setRecentlyViewedProducts] = useState(() => {
+    const stored = readStoredJson(RECENTLY_VIEWED_KEY, [])
+    return (Array.isArray(stored) ? stored : [])
+      .map((item) => sanitizeRecentlyViewedProduct(item))
+      .filter(Boolean)
+      .slice(0, RECENTLY_VIEWED_LIMIT)
+  })
   const [deliveryPincode, setDeliveryPincode] = useState('')
   const [isCheckingDelivery, setIsCheckingDelivery] = useState(false)
   const [deliveryCheck, setDeliveryCheck] = useState({
@@ -986,9 +1144,11 @@ function App() {
   const [sellerServiceableRegions, setSellerServiceableRegions] = useState([])
   const [sellerAllIndia, setSellerAllIndia] = useState(false)
   const [sellerOffers, setSellerOffers] = useState([])
+  const [sellerPromoCodes, setSellerPromoCodes] = useState([])
   const [isLoadingSellerData, setIsLoadingSellerData] = useState(false)
   const [sellerDataError, setSellerDataError] = useState('')
   const [isLoadingSellerOffers, setIsLoadingSellerOffers] = useState(false)
+  const [isLoadingSellerPromoCodes, setIsLoadingSellerPromoCodes] = useState(false)
   const [sellerProfileForm, setSellerProfileForm] = useState({
     support_email: '',
     short_tagline: '',
@@ -1032,6 +1192,21 @@ function App() {
   })
   const [isCreatingSellerOffer, setIsCreatingSellerOffer] = useState(false)
   const [sellerUpdatingOfferId, setSellerUpdatingOfferId] = useState('')
+  const [sellerPromoCodeForm, setSellerPromoCodeForm] = useState({
+    code: '',
+    title: '',
+    description: '',
+    product_id: '',
+    kind: 'flat',
+    value: '',
+    max_discount: '',
+    min_subtotal: '',
+    start_at: '',
+    end_at: '',
+    payment_methods: ['COD', 'RAZORPAY'],
+  })
+  const [isCreatingSellerPromoCode, setIsCreatingSellerPromoCode] = useState(false)
+  const [sellerUpdatingPromoCodeId, setSellerUpdatingPromoCodeId] = useState('')
   const [sellerPayoutForm, setSellerPayoutForm] = useState({
     amount: '',
     account_holder_name: '',
@@ -1442,6 +1617,18 @@ function App() {
   }, [wishlistIds])
 
   useEffect(() => {
+    localStorage.setItem(
+      RECENTLY_VIEWED_KEY,
+      JSON.stringify(
+        (Array.isArray(recentlyViewedProducts) ? recentlyViewedProducts : [])
+          .map((item) => sanitizeRecentlyViewedProduct(item))
+          .filter(Boolean)
+          .slice(0, RECENTLY_VIEWED_LIMIT),
+      ),
+    )
+  }, [recentlyViewedProducts])
+
+  useEffect(() => {
     localStorage.removeItem(LEGACY_ACCOUNT_CARDS_KEY)
   }, [])
 
@@ -1630,6 +1817,7 @@ function App() {
       setSellerAllIndia(false)
       setSellerServiceableRegions([])
       setSellerOffers([])
+      setSellerPromoCodes([])
       setSellerOrders([])
       setSellerShippingPartners([])
       setSellerNotifications([])
@@ -1637,6 +1825,7 @@ function App() {
       setSellerShipmentDrafts({})
       setIsLoadingSellerData(false)
       setIsLoadingSellerOffers(false)
+      setIsLoadingSellerPromoCodes(false)
       setSellerDataError('')
       return
     }
@@ -1644,15 +1833,17 @@ function App() {
     const loadSellerData = async () => {
       setIsLoadingSellerData(true)
       setIsLoadingSellerOffers(true)
+      setIsLoadingSellerPromoCodes(true)
       setSellerDataError('')
       try {
-        const [perfData, prodData, walletData, profData, regionsData, offersData, bankData, ordersData, shippingPartnersData, notificationsData] = await Promise.all([
+        const [perfData, prodData, walletData, profData, regionsData, offersData, promoCodesData, bankData, ordersData, shippingPartnersData, notificationsData] = await Promise.all([
           apiGet('/api/seller/performance', { token: authToken }).catch(() => null),
           apiGet('/api/seller/my-products', { token: authToken }).catch(() => null),
           apiGet('/api/seller/wallet', { token: authToken }).catch(() => null),
           apiGet('/api/seller/profile', { token: authToken }).catch(() => null),
           apiGet('/api/seller/serviceable-regions', { token: authToken }).catch(() => null),
           apiGet('/api/seller/offers', { token: authToken }).catch(() => null),
+          apiGet('/api/seller/promo-codes', { token: authToken }).catch(() => null),
           apiGet('/api/seller/bank-account', { token: authToken }).catch(() => null),
           apiGet('/api/seller/orders?status=all&limit=50&page=1', { token: authToken }).catch(() => null),
           apiGet('/api/seller/shipping-partners/catalog?limit=100', { token: authToken }).catch(() => null),
@@ -1672,6 +1863,7 @@ function App() {
         setSellerAllIndia(Boolean(regionsData?.all_india))
         setSellerServiceableRegions(Array.isArray(regionsData?.serviceable_regions) ? regionsData.serviceable_regions : [])
         setSellerOffers(Array.isArray(offersData?.offers) ? offersData.offers : [])
+        setSellerPromoCodes(Array.isArray(promoCodesData?.promo_codes) ? promoCodesData.promo_codes : [])
         setSellerOrders(nextOrders)
         setSellerShippingPartners(Array.isArray(shippingPartnersData?.partners) ? shippingPartnersData.partners : [])
         setSellerNotifications(Array.isArray(notificationsData?.notifications) ? notificationsData.notifications : [])
@@ -1693,6 +1885,7 @@ function App() {
       } finally {
         setIsLoadingSellerData(false)
         setIsLoadingSellerOffers(false)
+        setIsLoadingSellerPromoCodes(false)
       }
     }
     loadSellerData()
@@ -1845,11 +2038,6 @@ function App() {
       try {
         const detail = await apiGet(`/api/products/${activeProductId}`)
         setProductDetail(detail)
-        if (Array.isArray(detail?.variants) && detail.variants.length > 0) {
-          setSelectedVariantId(String(detail?.default_variant?.id || detail.variants[0]?.id || ''))
-        } else {
-          setSelectedVariantId('')
-        }
         if (Array.isArray(detail?.images) && detail.images.length > 0) {
           setSelectedImage(detail.images[0])
         } else {
@@ -1857,7 +2045,6 @@ function App() {
         }
       } catch (error) {
         setProductDetail(null)
-        setSelectedVariantId('')
         setDetailError(error instanceof Error ? error.message : 'Failed to load product detail')
       } finally {
         setIsLoadingDetail(false)
@@ -1866,6 +2053,17 @@ function App() {
 
     loadProductDetail()
   }, [activeProductId])
+
+  useEffect(() => {
+    const normalized = sanitizeRecentlyViewedProduct(productDetail)
+    if (!normalized) {
+      return
+    }
+    setRecentlyViewedProducts((prev) => {
+      const next = [normalized, ...(Array.isArray(prev) ? prev : []).filter((item) => item?.id !== normalized.id)]
+      return next.slice(0, RECENTLY_VIEWED_LIMIT)
+    })
+  }, [productDetail])
 
   useEffect(() => {
     if (!activeProductId) {
@@ -2038,6 +2236,13 @@ function App() {
     }
   }
 
+  const clearCatalogControls = () => {
+    setCatalogSortKey('featured')
+    setCatalogPriceBand('all')
+    setCatalogRatingBand('all')
+    setCatalogDiscountOnly(false)
+  }
+
   const handleHomeShortcut = () => {
     setActiveQuickPanel('')
     setIsCategoryView(false)
@@ -2053,6 +2258,10 @@ function App() {
   const handleCategoriesShortcut = () => {
     setIsCategoryView(true)
     setActiveQuickPanel('')
+    if (searchText.trim()) {
+      setSearchText('')
+      loadProducts()
+    }
     if (activeProductId) {
       closeProduct()
     }
@@ -2251,6 +2460,7 @@ function App() {
     setSelectedCheckoutAddress(selectedAddress || null)
     setSelectedPaymentMethod('RAZORPAY')
     setPaymentError('')
+    setCheckoutQuoteError('')
     setActiveQuickPanel('payment')
   }
 
@@ -2290,7 +2500,7 @@ function App() {
     return razorpayCheckoutPromise
   }
 
-  const buildCreateOrderPath = ({ productId, quantity, paymentMethod, addressId, idempotencyKey, offerId, variantId }) => {
+  const buildCreateOrderPath = ({ productId, quantity, paymentMethod, addressId, idempotencyKey, offerId, variantId, couponCode }) => {
     const params = new URLSearchParams({
       product_id: String(productId),
       quantity: String(quantity),
@@ -2306,7 +2516,92 @@ function App() {
     if (variantId) {
       params.set('variant_id', String(variantId))
     }
+    if (couponCode) {
+      params.set('coupon_code', String(couponCode))
+    }
     return `/api/orders/create?${params.toString()}`
+  }
+
+  const buildCheckoutQuotePayload = (couponCode = '') => ({
+    items: checkoutItems.map((item) => ({
+      product_id: String(item.id),
+      quantity: assertValidOrderQuantity(item.qty || 1),
+      ...(item.offer_id ? { offer_id: String(item.offer_id) } : {}),
+      ...(item.variant_id ? { variant_id: String(item.variant_id) } : {}),
+    })),
+    payment_method: selectedPaymentMethod,
+    ...(couponCode ? { coupon_code: couponCode } : {}),
+  })
+
+  const requestCheckoutQuote = async (couponCode = '') => {
+    return apiPost('/api/orders/quote', buildCheckoutQuotePayload(couponCode), { token: authToken })
+  }
+
+  const refreshCheckoutQuoteFromEffect = useEffectEvent(async (couponCode = checkoutPromoCode, { fallbackToBase = false } = {}) => {
+    if (!checkoutItems.length) {
+      setCheckoutQuote(null)
+      setCheckoutQuoteError('')
+      return null
+    }
+
+    setIsLoadingCheckoutQuote(true)
+    if (!couponCode) {
+      setCheckoutQuoteError('')
+    }
+
+    try {
+      const response = await requestCheckoutQuote(couponCode)
+      setCheckoutQuote(response)
+      return response
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not load checkout summary'
+      setCheckoutQuoteError(message)
+
+      if (couponCode && fallbackToBase) {
+        setCheckoutPromoCode('')
+        try {
+          const fallbackResponse = await requestCheckoutQuote('')
+          setCheckoutQuote(fallbackResponse)
+          return fallbackResponse
+        } catch {
+          setCheckoutQuote(null)
+          return null
+        }
+      }
+
+      setCheckoutQuote(null)
+      return null
+    } finally {
+      setIsLoadingCheckoutQuote(false)
+    }
+  })
+
+  const applyCheckoutPromoCode = async (candidateCode = checkoutPromoInput) => {
+    const normalizedCode = normalizeCouponCodeInput(candidateCode)
+    if (!normalizedCode) {
+      setCheckoutQuoteError('Enter a valid promo code')
+      return
+    }
+
+    setIsLoadingCheckoutQuote(true)
+    setCheckoutQuoteError('')
+    try {
+      const response = await requestCheckoutQuote(normalizedCode)
+      const appliedCode = String(response?.summary?.applied_coupon_code || normalizedCode).trim().toUpperCase()
+      setCheckoutQuote(response)
+      setCheckoutPromoCode(appliedCode)
+      setCheckoutPromoInput(appliedCode)
+    } catch (error) {
+      setCheckoutQuoteError(error instanceof Error ? error.message : 'Could not apply promo code')
+    } finally {
+      setIsLoadingCheckoutQuote(false)
+    }
+  }
+
+  const removeCheckoutPromoCode = () => {
+    setCheckoutPromoInput('')
+    setCheckoutPromoCode('')
+    setCheckoutQuoteError('')
   }
 
   const placeCodOrders = async () => {
@@ -2330,6 +2625,7 @@ function App() {
           idempotencyKey: createIdempotencyKey('cod'),
           offerId: item.offer_id,
           variantId: item.variant_id,
+          couponCode: checkoutQuote?.summary?.applied_coupon_code || '',
         }),
         undefined,
         { token: authToken },
@@ -2359,6 +2655,7 @@ function App() {
         idempotencyKey: createIdempotencyKey('rzp-create'),
         offerId: item.offer_id,
         variantId: item.variant_id,
+        couponCode: checkoutQuote?.summary?.applied_coupon_code || '',
       }),
       undefined,
       { token: authToken },
@@ -2447,6 +2744,10 @@ function App() {
       setCheckoutFlow(null)
       setSelectedCheckoutAddress(null)
       setPaymentError('')
+      setCheckoutPromoInput('')
+      setCheckoutPromoCode('')
+      setCheckoutQuote(null)
+      setCheckoutQuoteError('')
       closeQuickPanel()
       flashNotice(`Order placed via ${methodLabel} for ${itemCount} item${itemCount > 1 ? 's' : ''}${city ? ` to ${city}` : ''}`)
     } catch (error) {
@@ -2457,6 +2758,16 @@ function App() {
       setIsPlacingOrder(false)
     }
   }
+
+  useEffect(() => {
+    if (activeQuickPanel !== 'payment' || !isCheckoutFlow || checkoutItems.length === 0) {
+      setCheckoutQuote(null)
+      setCheckoutQuoteError('')
+      return
+    }
+
+    refreshCheckoutQuoteFromEffect(checkoutPromoCode, { fallbackToBase: Boolean(checkoutPromoCode) })
+  }, [activeQuickPanel, isCheckoutFlow, checkoutFlow, buyNowItem, cartItems, checkoutItems.length, selectedPaymentMethod, checkoutPromoCode])
 
   const addProductToCart = (product, preferredImage = '') => {
     if (!product?.id) {
@@ -2537,6 +2848,13 @@ function App() {
     if (!product?.id) {
       return
     }
+    const normalized = sanitizeRecentlyViewedProduct(product)
+    if (normalized) {
+      setRecentlyViewedProducts((prev) => {
+        const next = [normalized, ...(Array.isArray(prev) ? prev : []).filter((item) => item?.id !== normalized.id)]
+        return next.slice(0, RECENTLY_VIEWED_LIMIT)
+      })
+    }
     setActiveProductSummary(product)
     setActiveProductId(product.id)
     const url = new URL(window.location.href)
@@ -2615,6 +2933,10 @@ function App() {
     setBuyNowItem(null)
     setSelectedCheckoutAddress(null)
     setPaymentError('')
+    setCheckoutPromoInput('')
+    setCheckoutPromoCode('')
+    setCheckoutQuote(null)
+    setCheckoutQuoteError('')
     setActiveQuickPanel('')
   }
 
@@ -2923,13 +3245,14 @@ function App() {
       return
     }
     try {
-      const [perfData, prodData, walletData, profData, regionsData, offersData, bankData, ordersData, shippingPartnersData, notificationsData] = await Promise.all([
+      const [perfData, prodData, walletData, profData, regionsData, offersData, promoCodesData, bankData, ordersData, shippingPartnersData, notificationsData] = await Promise.all([
         apiGet('/api/seller/performance', { token: authToken }).catch(() => null),
         apiGet('/api/seller/my-products', { token: authToken }).catch(() => null),
         apiGet('/api/seller/wallet', { token: authToken }).catch(() => null),
         apiGet('/api/seller/profile', { token: authToken }).catch(() => null),
         apiGet('/api/seller/serviceable-regions', { token: authToken }).catch(() => null),
         apiGet('/api/seller/offers', { token: authToken }).catch(() => null),
+        apiGet('/api/seller/promo-codes', { token: authToken }).catch(() => null),
         apiGet('/api/seller/bank-account', { token: authToken }).catch(() => null),
         apiGet(`/api/seller/orders?status=${encodeURIComponent(sellerOrderStatusFilter)}&limit=50&page=1`, { token: authToken }).catch(() => null),
         apiGet('/api/seller/shipping-partners/catalog?limit=100', { token: authToken }).catch(() => null),
@@ -2943,6 +3266,7 @@ function App() {
       setSellerAllIndia(Boolean(regionsData?.all_india))
       setSellerServiceableRegions(Array.isArray(regionsData?.serviceable_regions) ? regionsData.serviceable_regions : [])
       setSellerOffers(Array.isArray(offersData?.offers) ? offersData.offers : [])
+      setSellerPromoCodes(Array.isArray(promoCodesData?.promo_codes) ? promoCodesData.promo_codes : [])
       setSellerOrders(nextOrders)
       setSellerShippingPartners(Array.isArray(shippingPartnersData?.partners) ? shippingPartnersData.partners : [])
       setSellerNotifications(Array.isArray(notificationsData?.notifications) ? notificationsData.notifications : [])
@@ -3430,6 +3754,158 @@ function App() {
       flashNotice(error instanceof Error ? error.message : 'Could not create offer')
     } finally {
       setIsCreatingSellerOffer(false)
+    }
+  }
+
+  const toggleSellerPromoPaymentMethod = (method) => {
+    const normalized = String(method || '').trim().toUpperCase()
+    if (!normalized) {
+      return
+    }
+    setSellerPromoCodeForm((prev) => {
+      const methods = Array.isArray(prev.payment_methods) ? prev.payment_methods : []
+      const nextMethods = methods.includes(normalized)
+        ? methods.filter((item) => item !== normalized)
+        : [...methods, normalized]
+      return { ...prev, payment_methods: nextMethods }
+    })
+  }
+
+  const createSellerPromoCode = async (event) => {
+    event.preventDefault()
+    if (!authToken) {
+      return
+    }
+
+    const normalizedCode = normalizeCouponCodeInput(sellerPromoCodeForm.code)
+    const title = sanitizeText(sellerPromoCodeForm.title, 80)
+    const description = sanitizeText(sellerPromoCodeForm.description, 180)
+    const kind = String(sellerPromoCodeForm.kind || 'flat').trim().toLowerCase()
+    const selectedProductId = String(sellerPromoCodeForm.product_id || '').trim()
+    const value = Number(sellerPromoCodeForm.value)
+    const maxDiscount = Number(sellerPromoCodeForm.max_discount)
+    const minSubtotal = Number(sellerPromoCodeForm.min_subtotal || 0)
+    const paymentMethods = Array.isArray(sellerPromoCodeForm.payment_methods)
+      ? sellerPromoCodeForm.payment_methods.map((item) => String(item || '').trim().toUpperCase()).filter(Boolean)
+      : []
+    const startAt = sellerPromoCodeForm.start_at ? new Date(sellerPromoCodeForm.start_at).toISOString() : ''
+    const endAt = sellerPromoCodeForm.end_at ? new Date(sellerPromoCodeForm.end_at).toISOString() : ''
+
+    if (!normalizedCode || !title || !Number.isFinite(value) || value <= 0 || !startAt || !endAt) {
+      flashNotice('Complete promo code fields')
+      return
+    }
+    if (!['flat', 'percent'].includes(kind)) {
+      flashNotice('Choose a valid promo type')
+      return
+    }
+    if (kind === 'percent' && value > 100) {
+      flashNotice('Percent promo cannot exceed 100')
+      return
+    }
+    if (paymentMethods.length === 0) {
+      flashNotice('Choose at least one payment method')
+      return
+    }
+    if (selectedProductId) {
+      const selectedProduct = sellerProducts.find((product) => String(product?.id || '').trim() === selectedProductId)
+      if (!selectedProduct) {
+        flashNotice('Select a valid product for this promo code')
+        return
+      }
+    }
+    const startAtMs = Date.parse(startAt)
+    const endAtMs = Date.parse(endAt)
+    if (!Number.isFinite(startAtMs) || !Number.isFinite(endAtMs) || startAtMs >= endAtMs) {
+      flashNotice('Promo end time must be later than start time')
+      return
+    }
+
+    setIsCreatingSellerPromoCode(true)
+    try {
+      const response = await apiPost('/api/seller/promo-codes', {
+        code: normalizedCode,
+        title,
+        description: description || undefined,
+        product_id: selectedProductId || undefined,
+        kind,
+        value,
+        max_discount: Number.isFinite(maxDiscount) && maxDiscount > 0 ? maxDiscount : undefined,
+        min_subtotal: Number.isFinite(minSubtotal) && minSubtotal > 0 ? minSubtotal : 0,
+        payment_methods: paymentMethods,
+        start_at: startAt,
+        end_at: endAt,
+      }, { token: authToken })
+      flashNotice(response?.message || 'Promo code saved')
+      setSellerPromoCodeForm({
+        code: '',
+        title: '',
+        description: '',
+        product_id: '',
+        kind: 'flat',
+        value: '',
+        max_discount: '',
+        min_subtotal: '',
+        start_at: '',
+        end_at: '',
+        payment_methods: ['COD', 'RAZORPAY'],
+      })
+      await refreshSellerDashboard()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not save promo code')
+    } finally {
+      setIsCreatingSellerPromoCode(false)
+    }
+  }
+
+  const pauseSellerPromoCode = async (promoCodeId) => {
+    const id = String(promoCodeId || '').trim()
+    if (!authToken || !id) {
+      return
+    }
+    setSellerUpdatingPromoCodeId(id)
+    try {
+      const response = await apiPatch(`/api/seller/promo-codes/${encodeURIComponent(id)}/pause`, {}, { token: authToken })
+      flashNotice(response?.message || 'Promo code paused')
+      await refreshSellerDashboard()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not pause promo code')
+    } finally {
+      setSellerUpdatingPromoCodeId('')
+    }
+  }
+
+  const resumeSellerPromoCode = async (promoCodeId) => {
+    const id = String(promoCodeId || '').trim()
+    if (!authToken || !id) {
+      return
+    }
+    setSellerUpdatingPromoCodeId(id)
+    try {
+      const response = await apiPatch(`/api/seller/promo-codes/${encodeURIComponent(id)}/resume`, {}, { token: authToken })
+      flashNotice(response?.message || 'Promo code resumed')
+      await refreshSellerDashboard()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not resume promo code')
+    } finally {
+      setSellerUpdatingPromoCodeId('')
+    }
+  }
+
+  const deleteSellerPromoCode = async (promoCodeId) => {
+    const id = String(promoCodeId || '').trim()
+    if (!authToken || !id) {
+      return
+    }
+    setSellerUpdatingPromoCodeId(id)
+    try {
+      const response = await apiDelete(`/api/seller/promo-codes/${encodeURIComponent(id)}`, { token: authToken })
+      flashNotice(response?.message || 'Promo code deleted')
+      await refreshSellerDashboard()
+    } catch (error) {
+      flashNotice(error instanceof Error ? error.message : 'Could not delete promo code')
+    } finally {
+      setSellerUpdatingPromoCodeId('')
     }
   }
 
@@ -4244,6 +4720,10 @@ function App() {
     }
     setCheckoutFlow('cart')
     setBuyNowItem(null)
+    setCheckoutPromoInput('')
+    setCheckoutPromoCode('')
+    setCheckoutQuote(null)
+    setCheckoutQuoteError('')
     if (!isLoggedIn) {
       setCheckoutPending(true)
       setActiveQuickPanel('auth')
@@ -4273,6 +4753,10 @@ function App() {
     setBuyNowItem(nextItem)
     setCheckoutFlow('buy_now')
     setPaymentError('')
+    setCheckoutPromoInput('')
+    setCheckoutPromoCode('')
+    setCheckoutQuote(null)
+    setCheckoutQuoteError('')
     setSelectedCheckoutAddress(null)
 
     if (!isLoggedIn) {
@@ -4286,6 +4770,35 @@ function App() {
     setSelectedCheckoutAddress(null)
     setActiveQuickPanel('address')
     loadAddresses()
+  }
+
+  const buyAgainOrder = (order) => {
+    const nextItem = buildCartItemFromOrder(order)
+    if (!nextItem) {
+      flashNotice('This order item is unavailable for reorder right now')
+      return
+    }
+
+    setBuyNowItem(nextItem)
+    setCheckoutFlow('buy_now')
+    setPaymentError('')
+    setCheckoutPromoInput('')
+    setCheckoutPromoCode('')
+    setCheckoutQuote(null)
+    setCheckoutQuoteError('')
+    setSelectedCheckoutAddress(null)
+
+    if (!isLoggedIn) {
+      setCheckoutPending(true)
+      setActiveQuickPanel('auth')
+      flashNotice('Login to continue checkout')
+      return
+    }
+
+    setCheckoutPending(false)
+    setActiveQuickPanel('address')
+    loadAddresses()
+    flashNotice('Repeat order ready for checkout')
   }
 
   const checkDeliveryAvailability = async (event) => {
@@ -4328,6 +4841,120 @@ function App() {
     } finally {
       setIsCheckingDelivery(false)
     }
+  }
+
+  const renderCatalogToolbar = (totalCount, visibleCount, title = 'Refine your browse') => (
+    <div className="catalog-toolbar">
+      <div className="catalog-toolbar-copy">
+        <strong>{title}</strong>
+        <span>
+          Showing {visibleCount} of {totalCount} item{totalCount === 1 ? '' : 's'}
+          {hasActiveCatalogControls ? ` with ${activeCatalogControlCount} active filter${activeCatalogControlCount === 1 ? '' : 's'}` : ''}
+        </span>
+      </div>
+      <div className="catalog-toolbar-controls">
+        <label className="catalog-field">
+          <span>Sort</span>
+          <select value={catalogSortKey} onChange={(event) => setCatalogSortKey(event.target.value)}>
+            <option value="featured">Featured</option>
+            <option value="price_low_to_high">Price: Low to High</option>
+            <option value="price_high_to_low">Price: High to Low</option>
+            <option value="rating_high_to_low">Top Rated</option>
+            <option value="discount_high_to_low">Biggest Discount</option>
+            <option value="newest_first">Newest First</option>
+          </select>
+        </label>
+        <label className="catalog-field">
+          <span>Price</span>
+          <select value={catalogPriceBand} onChange={(event) => setCatalogPriceBand(event.target.value)}>
+            <option value="all">All Prices</option>
+            <option value="under_500">Under Rs 500</option>
+            <option value="500_to_1500">Rs 500 - Rs 1,500</option>
+            <option value="1500_to_5000">Rs 1,500 - Rs 5,000</option>
+            <option value="above_5000">Above Rs 5,000</option>
+          </select>
+        </label>
+        <label className="catalog-field">
+          <span>Rating</span>
+          <select value={catalogRatingBand} onChange={(event) => setCatalogRatingBand(event.target.value)}>
+            <option value="all">All Ratings</option>
+            <option value="4">4 stars & up</option>
+            <option value="3">3 stars & up</option>
+          </select>
+        </label>
+        <label className="catalog-toggle">
+          <input
+            type="checkbox"
+            checked={catalogDiscountOnly}
+            onChange={(event) => setCatalogDiscountOnly(event.target.checked)}
+          />
+          <span>Deals only</span>
+        </label>
+        <button
+          type="button"
+          className="account-inline-btn"
+          onClick={clearCatalogControls}
+          disabled={!hasActiveCatalogControls}
+        >
+          Clear
+        </button>
+      </div>
+    </div>
+  )
+
+  const renderCatalogProductCard = (product) => {
+    const image = Array.isArray(product?.images) ? product.images[0] : null
+    const pricing = getProductPricingMeta(product)
+    const price = formatInr(pricing.effectivePrice)
+    const comparePrice = formatInr(pricing.comparePrice)
+    const hasReviews = Number(product?.review_count) > 0 && Number.isFinite(Number(product?.review_average))
+
+    return (
+      <article
+        className="product-card"
+        key={product.id}
+        onClick={() => openProduct(product)}
+        onKeyDown={(event) => event.key === 'Enter' && openProduct(product)}
+        role="button"
+        tabIndex={0}
+      >
+        <div className="product-media">
+          {pricing.discountBadgeLabel && (
+            <span className="product-offer-badge">
+              {pricing.discountBadgeLabel}
+            </span>
+          )}
+          {image ? <img src={image} alt={product.title} loading="lazy" /> : <span>No image</span>}
+        </div>
+        <div className="product-copy">
+          <h3>{product.title}</h3>
+          <p className="product-category">{product.category || 'Uncategorized'}</p>
+          <div className="product-rating">
+            {hasReviews ? (
+              <>
+                <span className="rating-chip">
+                  {Number(product.review_average).toFixed(1)} <span aria-hidden="true">&#9733;</span>
+                </span>
+                <span className="rating-count">({product.review_count})</span>
+              </>
+            ) : (
+              <span className="rating-empty">No reviews yet</span>
+            )}
+          </div>
+          <div className="product-pricing">
+            <strong>{price || '-'}</strong>
+            {pricing.hasComparePrice && <span>{comparePrice}</span>}
+          </div>
+          {pricing.hasComparePrice && (
+            <p className="product-offer-note">
+              Save {formatInr(pricing.savingsAmount) || 'Rs 0'}
+              {pricing.activeOffer?.festival_name ? ` | ${pricing.activeOffer.festival_name}` : ''}
+              {pricing.activeOffer?.end_at ? ` | Ends ${formatDateTime(pricing.activeOffer.end_at)}` : ''}
+            </p>
+          )}
+        </div>
+      </article>
+    )
   }
 
   const submitProductQuestion = async (event) => {
@@ -4380,6 +5007,23 @@ function App() {
     const line = Number(item.price || 0) * Number(item.qty || 1)
     return Number.isFinite(line) ? sum + line : sum
   }, 0)
+  const checkoutCompareTotal = checkoutItems.reduce((sum, item) => {
+    const unitPrice = Number(item.price || 0)
+    const comparePrice = Number(item.base_price || unitPrice)
+    const safePrice = Number.isFinite(comparePrice) && comparePrice > unitPrice ? comparePrice : unitPrice
+    const line = safePrice * Number(item.qty || 1)
+    return Number.isFinite(line) ? sum + line : sum
+  }, 0)
+  const checkoutOfferSavings = Math.max(0, checkoutCompareTotal - checkoutSubtotal)
+  const checkoutQuoteSummary = checkoutQuote?.summary || null
+  const checkoutAvailablePromos = Array.isArray(checkoutQuote?.available_promos) ? checkoutQuote.available_promos : []
+  const checkoutCouponDiscount = Number(checkoutQuoteSummary?.coupon_discount_total || 0)
+  const checkoutPayableTotal = Number(checkoutQuoteSummary?.payable_total || checkoutSubtotal)
+  const checkoutSummarySubtotal = Number(checkoutQuoteSummary?.subtotal || checkoutSubtotal)
+  const appliedCheckoutPromoCode = String(checkoutQuoteSummary?.applied_coupon_code || '').trim().toUpperCase()
+  const isCheckoutPromoPartial = Boolean(checkoutQuoteSummary?.partially_applied)
+  const checkoutEligiblePromoItems = Number(checkoutQuoteSummary?.eligible_item_count || 0)
+  const isOnlinePaymentSelectionBlocked = selectedPaymentMethod === 'RAZORPAY' && checkoutItems.length !== 1
   const cartItemTotal = cartItems.reduce((sum, item) => sum + Number(item.qty || 1), 0)
   const cartSubtotal = cartItems.reduce((sum, item) => {
     const line = Number(item.price || 0) * Number(item.qty || 1)
@@ -4393,12 +5037,53 @@ function App() {
     })
     return filtered.length ? filtered : products
   }, [products, activeCategoryQuery])
+  const catalogVisibleProducts = useMemo(() => applyCatalogControls(products, {
+    sortKey: catalogSortKey,
+    priceBand: catalogPriceBand,
+    ratingBand: catalogRatingBand,
+    discountOnly: catalogDiscountOnly,
+  }), [products, catalogSortKey, catalogPriceBand, catalogRatingBand, catalogDiscountOnly])
+  const categoryCatalogProducts = useMemo(() => applyCatalogControls(categoryProducts, {
+    sortKey: catalogSortKey,
+    priceBand: catalogPriceBand,
+    ratingBand: catalogRatingBand,
+    discountOnly: catalogDiscountOnly,
+  }), [categoryProducts, catalogSortKey, catalogPriceBand, catalogRatingBand, catalogDiscountOnly])
   const spotlightProducts = categoryProducts.slice(0, 8)
   const launchProducts = categoryProducts.slice(8, 16)
   const heroProduct = categoryProducts[0] || null
   const homeOfferLead = offerHighlights[0] || null
   const homeOfferLeadPricing = homeOfferLead ? getProductPricingMeta(homeOfferLead) : null
   const homeOfferTiles = offerHighlights.slice(1, 5)
+  const hasActiveCatalogControls = catalogSortKey !== 'featured'
+    || catalogPriceBand !== 'all'
+    || catalogRatingBand !== 'all'
+    || catalogDiscountOnly
+  const activeCatalogControlCount = Number(catalogSortKey !== 'featured')
+    + Number(catalogPriceBand !== 'all')
+    + Number(catalogRatingBand !== 'all')
+    + Number(catalogDiscountOnly)
+  const sellerPromoMetrics = useMemo(() => {
+    const now = Date.now()
+    const promos = Array.isArray(sellerPromoCodes) ? sellerPromoCodes : []
+    const activeCount = promos.filter((promoCode) => {
+      const isActive = String(promoCode?.status || '').trim().toLowerCase() === 'active'
+      const endAt = Date.parse(promoCode?.end_at || '')
+      return isActive && (!Number.isFinite(endAt) || endAt >= now)
+    }).length
+    const totalUses = promos.reduce((sum, promoCode) => sum + Number(promoCode?.used_count || 0), 0)
+    const catalogWideCount = promos.filter((promoCode) => !String(promoCode?.product_id || '').trim()).length
+    const topCode = [...promos].sort((left, right) => (
+      Number(right?.used_count || 0) - Number(left?.used_count || 0)
+    ))[0] || null
+
+    return {
+      activeCount,
+      totalUses,
+      catalogWideCount,
+      topCode,
+    }
+  }, [sellerPromoCodes])
   const accountViewTitle = ({
     menu: 'Account Settings',
     devices: 'Manage Devices',
@@ -5538,10 +6223,56 @@ function App() {
             </section>
           )}
 
+          {!searchText.trim() && recentlyViewedProducts.length > 0 && (
+            <section className="similar-section recently-viewed-section" aria-labelledby="recently-viewed-title">
+              <div className="home-products-head">
+                <div>
+                  <h2 id="recently-viewed-title">Recently Viewed</h2>
+                  <p>Jump back into products you already checked out.</p>
+                </div>
+              </div>
+              <div className="similar-row">
+                {recentlyViewedProducts.map((item) => {
+                  const pricing = getProductPricingMeta(item)
+                  return (
+                    <article
+                      key={`recent-${item.id}`}
+                      className="similar-card"
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => openProduct(item)}
+                      onKeyDown={(event) => event.key === 'Enter' && openProduct(item)}
+                    >
+                      <div className="similar-media">
+                        {Array.isArray(item.images) && item.images[0] ? (
+                          <img src={item.images[0]} alt={item.title} loading="lazy" />
+                        ) : (
+                          <span>Viewed</span>
+                        )}
+                      </div>
+                      <h3>{item.title}</h3>
+                      <p className="similar-reviews">
+                        {item.review_average !== null && Number.isFinite(Number(item.review_average))
+                          ? `${Number(item.review_average).toFixed(1)} ★ • ${Number(item.review_count || 0)} rating${Number(item.review_count || 0) === 1 ? '' : 's'}`
+                          : (item.category || 'Recently opened')}
+                      </p>
+                      <strong>{formatInr(pricing.effectivePrice) || '-'}</strong>
+                      {pricing.hasComparePrice && <span className="similar-price-compare">{formatInr(pricing.comparePrice)}</span>}
+                    </article>
+                  )
+                })}
+              </div>
+            </section>
+          )}
+
           <section className={`home-products ${viewTransition === 'to-home' ? 'is-entering' : ''}`} aria-labelledby="home-products-title">
             <div className="home-products-head">
-              <h2 id="home-products-title">{searchText.trim() ? 'Search Results' : 'Products'}</h2>
+              <div>
+                <h2 id="home-products-title">{searchText.trim() ? 'Search Results' : 'Products'}</h2>
+                <p>{searchText.trim() ? 'Use filters to narrow your search results faster.' : 'Sort by price, rating, discount, and more right from the storefront.'}</p>
+              </div>
             </div>
+            {!isLoadingProducts && !productsError && products.length > 0 && renderCatalogToolbar(products.length, catalogVisibleProducts.length, 'Sort, filter, and discover faster')}
 
             {isLoadingProducts && <p className="products-meta">Loading products...</p>}
 
@@ -5554,8 +6285,12 @@ function App() {
             )}
 
             {!isLoadingProducts && !productsError && products.length > 0 && (
-              <div className="product-grid">
-                {products.map((product) => {
+              <>
+                {catalogVisibleProducts.length === 0 && (
+                  <p className="products-meta">No products match the filters you selected. Clear filters and try again.</p>
+                )}
+                <div className="product-grid">
+                  {catalogVisibleProducts.map((product) => {
                   const image = Array.isArray(product.images) ? product.images[0] : null
                   const pricing = getProductPricingMeta(product)
                   const price = formatInr(pricing.effectivePrice)
@@ -5608,8 +6343,9 @@ function App() {
                       </div>
                     </article>
                   )
-                })}
-              </div>
+                  })}
+                </div>
+              </>
             )}
           </section>
         </>
@@ -5950,6 +6686,18 @@ function App() {
                   ))}
                 </div>
               </section>
+
+              <section className="categories-block" aria-labelledby="category-results-title">
+                <h3 id="category-results-title">Category Results</h3>
+                {renderCatalogToolbar(categoryProducts.length, categoryCatalogProducts.length, 'Filter this category')}
+                {categoryCatalogProducts.length > 0 ? (
+                  <div className="product-grid categories-product-grid">
+                    {categoryCatalogProducts.map((item) => renderCatalogProductCard(item))}
+                  </div>
+                ) : (
+                  <p className="products-meta">No category items match your current filters.</p>
+                )}
+              </section>
             </div>
           </div>
         </section>
@@ -6209,9 +6957,89 @@ function App() {
               </p>
               <p className="quick-panel-meta">
                 Checkout for: <strong>{checkoutItemTotal} item{checkoutItemTotal === 1 ? '' : 's'}</strong>
-                {' '}| Total: <strong>{formatInr(checkoutSubtotal) || '-'}</strong>
+                {' '}| Items Total: <strong>{formatInr(checkoutSummarySubtotal) || '-'}</strong>
               </p>
+              <section className="checkout-summary-card">
+                <div className="checkout-summary-head">
+                  <strong>Checkout Summary</strong>
+                  <span>{isLoadingCheckoutQuote ? 'Refreshing...' : `${checkoutItemTotal} item${checkoutItemTotal === 1 ? '' : 's'}`}</span>
+                </div>
+                <div className="checkout-summary-rows">
+                  <div>
+                    <span>Items Total</span>
+                    <strong>{formatInr(checkoutSummarySubtotal) || '-'}</strong>
+                  </div>
+                  {checkoutOfferSavings > 0 && (
+                    <div>
+                      <span>Live Offer Savings</span>
+                      <strong>-{formatInr(checkoutOfferSavings) || '-'}</strong>
+                    </div>
+                  )}
+                  {checkoutCouponDiscount > 0 && (
+                    <div>
+                      <span>Promo Savings</span>
+                      <strong>-{formatInr(checkoutCouponDiscount) || '-'}</strong>
+                    </div>
+                  )}
+                  <div>
+                    <span>Delivery</span>
+                    <strong>Free</strong>
+                  </div>
+                  <div className="is-total">
+                    <span>Payable Now</span>
+                    <strong>{formatInr(checkoutPayableTotal) || '-'}</strong>
+                  </div>
+                </div>
+                {appliedCheckoutPromoCode && (
+                  <p className="checkout-summary-note">
+                    Promo <strong>{appliedCheckoutPromoCode}</strong> applied
+                    {checkoutEligiblePromoItems > 0 ? ` on ${checkoutEligiblePromoItems} eligible item${checkoutEligiblePromoItems === 1 ? '' : 's'}` : ''}
+                    {isCheckoutPromoPartial ? '.' : ' across this checkout.'}
+                  </p>
+                )}
+              </section>
+              <section className="checkout-promo-card">
+                <div className="checkout-promo-head">
+                  <strong>Promo Code</strong>
+                  <span>{isLoadingCheckoutQuote ? 'Checking...' : 'Per eligible item'}</span>
+                </div>
+                <div className="checkout-promo-row">
+                  <input
+                    type="text"
+                    placeholder="Enter promo code"
+                    value={checkoutPromoInput}
+                    onChange={(event) => setCheckoutPromoInput(normalizeCouponCodeInput(event.target.value))}
+                  />
+                  <button type="button" onClick={() => applyCheckoutPromoCode()} disabled={isLoadingCheckoutQuote || checkoutItems.length === 0}>
+                    {appliedCheckoutPromoCode ? 'Update' : 'Apply'}
+                  </button>
+                  {appliedCheckoutPromoCode && (
+                    <button type="button" className="account-inline-btn" onClick={removeCheckoutPromoCode} disabled={isLoadingCheckoutQuote}>
+                      Remove
+                    </button>
+                  )}
+                </div>
+                {checkoutAvailablePromos.length > 0 && (
+                  <div className="checkout-promo-chips">
+                    {checkoutAvailablePromos.map((promo) => (
+                      <button
+                        key={promo.code}
+                        type="button"
+                        className={`checkout-promo-chip ${appliedCheckoutPromoCode === promo.code ? 'is-active' : ''}`}
+                        onClick={() => applyCheckoutPromoCode(promo.code)}
+                        disabled={isLoadingCheckoutQuote}
+                      >
+                        {promo.code}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {checkoutQuoteError && <p className="payment-error">{checkoutQuoteError}</p>}
+              </section>
               <p className="quick-panel-meta">Cards are entered securely in Razorpay Checkout. Brandcart does not store full card details on this device.</p>
+              {isOnlinePaymentSelectionBlocked && (
+                <p className="payment-error">Online payment currently supports one item at a time. Choose Cash on Delivery for full cart checkout or use Buy Now for a single item.</p>
+              )}
               <div className="payment-list">
                 {paymentOptions.map((option) => (
                   <button
@@ -6231,8 +7059,11 @@ function App() {
               {paymentError && <p className="payment-error">{paymentError}</p>}
             </div>
             <div className="quick-panel-foot">
-              <p>Method: <strong>{paymentOptions.find((item) => item.id === selectedPaymentMethod)?.title || '-'}</strong></p>
-              <button type="button" onClick={completeCheckout} disabled={isPlacingOrder}>
+              <p>
+                Method: <strong>{paymentOptions.find((item) => item.id === selectedPaymentMethod)?.title || '-'}</strong>
+                {' '}| Due: <strong>{formatInr(checkoutPayableTotal) || '-'}</strong>
+              </p>
+              <button type="button" onClick={completeCheckout} disabled={isPlacingOrder || isLoadingCheckoutQuote || isOnlinePaymentSelectionBlocked}>
                 {isPlacingOrder ? 'Processing...' : 'Place Order'}
               </button>
             </div>
@@ -6619,6 +7450,9 @@ function App() {
                       const orderId = String(order?.id || '')
                       const isUpdatingCancel = buyerUpdatingOrderActionId === `${orderId}:cancel`
                       const isUpdatingReturn = buyerUpdatingOrderActionId === `${orderId}:return`
+                      const payableTotal = Number(order?.pricing?.payable_total ?? order?.pricing?.subtotal ?? 0)
+                      const subtotalAmount = Number(order?.pricing?.subtotal ?? payableTotal)
+                      const couponDiscount = Number(order?.pricing?.coupon_discount ?? 0)
                       const productPreview = order?.product?.id
                         ? {
                           id: order.product.id,
@@ -6650,7 +7484,10 @@ function App() {
                               <span className={`status-chip is-${getStatusTone(order?.status)}`}>{formatStatusText(order?.status)}</span>
                             </div>
                             <div className="buyer-order-meta">
-                              <p>Amount: {formatCurrency(order?.pricing?.subtotal || 0)} | Qty: {Number(order?.quantity || 0)}</p>
+                              <p>Amount: {formatCurrency(payableTotal)} | Qty: {Number(order?.quantity || 0)}</p>
+                              {couponDiscount > 0 && (
+                                <p>Order Subtotal: {formatCurrency(subtotalAmount)} | Coupon Saved: {formatCurrency(couponDiscount)}</p>
+                              )}
                               <p>Payment: {formatStatusText(order?.payment?.method)} / {formatStatusText(order?.payment?.status)}</p>
                               <p>Seller: {order?.seller_snapshot?.brand_name || '-'}</p>
                               <p>Shipping Partner: {order?.shipping?.partner_name || 'Seller will update shipment soon'}</p>
@@ -6711,6 +7548,13 @@ function App() {
                                 onClick={() => loadBuyerOrderTimeline(orderId)}
                               >
                                 {isLoadingBuyerTimeline && activeBuyerTimelineOrderId === orderId ? 'Loading...' : 'Track Order'}
+                              </button>
+                              <button
+                                type="button"
+                                className="account-inline-btn"
+                                onClick={() => buyAgainOrder(order)}
+                              >
+                                Buy Again
                               </button>
                               {productPreview && (
                                 <button
@@ -7530,10 +8374,34 @@ function App() {
                   && String(offer?.status || '').toLowerCase() === 'active'
                   && (!offer?.end_at || Date.parse(offer.end_at) >= Date.now())
                 ))
+                const selectedPromoCodeProduct = sellerProducts.find((product) => String(product?.id || '') === String(sellerPromoCodeForm.product_id || ''))
+                const normalizedSellerPromoDraftCode = normalizeCouponCodeInput(sellerPromoCodeForm.code)
+                const existingSellerPromoCode = sellerPromoCodes.find((promoCode) => (
+                  String(promoCode?.code || '').trim().toUpperCase() === normalizedSellerPromoDraftCode
+                ))
                 return (
                   <div className="seller-section">
                     <h2>Offers</h2>
+                    <div className="metrics-grid">
+                      <article className="metric-card">
+                        <strong>Active Promo Codes</strong>
+                        <p className="metric-value">{sellerPromoMetrics.activeCount}</p>
+                      </article>
+                      <article className="metric-card">
+                        <strong>Total Redemptions</strong>
+                        <p className="metric-value">{sellerPromoMetrics.totalUses}</p>
+                      </article>
+                      <article className="metric-card">
+                        <strong>Catalog-wide Codes</strong>
+                        <p className="metric-value">{sellerPromoMetrics.catalogWideCount}</p>
+                      </article>
+                      <article className="metric-card">
+                        <strong>Top Promo Code</strong>
+                        <p className="metric-value">{sellerPromoMetrics.topCode?.code || '-'}</p>
+                      </article>
+                    </div>
                     <form className="account-form" onSubmit={createSellerOffer}>
+                      <h3>Create Product Offer</h3>
                       <div className="form-group">
                         <label>Product</label>
                         <select
@@ -7623,6 +8491,201 @@ function App() {
                                   className="action-btn delete"
                                   disabled={!offerId || sellerUpdatingOfferId === offerId}
                                   onClick={() => deleteSellerOffer(offerId)}
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                    <form className="account-form" onSubmit={createSellerPromoCode}>
+                      <h3>Promo Codes</h3>
+                      <p className="quick-panel-meta">Buyers can apply these codes during checkout on your eligible items. Leave product blank to let the code work across your catalog.</p>
+                      <div className="form-group">
+                        <label>Promo Code</label>
+                        <input
+                          type="text"
+                          value={sellerPromoCodeForm.code}
+                          onChange={(event) => setSellerPromoCodeForm((prev) => ({ ...prev, code: normalizeCouponCodeInput(event.target.value) }))}
+                          placeholder="SAVE200"
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Promo Title</label>
+                        <input
+                          type="text"
+                          value={sellerPromoCodeForm.title}
+                          onChange={(event) => setSellerPromoCodeForm((prev) => ({ ...prev, title: event.target.value }))}
+                          placeholder="Weekend checkout boost"
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Description (optional)</label>
+                        <textarea
+                          rows={2}
+                          value={sellerPromoCodeForm.description}
+                          onChange={(event) => setSellerPromoCodeForm((prev) => ({ ...prev, description: event.target.value }))}
+                          placeholder="Shown to buyers when the code is available."
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Applies To Product (optional)</label>
+                        <select
+                          value={sellerPromoCodeForm.product_id}
+                          onChange={(event) => setSellerPromoCodeForm((prev) => ({ ...prev, product_id: event.target.value }))}
+                        >
+                          <option value="">All Seller Products</option>
+                          {sellerProducts.map((product) => (
+                            <option key={product.id} value={product.id}>
+                              {product.title}
+                            </option>
+                          ))}
+                        </select>
+                        <p className="quick-panel-meta">
+                          {selectedPromoCodeProduct
+                            ? `Selected product price: ${formatCurrency(selectedPromoCodeProduct.selling_price)}`
+                            : 'Leave blank to let buyers use this code on any eligible item from your store.'}
+                        </p>
+                      </div>
+                      <div className="form-group">
+                        <label>Discount Type</label>
+                        <select
+                          value={sellerPromoCodeForm.kind}
+                          onChange={(event) => setSellerPromoCodeForm((prev) => ({ ...prev, kind: event.target.value }))}
+                        >
+                          <option value="flat">Flat amount</option>
+                          <option value="percent">Percent</option>
+                        </select>
+                      </div>
+                      <div className="form-group">
+                        <label>{sellerPromoCodeForm.kind === 'percent' ? 'Percent Off' : 'Flat Discount'}</label>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={sellerPromoCodeForm.value}
+                          onChange={(event) => setSellerPromoCodeForm((prev) => ({ ...prev, value: event.target.value }))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Maximum Discount (optional)</label>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={sellerPromoCodeForm.max_discount}
+                          onChange={(event) => setSellerPromoCodeForm((prev) => ({ ...prev, max_discount: event.target.value }))}
+                        />
+                        <p className="quick-panel-meta">Useful for percent promos so you can cap how much a single item discount can go up to.</p>
+                      </div>
+                      <div className="form-group">
+                        <label>Minimum Item Subtotal</label>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={sellerPromoCodeForm.min_subtotal}
+                          onChange={(event) => setSellerPromoCodeForm((prev) => ({ ...prev, min_subtotal: event.target.value }))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Payment Methods</label>
+                        <label className="address-default">
+                          <input
+                            type="checkbox"
+                            checked={sellerPromoCodeForm.payment_methods.includes('COD')}
+                            onChange={() => toggleSellerPromoPaymentMethod('COD')}
+                          />
+                          <span>Cash on Delivery</span>
+                        </label>
+                        <label className="address-default">
+                          <input
+                            type="checkbox"
+                            checked={sellerPromoCodeForm.payment_methods.includes('RAZORPAY')}
+                            onChange={() => toggleSellerPromoPaymentMethod('RAZORPAY')}
+                          />
+                          <span>UPI / Card / Wallet / NetBanking</span>
+                        </label>
+                      </div>
+                      <div className="form-group">
+                        <label>Start</label>
+                        <input
+                          type="datetime-local"
+                          value={sellerPromoCodeForm.start_at}
+                          onChange={(event) => setSellerPromoCodeForm((prev) => ({ ...prev, start_at: event.target.value }))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>End</label>
+                        <input
+                          type="datetime-local"
+                          value={sellerPromoCodeForm.end_at}
+                          onChange={(event) => setSellerPromoCodeForm((prev) => ({ ...prev, end_at: event.target.value }))}
+                        />
+                      </div>
+                      {existingSellerPromoCode && (
+                        <p className="quick-panel-meta">This promo code already exists in your dashboard. Saving here will update it instead of creating a duplicate.</p>
+                      )}
+                      <button type="submit" className="seller-button primary" disabled={isCreatingSellerPromoCode}>
+                        {isCreatingSellerPromoCode ? 'Saving...' : 'Create / Update Promo Code'}
+                      </button>
+                    </form>
+                    <h3>Existing Promo Codes</h3>
+                    {isLoadingSellerPromoCodes ? (
+                      <p>Loading promo codes...</p>
+                    ) : sellerPromoCodes.length === 0 ? (
+                      <p className="quick-panel-meta">No promo codes created yet.</p>
+                    ) : (
+                      <div className="products-list">
+                        {sellerPromoCodes.map((promoCode, index) => {
+                          const promoCodeId = String(promoCode?.id || '')
+                          const isUpdatingPromoCode = sellerUpdatingPromoCodeId === promoCodeId
+                          const promoStatus = String(promoCode?.status || 'active').trim().toLowerCase()
+                          const isDeleteLocked = Number(promoCode?.used_count || 0) > 0
+                          const paymentMethodLabel = Array.isArray(promoCode?.payment_methods) && promoCode.payment_methods.length > 0
+                            ? promoCode.payment_methods.join(' / ')
+                            : '-'
+                          const discountLabel = String(promoCode?.kind || '').toLowerCase() === 'percent'
+                            ? `${Number(promoCode?.value || 0)}% off`
+                            : `${formatCurrency(promoCode?.value)} off`
+                          return (
+                            <div key={promoCodeId || `promo-code-${index}`} className="product-row">
+                              <div className="product-info">
+                                <strong>{promoCode.code || 'PROMO'}{promoCode.title ? ` | ${promoCode.title}` : ''}</strong>
+                                <p className="product-category">{discountLabel} | Status: {promoCode.status || '-'} | Used: {Number(promoCode.used_count || 0)}</p>
+                                <p className="product-category">Scope: {promoCode.product_title || 'All seller products'} | Minimum item subtotal: {formatCurrency(promoCode.min_subtotal)}</p>
+                                <p className="product-category">Payments: {paymentMethodLabel}{Number(promoCode.max_discount || 0) > 0 ? ` | Max discount: ${formatCurrency(promoCode.max_discount)}` : ''}</p>
+                                <p className="product-category">{formatDateTime(promoCode.start_at)} to {formatDateTime(promoCode.end_at)}</p>
+                                {promoCode.description && <p className="quick-panel-meta">{promoCode.description}</p>}
+                                {isDeleteLocked && <p className="quick-panel-meta">This code already has buyer usage, so it can be paused but not deleted.</p>}
+                              </div>
+                              <div className="product-actions">
+                                {promoStatus === 'active' ? (
+                                  <button
+                                    type="button"
+                                    className="action-btn edit"
+                                    disabled={!promoCodeId || isUpdatingPromoCode}
+                                    onClick={() => pauseSellerPromoCode(promoCodeId)}
+                                  >
+                                    Pause
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className="action-btn edit"
+                                    disabled={!promoCodeId || isUpdatingPromoCode}
+                                    onClick={() => resumeSellerPromoCode(promoCodeId)}
+                                  >
+                                    Resume
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  className="action-btn delete"
+                                  disabled={!promoCodeId || isUpdatingPromoCode || isDeleteLocked}
+                                  onClick={() => deleteSellerPromoCode(promoCodeId)}
                                 >
                                   Delete
                                 </button>
@@ -7822,6 +8885,10 @@ function App() {
                           <div className="info-row">
                             <span className="label">Offers</span>
                             <span className="value">{sellerOffers.length}</span>
+                          </div>
+                          <div className="info-row">
+                            <span className="label">Promo Codes</span>
+                            <span className="value">{sellerPromoCodes.length}</span>
                           </div>
                           <div className="info-row">
                             <span className="label">Serviceable Regions (State/City)</span>

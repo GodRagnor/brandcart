@@ -10,6 +10,10 @@
   margin-top: 18px;
 }
 
+.recently-viewed-section {
+  margin-top: 16px;
+}
+
 .home-products.is-entering {
   animation: homeViewEnter 360ms cubic-bezier(0.2, 0.7, 0.2, 1);
 }
@@ -42,6 +46,77 @@
 
 .products-error {
   color: #9d3327;
+}
+
+.catalog-toolbar {
+  border: 1px solid #eadfcf;
+  border-radius: 16px;
+  background: linear-gradient(180deg, #fffdf9 0%, #fff7eb 100%);
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.catalog-toolbar-copy {
+  display: grid;
+  gap: 2px;
+}
+
+.catalog-toolbar-copy strong {
+  color: #43311f;
+  font-size: 0.95rem;
+}
+
+.catalog-toolbar-copy span {
+  color: #836d4d;
+  font-size: 0.8rem;
+}
+
+.catalog-toolbar-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: end;
+}
+
+.catalog-field {
+  min-width: 150px;
+  display: grid;
+  gap: 5px;
+}
+
+.catalog-field span {
+  color: #5e4a31;
+  font-size: 0.76rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.catalog-field select {
+  border: 1px solid #e0d2ba;
+  border-radius: 9px;
+  background: #fffdf9;
+  color: #3e3223;
+  padding: 9px 10px;
+  font: inherit;
+}
+
+.catalog-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #e6d7bf;
+  border-radius: 10px;
+  background: #fff;
+  color: #5a4831;
+  padding: 9px 11px;
+  font-weight: 600;
+}
+
+.catalog-toggle input {
+  width: auto;
 }
 
 .offers-hero {
@@ -1638,6 +1713,118 @@
   line-height: 1.4;
 }
 
+.checkout-summary-card,
+.checkout-promo-card {
+  border: 1px solid #eadfcf;
+  border-radius: 12px;
+  background: #fffdf9;
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.checkout-summary-head,
+.checkout-promo-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.checkout-summary-head strong,
+.checkout-promo-head strong {
+  color: #3f2f1f;
+}
+
+.checkout-summary-head span,
+.checkout-promo-head span {
+  color: #856f50;
+  font-size: 0.78rem;
+}
+
+.checkout-summary-rows {
+  display: grid;
+  gap: 8px;
+}
+
+.checkout-summary-rows div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #654f34;
+  font-size: 0.88rem;
+}
+
+.checkout-summary-rows div strong {
+  color: #2f2519;
+}
+
+.checkout-summary-rows .is-total {
+  padding-top: 8px;
+  border-top: 1px solid #f0e5d2;
+  font-size: 0.94rem;
+}
+
+.checkout-summary-note {
+  margin: 0;
+  color: #7b633f;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.checkout-promo-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.checkout-promo-row input {
+  width: 100%;
+  padding: 10px 11px;
+  border: 1px solid #e0d1b4;
+  border-radius: 10px;
+  background: #fff;
+  color: #3c2f20;
+  text-transform: uppercase;
+}
+
+.checkout-promo-row button {
+  border: 0;
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #2f5645;
+  color: #fff8ef;
+  font-weight: 700;
+}
+
+.checkout-promo-row button:disabled {
+  opacity: 0.65;
+}
+
+.checkout-promo-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.checkout-promo-chip {
+  border: 1px solid #e0d1b4;
+  border-radius: 999px;
+  padding: 8px 11px;
+  background: #fff7eb;
+  color: #714e1f;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.checkout-promo-chip.is-active {
+  border-color: #cf9d4d;
+  background: #fff1cf;
+  color: #5d3d13;
+}
+
 .account-body {
   gap: 12px;
 }
@@ -2468,6 +2655,10 @@
   gap: 10px;
 }
 
+.categories-product-grid {
+  margin-top: 12px;
+}
+
 .categories-card {
   border: 0;
   background: transparent;
@@ -2566,6 +2757,15 @@
     grid-template-columns: 1fr;
   }
 
+  .catalog-toolbar-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .catalog-field {
+    min-width: 0;
+  }
+
   .offers-hero-lead {
     grid-template-columns: 1fr;
   }
@@ -2598,6 +2798,10 @@
   .buyer-order-toolbar,
   .buyer-order-card,
   .buyer-order-action-form {
+    grid-template-columns: 1fr;
+  }
+
+  .checkout-promo-row {
     grid-template-columns: 1fr;
   }
 }

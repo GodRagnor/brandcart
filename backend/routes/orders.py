@@ -36,6 +36,7 @@ from utils.products import (
     reserve_product_inventory,
     serialize_product_variant,
 )
+from utils.promo_codes import evaluate_promo_code, get_active_promo_catalog
 from config.env import RAZORPAY_KEY_ID, OTP_DEV_MODE
 from pydantic import BaseModel
 from utils.guards import parse_object_id
@@ -180,6 +181,19 @@ class DeliveryConfirmationPayload(BaseModel):
     otp: str
 
 
+class CheckoutQuoteItemPayload(BaseModel):
+    product_id: str
+    quantity: int
+    offer_id: Optional[str] = None
+    variant_id: Optional[str] = None
+
+
+class CheckoutQuotePayload(BaseModel):
+    items: list[CheckoutQuoteItemPayload]
+    payment_method: str
+    coupon_code: Optional[str] = None
+
+
 async def finalize_delivery_confirmation(
     db,
     *,
@@ -291,9 +305,244 @@ async def finalize_delivery_confirmation(
     return now
 
 
+def build_applied_coupon_snapshot(promo_result: dict) -> Optional[dict]:
+    promo = promo_result.get("promo") or {}
+    if not promo_result.get("is_applied") or not promo:
+        return None
+
+    return {
+        "id": promo.get("id"),
+        "source": promo.get("source") or "static",
+        "code": promo.get("code"),
+        "title": promo.get("title"),
+        "description": promo.get("description"),
+        "kind": promo.get("kind"),
+        "value": promo.get("value"),
+        "discount_amount": round(float(promo_result.get("discount_amount") or 0), 2),
+        "seller_id": promo.get("seller_id"),
+        "product_id": promo.get("product_id"),
+    }
+
+
+async def resolve_checkout_line(
+    db,
+    *,
+    product_id: str,
+    quantity: int,
+    payment_method: str,
+    offer_id: str | None = None,
+    variant_id: str | None = None,
+    coupon_code: str | None = None,
+    now: Optional[datetime] = None,
+):
+    current_time = now or datetime.utcnow()
+    normalized_payment_method = normalize_payment_method(payment_method)
+    normalized_quantity = int(quantity or 0)
+    if normalized_quantity <= 0:
+        raise HTTPException(400, "Quantity must be greater than zero")
+
+    product_oid = parse_object_id(product_id, "product_id")
+    offer_oid = parse_object_id(offer_id, "offer_id") if offer_id else None
+    product = await db.products.find_one({"_id": product_oid})
+    if not product:
+        raise HTTPException(404, "Product not found")
+
+    if product.get("variants"):
+        selected_variant = (
+            find_product_variant(product, variant_id)
+            if variant_id
+            else get_default_product_variant(product)
+        )
+        if not selected_variant:
+            raise HTTPException(400, "Selected variant is unavailable")
+    elif variant_id:
+        raise HTTPException(400, "This product does not support variants")
+    else:
+        selected_variant = None
+
+    base_price = (selected_variant or {}).get("selling_price", product.get("selling_price"))
+    if base_price is None:
+        raise HTTPException(400, "Product price not configured")
+    unit_price = round(float(base_price), 2)
+
+    seller = await db.users.find_one({"_id": product["seller_id"]})
+    if not seller or seller.get("seller_status") != "verified":
+        raise HTTPException(403, "Seller not verified")
+    if seller.get("is_frozen") or seller.get("seller_status") == "frozen":
+        raise HTTPException(403, "Seller account frozen")
+
+    applied_offer = None
+    if offer_oid:
+        offer = await db.seller_offers.find_one({
+            "_id": offer_oid,
+            "seller_id": seller["_id"],
+            "product_id": product["_id"],
+            "status": "active",
+            "start_at": {"$lte": current_time},
+            "end_at": {"$gte": current_time},
+        })
+        if not offer:
+            raise HTTPException(400, "Invalid or expired offer")
+
+        unit_price = round(float(offer["offer_price"]), 2)
+        applied_offer = {
+            "offer_id": offer["_id"],
+            "festival_id": offer.get("festival_id"),
+            "offer_price": unit_price,
+        }
+
+    if selected_variant and selected_variant.get("stock", 0) < normalized_quantity:
+        raise HTTPException(400, "Selected variant is out of stock")
+    if product.get("stock", 0) < normalized_quantity:
+        raise HTTPException(400, "Insufficient stock")
+
+    subtotal = round(unit_price * normalized_quantity, 2)
+    promo_result = await evaluate_promo_code(
+        db=db,
+        code=coupon_code,
+        subtotal=subtotal,
+        payment_method=normalized_payment_method,
+        seller_id=seller["_id"],
+        product_id=product["_id"],
+        now=current_time,
+    )
+    if promo_result.get("error_code") == "invalid_code":
+        raise HTTPException(400, promo_result.get("reason") or "Invalid promo code")
+
+    coupon_discount = round(float(promo_result.get("discount_amount") or 0), 2) if promo_result.get("is_applied") else 0.0
+    payable_total = round(float(promo_result.get("payable_total") or subtotal), 2) if promo_result.get("is_applied") else subtotal
+    coupon_snapshot = build_applied_coupon_snapshot(promo_result)
+
+    commission_percent = seller.get(
+        "commission_percent",
+        5.0 if seller.get("seller_status") == "verified" else 8.0,
+    )
+    commission_amount = round(subtotal * commission_percent / 100, 2)
+    platform_fee = float(PLATFORM_FEE_PER_ORDER)
+    seller_payout = round(subtotal - commission_amount - platform_fee, 2)
+    if seller_payout <= 0:
+        raise HTTPException(400, "Order value too low for platform fee and commission policy")
+
+    eligible_promos = await get_active_promo_catalog(
+        db=db,
+        seller_id=seller["_id"],
+        product_id=product["_id"],
+        payment_method=normalized_payment_method,
+        subtotal=subtotal,
+        now=current_time,
+    )
+
+    return {
+        "product": product,
+        "seller": seller,
+        "selected_variant": selected_variant,
+        "unit_price": unit_price,
+        "subtotal": subtotal,
+        "coupon_discount": coupon_discount,
+        "payable_total": payable_total,
+        "coupon": coupon_snapshot,
+        "promo_result": promo_result,
+        "applied_offer": applied_offer,
+        "commission_percent": commission_percent,
+        "commission_amount": commission_amount,
+        "platform_fee": platform_fee,
+        "seller_payout": seller_payout,
+        "eligible_promos": eligible_promos,
+    }
+
+
 # ======================================================
 # CREATE ORDER (BUYER)
 # ======================================================
+
+@router.post("/quote")
+async def quote_checkout(
+    data: CheckoutQuotePayload,
+    buyer=Depends(require_roles("buyer", "seller")),
+    db=Depends(get_db),
+):
+    now = datetime.utcnow()
+    payment_method = normalize_payment_method(data.payment_method)
+    items = data.items or []
+    if not items:
+        raise HTTPException(400, "At least one checkout item is required")
+
+    await rate_limit(
+        db=db,
+        key=f"checkout_quote:{buyer['_id']}",
+        max_requests=20,
+        window_seconds=60,
+    )
+
+    requested_coupon_code = str(data.coupon_code or "").strip().upper()
+    quote_items = []
+    available_promos_by_code = {}
+    subtotal_total = 0.0
+    coupon_discount_total = 0.0
+    payable_total = 0.0
+    eligible_item_count = 0
+    coupon_failure_reasons = []
+
+    for item in items:
+        line = await resolve_checkout_line(
+            db,
+            product_id=item.product_id,
+            quantity=item.quantity,
+            payment_method=payment_method,
+            offer_id=item.offer_id,
+            variant_id=item.variant_id,
+            coupon_code=requested_coupon_code or None,
+            now=now,
+        )
+
+        promo_result = line["promo_result"]
+        if requested_coupon_code and not line["coupon"] and promo_result.get("reason"):
+            coupon_failure_reasons.append(promo_result["reason"])
+
+        if line["coupon"]:
+            eligible_item_count += 1
+
+        subtotal_total += line["subtotal"]
+        coupon_discount_total += line["coupon_discount"]
+        payable_total += line["payable_total"]
+
+        quote_items.append({
+            "product_id": str(line["product"]["_id"]),
+            "title": line["product"].get("title"),
+            "quantity": item.quantity,
+            "unit_price": line["unit_price"],
+            "subtotal": line["subtotal"],
+            "coupon_discount": line["coupon_discount"],
+            "payable_total": line["payable_total"],
+            "coupon": line["coupon"],
+            "coupon_reason": promo_result.get("reason") if requested_coupon_code and not line["coupon"] else "",
+            "offer": line["applied_offer"],
+            "variant": serialize_product_variant(line["selected_variant"], include_inventory=False),
+        })
+        for promo in line.get("eligible_promos") or []:
+            code = str(promo.get("code") or "").strip().upper()
+            if code and code not in available_promos_by_code:
+                available_promos_by_code[code] = promo
+
+    if requested_coupon_code and eligible_item_count == 0:
+        reason = next((message for message in coupon_failure_reasons if message), "") or f"{requested_coupon_code} could not be applied to this checkout."
+        raise HTTPException(400, reason)
+
+    return {
+        "items": quote_items,
+        "summary": {
+            "requested_coupon_code": requested_coupon_code or None,
+            "applied_coupon_code": requested_coupon_code if eligible_item_count > 0 else None,
+            "item_count": len(quote_items),
+            "eligible_item_count": eligible_item_count,
+            "partially_applied": bool(requested_coupon_code and 0 < eligible_item_count < len(quote_items)),
+            "subtotal": round(subtotal_total, 2),
+            "coupon_discount_total": round(coupon_discount_total, 2),
+            "payable_total": round(payable_total, 2),
+        },
+        "available_promos": list(available_promos_by_code.values()),
+    }
+
 
 @router.post("/create")
 async def create_order(
@@ -304,6 +553,7 @@ async def create_order(
     address_id: str | None = Query(None),
     offer_id: str | None = Query(None),
     variant_id: str | None = Query(None),
+    coupon_code: str | None = Query(None),
     idempotency_key: str = Query(...),
     buyer=Depends(require_roles("buyer", "seller")),
     db=Depends(get_db),
@@ -335,36 +585,30 @@ async def create_order(
         return existing_response
 
     try:
-        product_oid = parse_object_id(product_id, "product_id")
-        offer_oid = parse_object_id(offer_id, "offer_id") if offer_id else None
-        product = await db.products.find_one({"_id": product_oid})
-        if not product:
-            raise HTTPException(404, "Product not found")
+        line = await resolve_checkout_line(
+            db,
+            product_id=product_id,
+            quantity=quantity,
+            payment_method=payment_method,
+            offer_id=offer_id,
+            variant_id=variant_id,
+            coupon_code=coupon_code,
+            now=now,
+        )
+        product = line["product"]
+        selected_variant = line["selected_variant"]
+        seller = line["seller"]
+        applied_offer = line["applied_offer"]
+        coupon_snapshot = line["coupon"]
+        subtotal = line["subtotal"]
+        coupon_discount = line["coupon_discount"]
+        payable_total = line["payable_total"]
+        commission_percent = line["commission_percent"]
+        commission_amount = line["commission_amount"]
+        platform_fee = line["platform_fee"]
+        seller_payout = line["seller_payout"]
 
-        selected_variant = None
-        if product.get("variants"):
-            selected_variant = (
-                find_product_variant(product, variant_id)
-                if variant_id
-                else get_default_product_variant(product)
-            )
-            if not selected_variant:
-                raise HTTPException(400, "Selected variant is unavailable")
-        elif variant_id:
-            raise HTTPException(400, "This product does not support variants")
-
-        base_price = (selected_variant or {}).get("selling_price", product.get("selling_price"))
-        if base_price is None:
-            raise HTTPException(400, "Product price not configured")
-
-        seller = await db.users.find_one({"_id": product["seller_id"]})
-        if not seller or seller.get("seller_status") != "verified":
-            raise HTTPException(403, "Seller not verified")
-
-        if seller.get("is_frozen") or seller.get("seller_status") == "frozen":
-            raise HTTPException(403, "Seller account frozen")
-
-        estimated_order_value = base_price * quantity
+        estimated_order_value = subtotal
         enforce_seller_risk(
             seller=seller,
             payment_method=payment_method,
@@ -388,33 +632,6 @@ async def create_order(
             max_order_value = restrictions.get("max_order_value")
             if max_order_value is not None and estimated_order_value > max_order_value:
                 raise HTTPException(403, "Order value exceeds seller probation limit")
-
-        final_price = base_price
-        applied_offer = None
-
-        if offer_oid:
-            offer = await db.seller_offers.find_one({
-                "_id": offer_oid,
-                "seller_id": seller["_id"],
-                "product_id": product["_id"],
-                "status": "active",
-                "start_at": {"$lte": now},
-                "end_at": {"$gte": now},
-            })
-            if not offer:
-                raise HTTPException(400, "Invalid or expired offer")
-
-            final_price = offer["offer_price"]
-            applied_offer = {
-                "offer_id": offer["_id"],
-                "festival_id": offer.get("festival_id"),
-                "offer_price": final_price,
-            }
-
-        if selected_variant and selected_variant.get("stock", 0) < quantity:
-            raise HTTPException(400, "Selected variant is out of stock")
-        if product.get("stock", 0) < quantity:
-            raise HTTPException(400, "Insufficient stock")
 
         buyer_addresses = buyer.get("addresses", [])
         address = None
@@ -452,17 +669,6 @@ async def create_order(
         if payment_method == "COD" and not cod_enabled:
             raise HTTPException(403, "Seller has not enabled COD")
 
-        subtotal = final_price * quantity
-        commission_percent = seller.get(
-            "commission_percent",
-            5.0 if seller.get("seller_status") == "verified" else 8.0,
-        )
-        commission_amount = round(subtotal * commission_percent / 100, 2)
-        platform_fee = float(PLATFORM_FEE_PER_ORDER)
-        seller_payout = round(subtotal - commission_amount - platform_fee, 2)
-        if seller_payout <= 0:
-            raise HTTPException(400, "Order value too low for platform fee and commission policy")
-
         if payment_method == "COD":
             if subtotal > MAX_COD_ORDER_VALUE:
                 raise HTTPException(403, "COD order value exceeds platform limit")
@@ -479,7 +685,7 @@ async def create_order(
             raise HTTPException(400, "Stock reservation failed")
         stock_reserved = True
 
-        amount_paise = amount_to_paise(subtotal)
+        amount_paise = amount_to_paise(payable_total)
         razorpay_order = None
         if payment_method == "RAZORPAY":
             razorpay_order = await asyncio.to_thread(
@@ -491,6 +697,7 @@ async def create_order(
                     "seller_id": str(seller["_id"]),
                     "product_id": str(product["_id"]),
                     "variant_id": str(selected_variant["_id"]) if selected_variant else "",
+                    "coupon_code": coupon_snapshot.get("code") if coupon_snapshot else "",
                 },
             )
 
@@ -501,13 +708,17 @@ async def create_order(
             "quantity": quantity,
             "variant": serialize_product_variant(selected_variant, include_inventory=False),
             "pricing": {
-                "unit_price": final_price,
+                "unit_price": line["unit_price"],
                 "subtotal": subtotal,
+                "coupon_discount": coupon_discount,
+                "discount_total": coupon_discount,
+                "payable_total": payable_total,
                 "commission_percent": commission_percent,
                 "commission_amount": commission_amount,
                 "platform_fee": platform_fee,
                 "seller_payout": seller_payout,
                 "offer": applied_offer,
+                "coupon": coupon_snapshot,
             },
             "payment": {
                 "method": payment_method,
@@ -517,6 +728,7 @@ async def create_order(
                 "gateway_payment_id": None,
                 "gateway_signature": None,
                 "amount_paise": amount_paise if payment_method == "RAZORPAY" else None,
+                "amount_due": payable_total,
                 "currency": "INR" if payment_method == "RAZORPAY" else None,
                 "paid_at": None,
             },
@@ -550,7 +762,12 @@ async def create_order(
             event="ORDER_CREATED",
             actor_role="buyer",
             actor_id=buyer["_id"],
-            metadata={"payment_method": payment_method, "subtotal": subtotal},
+            metadata={
+                "payment_method": payment_method,
+                "subtotal": subtotal,
+                "payable_total": payable_total,
+                "coupon_code": coupon_snapshot.get("code") if coupon_snapshot else None,
+            },
         )
 
         if applied_offer:
@@ -558,14 +775,23 @@ async def create_order(
                 {"_id": applied_offer["offer_id"]},
                 {"$inc": {"used_count": 1}},
             )
+        if coupon_snapshot and coupon_snapshot.get("source") == "seller" and coupon_snapshot.get("id"):
+            await db.seller_promo_codes.update_one(
+                {"_id": parse_object_id(coupon_snapshot["id"], "coupon_id")},
+                {"$inc": {"used_count": 1}},
+            )
 
         response = {
             "message": "Order created successfully",
             "order_id": str(order["_id"]),
-            "order_amount": subtotal,
+            "order_amount": payable_total,
+            "subtotal": subtotal,
+            "coupon_discount": coupon_discount,
+            "payable_total": payable_total,
             "platform_fee": platform_fee,
             "payment_method": payment_method,
             "offer_applied": bool(applied_offer),
+            "coupon_applied": bool(coupon_snapshot),
         }
 
         if payment_method == "RAZORPAY":
@@ -900,7 +1126,8 @@ async def cancel_buyer_order(
     payment = order.get("payment") or {}
     is_prepaid = payment.get("method") == "RAZORPAY" and payment.get("status") == "paid"
     refund_status = "pending_manual_review" if is_prepaid else None
-    refund_amount = (order.get("pricing") or {}).get("subtotal") if is_prepaid else None
+    pricing = order.get("pricing") or {}
+    refund_amount = (pricing.get("payable_total") if pricing.get("payable_total") is not None else pricing.get("subtotal")) if is_prepaid else None
     payment_status = payment.get("status")
     if payment.get("method") == "COD":
         payment_status = "cancelled"
@@ -1975,7 +2202,9 @@ async def system_refund(
         return {"message": "Refund already processed"}
 
     seller_id = order["seller_id"]
-    refund_amount = order["pricing"]["seller_payout"]
+    pricing = order.get("pricing") or {}
+    seller_refund_amount = pricing["seller_payout"]
+    refund_amount = pricing.get("payable_total") if pricing.get("payable_total") is not None else pricing.get("subtotal")
     reason = ret.get("reason")
 
     # ------------------------------------------------------
@@ -1985,7 +2214,7 @@ async def system_refund(
         db=db,
         seller_id=seller_id,
         order_id=order["_id"],
-        refund_amount=refund_amount,
+        refund_amount=seller_refund_amount,
     )
 
     # ------------------------------------------------------
@@ -2034,6 +2263,7 @@ async def system_refund(
             "order_id": str(order["_id"]),
             "seller_id": str(seller_id),
             "refund_amount": refund_amount,
+            "seller_refund_amount": seller_refund_amount,
             "reason": reason,
             "seller_fault": reason in SELLER_FAULT_REASONS,
         },
@@ -2050,6 +2280,7 @@ async def system_refund(
         actor_id=None,
         metadata={
             "refund_amount": refund_amount,
+            "seller_refund_amount": seller_refund_amount,
             "reason": reason,
         },
     )
@@ -2088,7 +2319,8 @@ async def complete_cancellation_refund(
 
     refund_amount = cancellation.get("refund_amount")
     if refund_amount is None:
-        refund_amount = (order.get("pricing") or {}).get("subtotal")
+        pricing = order.get("pricing") or {}
+        refund_amount = pricing.get("payable_total") if pricing.get("payable_total") is not None else pricing.get("subtotal")
 
     await db.orders.update_one(
         {"_id": order["_id"]},

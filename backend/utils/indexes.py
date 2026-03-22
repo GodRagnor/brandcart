@@ -215,3 +215,22 @@ async def ensure_indexes(db):
         name="wallet_ledger_reference_idx",
         sparse=True,
     )
+
+    # Seller promo codes
+    await _create_index_safe(
+        db.seller_promo_codes,
+        [("code", ASCENDING)],
+        name="seller_promo_codes_code_unique_idx",
+        unique=True,
+    )
+    await _create_index_safe(
+        db.seller_promo_codes,
+        [("seller_id", ASCENDING), ("status", ASCENDING), ("created_at", DESCENDING)],
+        name="seller_promo_codes_seller_status_created_idx",
+    )
+    await _create_index_safe(
+        db.seller_promo_codes,
+        [("seller_id", ASCENDING), ("product_id", ASCENDING), ("status", ASCENDING), ("end_at", DESCENDING)],
+        name="seller_promo_codes_scope_status_end_idx",
+        sparse=True,
+    )
